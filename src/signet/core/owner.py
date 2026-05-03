@@ -61,9 +61,7 @@ class Owner:
         if self.owner_type is OwnerType.UNRESOLVED:
             return
         if not self.owner_id:
-            raise ValueError(
-                f"Owner of type {self.owner_type!r} requires a non-empty owner_id"
-            )
+            raise ValueError(f"Owner of type {self.owner_type!r} requires a non-empty owner_id")
 
     @classmethod
     def unresolved(cls) -> Owner:

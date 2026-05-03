@@ -148,9 +148,7 @@ class Check:
         """
         return CheckResult.allow()
 
-    async def inspect_response_chunk(
-        self, ctx: ResponseContext, chunk: str
-    ) -> CheckResult:
+    async def inspect_response_chunk(self, ctx: ResponseContext, chunk: str) -> CheckResult:
         """Called on every streamed response chunk.
 
         Default: allow. Override for spillage detection, output content
@@ -160,9 +158,7 @@ class Check:
         """
         return CheckResult.allow()
 
-    async def inspect_tool_call(
-        self, ctx: ToolCallContext
-    ) -> CheckResult:
+    async def inspect_tool_call(self, ctx: ToolCallContext) -> CheckResult:
         """Called when the model emits a tool call, before that tool runs.
 
         Default: allow. Override to block specific tools, require sandbox

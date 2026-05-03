@@ -72,12 +72,14 @@ class TestCheckResultConstructors:
 class TestCheckSubclassValidation:
     def test_subclass_without_name_raises_at_definition(self) -> None:
         with pytest.raises(TypeError, match="non-empty `name`"):
+
             class _BadCheck(Check):
                 stage = Stage.ADMISSION
                 # name omitted
 
     def test_subclass_without_stage_raises_at_definition(self) -> None:
         with pytest.raises(TypeError, match="`stage` to a Stage"):
+
             class _BadCheck(Check):
                 name = "bad"
                 stage = "admission"  # type: ignore[assignment]  # not a Stage enum
@@ -105,9 +107,7 @@ class TestCheckDefaultHooksAreAllow:
     def ctx(self) -> RequestContext:
         return RequestContext(owner=Owner.unresolved())
 
-    async def test_pre_request_default_is_allow(
-        self, check: Check, ctx: RequestContext
-    ) -> None:
+    async def test_pre_request_default_is_allow(self, check: Check, ctx: RequestContext) -> None:
         result = await check.pre_request(ctx)
         assert result.is_allow
 
@@ -130,9 +130,7 @@ class TestCheckDefaultHooksAreAllow:
         result = await check.inspect_tool_call(tctx)
         assert result.is_allow
 
-    async def test_post_complete_default_is_allow(
-        self, check: Check, ctx: RequestContext
-    ) -> None:
+    async def test_post_complete_default_is_allow(self, check: Check, ctx: RequestContext) -> None:
         from signet.core.context import ResponseContext
 
         rctx = ResponseContext(request=ctx)

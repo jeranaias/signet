@@ -71,9 +71,7 @@ class Pipeline:
                 return _annotate(result, check)
         return CheckResult.allow("admission cleared")
 
-    async def inspect_response_chunk(
-        self, ctx: ResponseContext, chunk: str
-    ) -> CheckResult:
+    async def inspect_response_chunk(self, ctx: ResponseContext, chunk: str) -> CheckResult:
         """Run every INSPECTION-stage check against the new chunk.
 
         Returns the first non-allow result, or
