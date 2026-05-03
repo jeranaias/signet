@@ -1,0 +1,27 @@
+"""HMAC-chained audit log — tamper-evident decision history.
+
+Every decision the :class:`signet.core.pipeline.Pipeline` makes is appended
+to an audit chain. Each entry is HMAC-SHA256-signed using a secret key, and
+its signature includes the *previous* entry's signature. This means any
+tampering — modifying, deleting, reordering, or inserting entries — breaks
+the chain at the tamper point, and every entry after it fails verification.
+
+This module is the storage and crypto layer:
+
+* :class:`HmacChain` — the writer. Append entries; manage the secret key.
+* :class:`ChainVerifier` — the reader. Walk a chain and report breaks.
+* :class:`KeyRing` — multi-key support for key rotation across eras.
+* :class:`JsonlBackend` — default append-only storage backend.
+
+The data shape (:class:`signet.core.audit.AuditEntry`) lives in
+:mod:`signet.core.audit` and is intentionally crypto-free so it can be
+imported anywhere.
+
+Compatible with NIST 800-53 AU-3 (audit content) and AU-9 (audit
+information protection): the chain is append-only, integrity-protected,
+and every entry carries non-repudiable attribution to an :class:`Owner`.
+"""
+
+from __future__ import annotations
+
+__all__: list[str] = []
