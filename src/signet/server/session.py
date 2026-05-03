@@ -13,8 +13,21 @@ attribution — the caller knows which conversation the request belongs
 to; the gate doesn't have to guess.
 
 Storage: :class:`SessionStore` is a protocol; the bundled
-:class:`InMemorySessionStore` is the default. For multi-replica
-deployments, plug in Redis or a database-backed store.
+:class:`InMemorySessionStore` is the default.
+
+**Production caveats** for the in-memory store:
+
+* **Multi-replica deployments lose sessions on every load-balancer
+  flip.** Each replica has an independent dict. Either implement
+  :class:`SessionStore` against Redis / Postgres / DynamoDB and pass
+  it to :class:`signet.server.app.SignetApp`, or pin sessions to a
+  single replica via your LB.
+* **No expiration / GC.** Sessions accumulate forever. Long-running
+  processes will leak. Implement a periodic sweep over
+  ``InMemorySessionStore._sessions`` based on
+  :attr:`Session.last_seen_at`, or use an external store with TTLs.
+* **No persistence across restarts.** The store is process-local and
+  not flushed to disk.
 """
 
 from __future__ import annotations

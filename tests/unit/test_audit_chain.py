@@ -277,6 +277,54 @@ class TestKeyRingValidation:
             ring.add_legacy(Key.generate("k0"))
 
 
+class TestConcurrentAppend:
+    def test_concurrent_appends_do_not_fork_chain(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        """Threads racing through append must not fork the chain.
+
+        Without the internal lock, two threads could both read the same
+        ``prev_hmac`` before either wrote, producing two entries with
+        the same predecessor. The verifier would then report a
+        LINK_MISMATCH.
+        """
+        import threading
+
+        N = 25
+        barrier = threading.Barrier(N)
+
+        def worker(i: int) -> None:
+            barrier.wait()  # release all threads at once for max contention
+            chain.append(_entry(f"e{i}"))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert report.ok, f"breaks: {report.breaks}"
+        assert report.total_entries == N
+
+
+class TestCanonicalization:
+    def test_nan_in_metadata_is_rejected(self, chain: HmacChain, keyring: KeyRing) -> None:
+        """NaN in metadata would produce non-canonical JSON
+        (`NaN` literal that strict parsers reject), so the writer
+        must refuse it loudly rather than silently produce an entry
+        the verifier later rejects."""
+        bad_entry = AuditEntry(
+            owner=Owner.human("alice"),
+            check_name="x",
+            decision=Decision.ALLOW,
+            reason="bad",
+            metadata={"score": float("nan")},
+        )
+        with pytest.raises(ValueError, match="not JSON compliant"):
+            chain.append(bad_entry)
+
+
 class TestVerificationReportShape:
     def test_clean_report_attributes(
         self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing

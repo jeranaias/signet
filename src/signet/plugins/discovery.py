@@ -93,17 +93,13 @@ def reset_cache() -> None:
 
 
 def _iter_entry_points() -> list[EntryPoint]:
-    """Compatibility shim for entry_points() shape across Python versions.
+    """Return every entry point registered under :data:`ENTRY_POINT_GROUP`.
 
-    importlib.metadata returns a ``SelectableGroups``-shaped object on
-    Python 3.10+ and a ``dict``-shaped object on older versions.
+    Uses the ``entry_points().select(group=...)`` API standardized in
+    Python 3.10. signet pins ``requires-python >= 3.11`` so older
+    ``EntryPoints`` dict-shaped fallbacks are unnecessary.
     """
-    eps = entry_points()
-    select = getattr(eps, "select", None)
-    if callable(select):
-        return list(select(group=ENTRY_POINT_GROUP))
-    # Fallback for very old shapes
-    return list(eps.get(ENTRY_POINT_GROUP, []))
+    return list(entry_points().select(group=ENTRY_POINT_GROUP))
 
 
 __all__ = ["ENTRY_POINT_GROUP", "discover", "load_by_name", "reset_cache"]

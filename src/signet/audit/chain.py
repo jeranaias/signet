@@ -10,9 +10,15 @@ breaks every entry afterwards because the chain link no longer matches.
 The verifier in :mod:`signet.audit.verifier` walks the chain and reports
 exactly where a break occurs.
 
-Threading: a single :class:`HmacChain` instance is not safe for concurrent
-appends. For multi-process or multi-threaded writers, either serialize
-through a queue or partition writers by chain (one chain per writer).
+Concurrency: ``append`` holds an internal :class:`threading.Lock` so
+single-process concurrent callers (FastAPI's async event loop counts
+as one) cannot fork the chain by reading the same ``prev_hmac`` twice
+before either writes. **Multi-process** writers (e.g. ``uvicorn
+--workers 2``) are not protected; each worker has its own lock and
+its own ``_cached_prev``. Run signet with a single worker, or plug in
+a custom backend that takes a cross-process lock (e.g. ``fcntl.flock``
+on POSIX, ``msvcrt.locking`` on Windows). Multi-process safe writers
+are tracked for v0.2.
 """
 
 from __future__ import annotations
@@ -20,6 +26,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import threading
+from dataclasses import replace
 from typing import Any
 
 from signet.audit.backend import AuditBackend
@@ -51,6 +59,11 @@ class HmacChain:
         # backend on every append. A None sentinel means "haven't loaded
         # yet"; an empty string means "chain is genuinely empty".
         self._cached_prev: str | None = None
+        # Serialize concurrent appends. Required because two coroutines
+        # racing through read_prev → compute → write would otherwise both
+        # see the same prev_hmac and fork the chain. See module docstring
+        # for the multi-process caveat.
+        self._lock = threading.Lock()
 
     def append(self, entry: AuditEntry) -> AuditEntry:
         """Sign and persist ``entry``; return the linked entry.
@@ -59,27 +72,26 @@ class HmacChain:
         key ID populated. The original ``entry`` argument is unchanged
         (entries are frozen).
         """
-        prev_hmac = self._read_prev_hmac()
-        active = self._keyring.active
+        with self._lock:
+            prev_hmac = self._read_prev_hmac()
+            active = self._keyring.active
 
-        # Embed the signing key ID so the verifier can look it up later.
-        # We keep a copy of the entry with key ID inserted into metadata
-        # before computing the HMAC, so the HMAC covers it.
-        from dataclasses import replace
+            # Embed the signing key ID so the verifier can look it up later.
+            # We keep a copy of the entry with key ID inserted into metadata
+            # before computing the HMAC, so the HMAC covers it.
+            entry_with_key = replace(
+                entry,
+                metadata={**entry.metadata, KEY_ID_FIELD: active.key_id},
+                prev_hmac=prev_hmac,
+            )
 
-        entry_with_key = replace(
-            entry,
-            metadata={**entry.metadata, KEY_ID_FIELD: active.key_id},
-            prev_hmac=prev_hmac,
-        )
+            payload = _serialize_for_signing(entry_with_key)
+            new_hmac = hmac.new(active.secret, payload, hashlib.sha256).hexdigest()
 
-        payload = _serialize_for_signing(entry_with_key)
-        new_hmac = hmac.new(active.secret, payload, hashlib.sha256).hexdigest()
-
-        linked = entry_with_key.with_chain_links(prev_hmac=prev_hmac, hmac=new_hmac)
-        self._backend.append(linked)
-        self._cached_prev = new_hmac
-        return linked
+            linked = entry_with_key.with_chain_links(prev_hmac=prev_hmac, hmac=new_hmac)
+            self._backend.append(linked)
+            self._cached_prev = new_hmac
+            return linked
 
     def _read_prev_hmac(self) -> str:
         """Return the HMAC of the latest entry in the chain, or ``""`` if
@@ -96,9 +108,33 @@ def _serialize_for_signing(entry: AuditEntry) -> bytes:
 
     Excludes the ``hmac`` field (since that's what we're computing).
     Includes everything else, including ``prev_hmac``, so chain breaks
-    are detected. Uses sort_keys + compact separators for determinism
-    across implementations and Python versions.
+    are detected.
+
+    Canonicalization rules — these are deliberately narrow because the
+    payload shape is constrained (see :class:`AuditEntry.to_dict`):
+
+    * ``sort_keys=True`` — deterministic key order across runs.
+    * ``separators=(",", ":")`` — no whitespace.
+    * ``allow_nan=False`` — reject ``NaN`` / ``Infinity`` outright;
+      they have no JSON literal and produce non-canonical output in
+      Python's ``json`` (it emits ``NaN`` which strict parsers reject).
+      A check that puts a NaN into metadata will fail loudly here
+      rather than silently produce an unverifiable entry.
+    * ``ensure_ascii=False`` — UTF-8 throughout. Callers that mix
+      Unicode-normalization forms (NFC vs NFD) in metadata strings
+      will produce different signatures for visually-identical text;
+      normalize at the application layer if that matters.
+
+    For richer canonicalization (RFC 8785 JCS, CBOR-deterministic),
+    swap this function out — :class:`HmacChain` and
+    :class:`ChainVerifier` import it as a module-level callable.
     """
     d: dict[str, Any] = entry.to_dict()
     d.pop("hmac", None)
-    return json.dumps(d, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json.dumps(
+        d,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+        ensure_ascii=False,
+    ).encode("utf-8")

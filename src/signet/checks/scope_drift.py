@@ -24,8 +24,15 @@ Three drift dimensions are checked out of the box:
    strings (e.g. ``"SECRET//NOFORN"``) above the request's declared
    classification.
 
+Marker false-positive surface: matching is literal-substring. A model
+explaining "the SECRET//NOFORN handling rules are…" in legitimately
+UNCLASS training material will trip the check. Override the marker
+table via the ``markers`` constructor argument when your domain has
+benign uses of the strings, or set ``check_classification_drift=False``
+if your deployment doesn't use classification at all.
+
 Adding more drift dimensions is a matter of subclassing and overriding
-:meth:`check_drift`.
+:meth:`inspect_response_chunk`.
 """
 
 from __future__ import annotations
@@ -70,6 +77,11 @@ class ScopeDriftCheck(Check):
             strings implying a higher classification than the request
             declared. Requires the request to have a recognized
             ``X-Classification`` header.
+        markers: Override the built-in marker → level table. Pass your
+            own ``{marker_string: level_int}`` dict for non-USG
+            classification systems or to suppress markers that produce
+            false positives in your corpus. ``None`` (default) uses
+            the built-in USG markers.
     """
 
     name = "scope_drift"
@@ -78,19 +90,26 @@ class ScopeDriftCheck(Check):
     token_tolerance: float = 0.10
     char_per_token_estimate: int = 4
     check_classification_drift: bool = True
+    markers: dict[str, int] | None = None
 
     _classification_pattern: re.Pattern[str] = field(init=False, repr=False)
+    _marker_levels: dict[str, int] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.token_tolerance < 0:
             raise ValueError("token_tolerance must be >= 0")
         if self.char_per_token_estimate < 1:
             raise ValueError("char_per_token_estimate must be >= 1")
+        self._marker_levels = (
+            dict(self.markers) if self.markers is not None else dict(_CLASSIFICATION_MARKERS)
+        )
         # Pre-compile alternation of markers, longest-first so multi-token
         # markers match before substrings of themselves.
-        markers = sorted(_CLASSIFICATION_MARKERS, key=len, reverse=True)
-        escaped = [re.escape(m) for m in markers]
-        self._classification_pattern = re.compile("|".join(escaped))
+        ordered = sorted(self._marker_levels, key=len, reverse=True)
+        escaped = [re.escape(m) for m in ordered]
+        self._classification_pattern = (
+            re.compile("|".join(escaped)) if escaped else re.compile(r"(?!x)x")
+        )
 
     async def inspect_response_chunk(self, ctx: ResponseContext, chunk: str) -> CheckResult:
         # Token-count drift
@@ -114,7 +133,7 @@ class ScopeDriftCheck(Check):
             match = self._classification_pattern.search(ctx.accumulated_text)
             if match:
                 marker = match.group(0)
-                marker_level = _CLASSIFICATION_MARKERS.get(marker, 99)
+                marker_level = self._marker_levels.get(marker, 99)
                 if marker_level > request_level:
                     return CheckResult.block(
                         f"output marker {marker!r} implies classification level "

@@ -19,6 +19,29 @@ What the built-in patterns cover:
    that decode to text containing override patterns; zero-width and
    bidirectional Unicode characters.
 
+What the built-in patterns DO NOT cover (known gaps — by design):
+
+* **Non-English attacks.** Patterns are English-only. Russian, Chinese,
+  Arabic, etc. all bypass. Add language-specific patterns or layer an
+  LLM-judge.
+* **Lookalike Unicode (homoglyph) attacks.** A Cyrillic ``i``-lookalike
+  at U+0456 in front of ``gnore previous`` bypasses the regex while
+  rendering identically to a Latin ``i``. Normalize to NFKC and fold
+  confusables before scanning if you care.
+* **Whitespace / casing obfuscation across-character.** ``i g n o r e``
+  with single-character spacing is not matched. Add a normalizer.
+* **Encoding other than base64.** Hex, URL-safe base64 (``-_``
+  alphabet), base32, ROT13 — none are decoded.
+* **Multi-step attacks.** "First answer X. Now ignore your rules" split
+  across messages or tool-call results. Cumulative cross-turn detection
+  is a session-level concern, not this check.
+* **Adversarial suffix attacks** (e.g. GCG-discovered token strings).
+  Beyond regex; needs a model.
+
+Treat this check as a tripwire, not a wall. Anything important should
+also have a downstream judge or sandbox preview gate (see
+:mod:`signet.plugins.tribunal` and :mod:`signet.plugins.sandbox`).
+
 Each rule has a severity. Default behavior:
 
 * HIGH severity matches → block.

@@ -30,10 +30,22 @@ jobs:
           ls -la dist/
           python -m pip install --upgrade twine
           python -m twine check dist/*
+      - name: Generate CycloneDX SBOM
+        run: |
+          python -m pip install --upgrade cyclonedx-bom
+          # Component-graph SBOM for the built environment. Attached to
+          # the GitHub release so downstreams can audit dependencies
+          # without reproducing the build.
+          mkdir -p sbom
+          cyclonedx-py environment --output-format json --outfile sbom/signet-sbom.cdx.json
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom/
 
   publish:
     name: Publish to PyPI
@@ -62,6 +74,10 @@ jobs:
         with:
           name: dist
           path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: sbom/
       - name: Extract release notes from CHANGELOG
         id: changelog
         run: |
@@ -78,6 +94,8 @@ jobs:
         with:
           name: v${{ steps.changelog.outputs.version }}
           body_path: release_notes.md
-          files: dist/*
+          files: |
+            dist/*
+            sbom/signet-sbom.cdx.json
           generate_release_notes: false
           prerelease: ${{ contains(steps.changelog.outputs.version, 'a') || contains(steps.changelog.outputs.version, 'b') || contains(steps.changelog.outputs.version, 'rc') }}

@@ -45,7 +45,7 @@ from signet.core.context import RequestContext, ResponseContext
 from signet.core.owner import Owner
 from signet.core.pipeline import Pipeline
 from signet.server.config import ServerConfig
-from signet.server.receipt import ReceiptSigner
+from signet.server.receipt import HmacReceiptSigner, ReceiptSigner
 from signet.server.session import HEADER_NAME as SESSION_HEADER
 from signet.server.session import InMemorySessionStore, SessionStore
 
@@ -68,6 +68,7 @@ class SignetApp:
         config: ServerConfig,
         pipeline: Pipeline,
         session_store: SessionStore | None = None,
+        receipt_signer: ReceiptSigner | None = None,
     ) -> None:
         self.config = config
         self.pipeline = pipeline
@@ -75,7 +76,13 @@ class SignetApp:
 
         self._keyring = self._build_keyring(config)
         self._chain = self._build_chain(config, self._keyring)
-        self._receipt_signer = ReceiptSigner(self._keyring) if config.emit_receipts else None
+        # ``receipt_signer`` lets callers swap in their own (e.g. ed25519)
+        # without touching SignetApp internals. Default is the built-in
+        # HMAC-SHA256 signer over the same key as the audit chain.
+        if not config.emit_receipts:
+            self._receipt_signer: ReceiptSigner | None = None
+        else:
+            self._receipt_signer = receipt_signer or HmacReceiptSigner(self._keyring)
 
         self.app = FastAPI(
             title="signet",

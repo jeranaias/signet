@@ -50,9 +50,14 @@ A token-budget approval for 200 tokens shouldn't silently become a 50,000-token 
 
 ## What every commit produces
 
-Every decision the pipeline makes — allow, block, redact, escalate — becomes one immutable `AuditEntry`. Entries are appended to an HMAC-chained log: each entry's HMAC depends on its predecessor's, so any tampering breaks the chain at that point and every subsequent entry.
+Every decision the pipeline makes — allow, block, redact, escalate — becomes one immutable `AuditEntry`. Entries are appended to an HMAC-chained log: each entry's HMAC depends on its predecessor's, so any tampering by a party that **does not** hold the HMAC key breaks the chain at that point and every subsequent entry.
 
-For each *response* the proxy emits, an `X-Signet-Receipt` HTTP header is returned to the caller. The receipt is an HMAC-signed summary of the gate's decision (owner, stage outcomes, any redactions). Callers can verify the receipt offline against signet's public key. This gives the caller cryptographic proof of what the gate did, independent of trusting the proxy operator.
+For each *response* the proxy emits, an `X-Signet-Receipt` HTTP header is returned to the caller. The receipt is signed (HMAC-SHA256 in v0.1; the format carries an `alg=` tag so asymmetric signers can be added without a downgrade attack) over a canonicalized summary of the audit row. Callers verify the receipt against the signing key.
+
+**Two limits to internalize before relying on this:**
+
+1. **HMAC is symmetric.** The party that verifies a receipt holds the secret to forge one. Fine when verifier and proxy share a trust domain (your own auditor reads your own logs). Not fine for handing receipts to outside parties as unforgeable proof. Asymmetric (ed25519) signers are roadmapped for v0.2.
+2. **The chain is tamper-evident, not write-once.** An attacker with both file-write access *and* the HMAC secret can replace the chain end-to-end and the verifier sees nothing. True append-only requires WORM storage, RFC 3161 timestamping, or transparency-log anchoring — all v0.2 work.
 
 ## Replay
 
@@ -69,20 +74,24 @@ The proprietary parent system (Pyros + Mycelium, not in this OSS release) ships 
 ## Trust model
 
 signet trusts:
-- The proxy operator. Audit logs and HMAC keys live on the proxy host. A compromised proxy can rewrite history at the head of the chain.
+- The proxy operator. Audit logs and HMAC keys live on the proxy host. A compromised proxy can rewrite history end-to-end and re-sign.
 - The TLS endpoint. Wire integrity is delegated to TLS; signet does not re-sign request payloads.
 - The Python interpreter and OS. Standard threat-model scope.
 
 signet does **not** trust:
 - The upstream model. Output is treated as adversarial; INSPECTION and COMMITMENT checks assume the model may try to bypass.
-- The caller. ADMISSION checks assume any header can be spoofed except those coming from a trusted-network range.
+- **The caller's owner claim.** `X-Commit-Owner` / `X-Agent-Id` / `X-Policy-Name` are recorded as caller-asserted attribution, not authenticated identity. signet does not verify JWTs, OIDC tokens, mTLS certs, or SSO sessions on its own. Audit rows say "the caller said the owner was X," not "X cryptographically authorized this." Layer real authentication (mTLS, OIDC, an SSO-fronting reverse proxy, `LoopbackTrustCheck` over a tailnet) before signet's ADMISSION stage if your threat model requires identity proof.
 - Tool implementations. COMMITMENT checks gate tool execution before the tool runs; the tool itself is not trusted to enforce policy.
 
 ## What is intentionally not in scope
 
+- **Authenticating the owner.** signet records what the caller said the owner was. Real identity proofs (JWT/OIDC verification, mTLS client cert binding, SSO sessions) belong upstream of the ADMISSION pipeline.
 - **Persuading the model to behave.** signet does not train, fine-tune, or rewrite prompts. The model behaves however it behaves; signet decides whether to forward what it produced.
 - **Network-level enforcement.** signet enforces at the application layer. Network isolation, mTLS, and outbound firewall rules are out of scope.
 - **Comprehensive PII detection.** The built-in `RegexContentCheck` handles common patterns; richer detection (Presidio, custom NER) is a plugin concern.
+- **Sophisticated prompt-injection defense.** `PromptInjectionCheck` catches obvious English patterns; non-English, homoglyph, whitespace-obfuscated, and adversarial-suffix attacks all pass. Layer an LLM-judge plugin if you need real coverage.
+- **Multi-process safe audit writes.** v0.1 ships with a single-writer chain; multi-worker uvicorn deployments need a custom backend with cross-process locking.
+- **Tamper-proof audit storage.** The HMAC chain is tamper-evident (detects modification by parties without the key) but not write-once. WORM storage / RFC 3161 timestamping / transparency-log anchoring is v0.2 work.
 - **Solving social engineering by AI.** A model that produces a sufficiently persuasive justification for a bad action can still get a tired human reviewer to approve it. That is a residual problem signet does not claim to solve.
 
 ---

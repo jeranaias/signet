@@ -376,6 +376,25 @@ class TestScopeDrift:
         with pytest.raises(ValueError):
             ScopeDriftCheck(char_per_token_estimate=0)
 
+    async def test_custom_markers_replace_defaults(self) -> None:
+        # User overrides with their own marker table — built-in
+        # USG markers should NOT trigger.
+        check = ScopeDriftCheck(markers={"INTERNAL_ONLY": 2})
+        ctx = _request(headers={"X-Classification": "UNCLASS"}, body={"max_tokens": 1000})
+        # Built-in marker no longer in table → not blocked
+        rctx = _response(ctx, accumulated="contains SECRET//NOFORN content")
+        assert (await check.inspect_response_chunk(rctx, "x")).is_allow
+        # Custom marker IS in table → blocked
+        rctx2 = _response(ctx, accumulated="this is INTERNAL_ONLY data")
+        assert (await check.inspect_response_chunk(rctx2, "x")).is_block
+
+    async def test_empty_markers_disables_classification_drift(self) -> None:
+        check = ScopeDriftCheck(markers={})
+        ctx = _request(headers={"X-Classification": "UNCLASS"}, body={"max_tokens": 1000})
+        rctx = _response(ctx, accumulated="any text including SECRET//NOFORN")
+        # No markers configured → classification drift can't fire
+        assert (await check.inspect_response_chunk(rctx, "x")).is_allow
+
 
 class TestContinuingConsent:
     async def test_predicate_true_allows(self) -> None:

@@ -16,6 +16,8 @@ The report distinguishes:
 * **Unknown-key** — the entry's signing key ID is not in the ring; we
   can't verify it. Distinct from a tamper finding: usually means the
   ring is missing a legacy key.
+* **Missing-key-id** — the entry has no signing-key-id metadata field.
+  Either pre-dates the chain feature or was tampered to drop the marker.
 
 The CLI surfaces this through ``signet audit verify``.
 """

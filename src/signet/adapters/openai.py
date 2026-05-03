@@ -78,6 +78,17 @@ def wrap_openai(
             "(signet refuses requests without a resolvable commit owner)"
         )
 
+    # Tested against openai>=1.0. The SDK exposes ``base_url`` and
+    # ``default_headers`` as mutable attributes; if a future major
+    # rewrite removes either, fail loudly here rather than silently
+    # produce a client that bypasses the proxy.
+    if not hasattr(client, "base_url"):
+        raise TypeError(
+            f"wrap_openai expected an OpenAI SDK client with a writable "
+            f"`base_url` attribute; got {type(client).__name__!r}. "
+            "Confirm openai>=1.0 is installed."
+        )
+
     headers = _build_headers(
         owner=owner,
         agent_id=agent_id,
@@ -87,10 +98,7 @@ def wrap_openai(
         session_id=session_id,
     )
 
-    # The OpenAI SDK exposes both base_url and default_headers as mutable
-    # attributes on the client instance. We don't import the SDK to avoid
-    # a hard dependency; runtime duck-typing is enough.
-    client.base_url = signet_url  # type: ignore[attr-defined]
+    client.base_url = signet_url
     if hasattr(client, "default_headers"):
         existing = dict(client.default_headers or {})
         existing.update(headers)

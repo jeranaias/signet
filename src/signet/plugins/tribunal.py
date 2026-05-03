@@ -89,12 +89,29 @@ class TribunalCheck(Check):
             arguments=json.dumps(ctx.arguments, sort_keys=True),
         )
 
+        # return_exceptions=True so one judge crashing does not cancel
+        # the other mid-flight (which would leak the surviving HTTP
+        # connection and discard a usable verdict). Convert exceptions
+        # to BLOCK explicitly here to keep the fail-closed semantics.
         async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            verdicts = await asyncio.gather(
+            raw = await asyncio.gather(
                 self._ask_judge(client, self.judge_a_url, self.judge_a_model, prompt),
                 self._ask_judge(client, self.judge_b_url, self.judge_b_model, prompt),
-                return_exceptions=False,
+                return_exceptions=True,
             )
+
+        verdicts: list[str] = []
+        for url, value in zip((self.judge_a_url, self.judge_b_url), raw, strict=True):
+            if isinstance(value, BaseException):
+                logger.warning(
+                    "tribunal judge %s raised %s: %s; counting as BLOCK",
+                    url,
+                    type(value).__name__,
+                    value,
+                )
+                verdicts.append("BLOCK")
+            else:
+                verdicts.append(value)
 
         a, b = verdicts
         if a == "ALLOW" and b == "ALLOW":

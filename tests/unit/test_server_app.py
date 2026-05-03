@@ -192,9 +192,52 @@ class TestReceiptIntegration:
         parsed = parse_header(receipt)
         assert parsed is not None
         assert parsed["signet"] == "v1"
+        assert parsed["alg"] == "hmac-sha256"
         assert parsed["entry"]
         assert parsed["key"]
         assert len(parsed["sig"]) == 64  # hex SHA-256
+
+    def test_receipt_with_wrong_alg_rejected_by_verifier(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """An attacker that downgrades a future ed25519 receipt to
+        hmac-sha256 by rewriting the alg= field must fail verification.
+
+        The HmacReceiptSigner.verify only accepts alg=hmac-sha256;
+        anything else returns False without comparing signatures.
+        """
+        from signet.audit.chain import HmacChain
+        from signet.audit.keyring import Key, KeyRing
+        from signet.core.audit import AuditEntry, Decision
+        from signet.core.owner import Owner
+        from signet.server.receipt import HmacReceiptSigner
+
+        ring = KeyRing(active=Key(key_id="k1", secret=b"x" * 32))
+        signer = HmacReceiptSigner(ring)
+        chain = HmacChain(
+            backend=type(
+                "B",
+                (),
+                {
+                    "append": lambda self, e: None,
+                    "iter_entries": lambda self: iter([]),
+                    "last_entry": lambda self: None,
+                },
+            )(),
+            keyring=ring,
+        )
+        entry = chain.append(
+            AuditEntry(
+                owner=Owner.human("a"),
+                check_name="x",
+                decision=Decision.ALLOW,
+                reason="ok",
+            )
+        )
+        receipt = signer.sign(entry)
+        # Substitute in a different alg tag — must reject.
+        tampered = receipt.replace("alg=hmac-sha256", "alg=ed25519")
+        assert signer.verify(tampered, entry) is False
 
 
 class TestErrorPaths:

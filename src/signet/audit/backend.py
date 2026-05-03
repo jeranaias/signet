@@ -14,6 +14,7 @@ crypto.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Protocol
@@ -61,16 +62,30 @@ class JsonlBackend:
     (<10K entries/sec), and any setting where a file on disk is the
     audit-of-record. For higher throughput, multiple writers, or
     cloud-native deployments, plug in a custom backend.
+
+    Durability: by default each append calls :func:`os.fsync` after
+    writing so a crash between request handling and disk flush still
+    leaves the chain consistent. Disable with ``fsync_after_append=False``
+    if you need throughput and accept the post-crash audit-tail-loss
+    window. There is no rotation, compression, or indexing — those
+    belong in a dedicated backend.
     """
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, fsync_after_append: bool = True) -> None:
         """Open the backend at ``path``.
 
-        The file is created if it does not exist; its parent directory
-        must already exist.
+        Args:
+            path: File path. Created if it does not exist; parent
+                directory must already exist.
+            fsync_after_append: When True (default), :func:`os.fsync`
+                is called after every write so a crash cannot leave
+                the audit chain shorter than the responses already
+                returned to callers. Set False for benchmark or
+                ephemeral use; production must keep fsync on.
         """
         self._path = Path(path)
         self._path.touch(exist_ok=True)
+        self._fsync = fsync_after_append
 
     @property
     def path(self) -> Path:
@@ -78,9 +93,18 @@ class JsonlBackend:
         return self._path
 
     def append(self, entry: AuditEntry) -> None:
-        line = json.dumps(entry.to_dict(), separators=(",", ":"), sort_keys=True)
+        line = json.dumps(
+            entry.to_dict(),
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+            ensure_ascii=False,
+        )
         with self._path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
+            if self._fsync:
+                f.flush()
+                os.fsync(f.fileno())
 
     def iter_entries(self) -> Iterator[AuditEntry]:
         if not self._path.exists():

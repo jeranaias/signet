@@ -61,6 +61,17 @@ def wrap_anthropic(
             "(signet refuses requests without a resolvable commit owner)"
         )
 
+    # Tested against anthropic>=0.30. The SDK exposes ``base_url`` and
+    # ``default_headers`` as mutable attributes; refuse to wrap a
+    # client that doesn't expose ``base_url`` rather than silently
+    # leave the original endpoint in place.
+    if not hasattr(client, "base_url"):
+        raise TypeError(
+            f"wrap_anthropic expected an Anthropic SDK client with a "
+            f"writable `base_url` attribute; got {type(client).__name__!r}. "
+            "Confirm anthropic>=0.30 is installed."
+        )
+
     headers: dict[str, str] = {}
     if owner:
         headers["X-Commit-Owner"] = owner
@@ -76,7 +87,7 @@ def wrap_anthropic(
         headers["X-Signet-Session"] = session_id
 
     # Anthropic SDK exposes base_url and default_headers on the client.
-    client.base_url = signet_url  # type: ignore[attr-defined]
+    client.base_url = signet_url
     if hasattr(client, "default_headers"):
         existing = dict(client.default_headers or {})
         existing.update(headers)

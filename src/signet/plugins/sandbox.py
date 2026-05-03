@@ -55,10 +55,20 @@ class SandboxResult:
     details: dict[str, Any] = field(default_factory=dict)
 
     def is_safe(self) -> bool:
-        """Default safety predicate: True if the preview ran without
-        error AND no effect-flagging keywords appear in
-        ``observed_effect``. Override by passing a custom predicate
-        to :class:`SandboxPreviewCheck`."""
+        """Heuristic safety predicate. **Treat as a placeholder.**
+
+        Returns True iff the preview ran without error AND none of a
+        small built-in keyword list (``destroy``, ``delete``,
+        ``irreversible``, ``payment``, ``transfer``) appears in
+        ``observed_effect``. The list is deliberately tiny: false
+        positives on any benign description containing the word
+        "delete"; false negatives on synonyms (``purge``, ``wire``,
+        ``void``, ``remove``) and on non-English effect descriptions.
+
+        For real use, do NOT rely on this. Pass a custom ``policy=``
+        callable to :class:`SandboxPreviewCheck` that inspects the
+        structured ``details`` field instead of grep-matching prose.
+        """
         if not self.ok:
             return False
         flag_words = ("destroy", "delete", "irreversible", "payment", "transfer")
