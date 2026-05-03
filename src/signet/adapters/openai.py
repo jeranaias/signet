@@ -27,10 +27,7 @@ The :func:`wrap_openai` function works on both ``openai.OpenAI``
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, TypeVar
-
-if TYPE_CHECKING:
-    from openai import AsyncOpenAI, OpenAI
+from typing import TypeVar
 
 ClientT = TypeVar("ClientT")
 

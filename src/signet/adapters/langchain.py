@@ -85,11 +85,9 @@ class SignetCallbackHandler:
         if body is not None and hasattr(body, "json"):
             try:
                 payload = body.json()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 payload = None
-            if isinstance(payload, dict) and payload.get("error", "").startswith(
-                "signet refused"
-            ):
+            if isinstance(payload, dict) and payload.get("error", "").startswith("signet refused"):
                 self.last_refusal = payload
 
     @staticmethod
