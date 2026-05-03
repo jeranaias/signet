@@ -35,9 +35,10 @@ jobs:
           python -m pip install --upgrade cyclonedx-bom
           # Component-graph SBOM for the built environment. Attached to
           # the GitHub release so downstreams can audit dependencies
-          # without reproducing the build.
+          # without reproducing the build. cyclonedx-bom 7.x uses
+          # `-o <file>` rather than the older `--outfile` flag.
           mkdir -p sbom
-          cyclonedx-py environment --output-format json --outfile sbom/signet-sbom.cdx.json
+          cyclonedx-py environment --output-format json -o sbom/signet-sbom.cdx.json
       - uses: actions/upload-artifact@v4
         with:
           name: dist
