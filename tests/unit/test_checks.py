@@ -109,6 +109,40 @@ class TestOwnerResolution:
         assert result.is_allow
         assert ctx.owner is pre_resolved
 
+    async def test_lowercase_header_is_recognized(self) -> None:
+        check = OwnerResolutionCheck()
+        ctx = _request(headers={"x-commit-owner": "human:alice@example.com"})
+        result = await check.pre_request(ctx)
+        assert result.is_allow
+        assert ctx.owner.owner_id == "alice@example.com"
+
+    async def test_human_wins_over_agent_when_both_present(self) -> None:
+        check = OwnerResolutionCheck()
+        ctx = _request(
+            headers={
+                "X-Commit-Owner": "human:alice",
+                "X-Agent-Id": "agent:rogue",
+            }
+        )
+        result = await check.pre_request(ctx)
+        assert result.is_allow
+        assert ctx.owner.owner_type is OwnerType.HUMAN
+        assert ctx.owner.owner_id == "alice"
+
+    async def test_whitespace_in_header_value_is_stripped(self) -> None:
+        check = OwnerResolutionCheck()
+        ctx = _request(headers={"X-Commit-Owner": "  human:alice  "})
+        result = await check.pre_request(ctx)
+        assert result.is_allow
+        assert ctx.owner.owner_id == "alice"
+
+    async def test_human_prefix_with_empty_principal_blocked(self) -> None:
+        check = OwnerResolutionCheck(require_owner=True)
+        # Just "human:" with no principal — should NOT resolve
+        ctx = _request(headers={"X-Commit-Owner": "human:"})
+        result = await check.pre_request(ctx)
+        assert result.is_block
+
 
 class TestLoopbackTrust:
     async def test_loopback_resolves_to_internal_loopback(self) -> None:
@@ -179,6 +213,18 @@ class TestRateLimit:
             RateLimitCheck(capacity=0, refill_per_second=1.0)
         with pytest.raises(ValueError):
             RateLimitCheck(capacity=1, refill_per_second=0)
+
+    async def test_lru_eviction_caps_memory(self) -> None:
+        from signet.checks.rate_limit import InMemoryRateLimitState
+
+        state = InMemoryRateLimitState(max_owners=3)
+        check = RateLimitCheck(capacity=10, refill_per_second=1.0, state=state)
+        for i in range(5):
+            await check.pre_request(_request(owner=Owner.human(f"u{i}")))
+        # Only the most-recent 3 owners should remain
+        assert len(state._buckets) == 3  # type: ignore[attr-defined]
+        assert "human:u0" not in state._buckets  # evicted  # type: ignore[attr-defined]
+        assert "human:u4" in state._buckets  # type: ignore[attr-defined]
 
 
 class TestRegexContent:

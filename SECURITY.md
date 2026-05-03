@@ -2,7 +2,13 @@
 
 ## Reporting a vulnerability
 
-**Do not open a public GitHub issue.** Email jeranaias@gmail.com with:
+**Do not open a public GitHub issue.**
+
+Preferred channel: open a [private security advisory](https://github.com/jeranaias/signet/security/advisories/new). GitHub coordinates the disclosure timeline and notifies maintainers without exposing the report.
+
+Backup channel: `jeranaias@gmail.com` (subject prefix `[signet-security]`). Until the project has a hosted domain, this single inbox is the only out-of-band path; expect occasional delays. A `security@signet.<domain>` alias is roadmapped for v0.2.
+
+Include:
 
 - A description of the issue.
 - Steps to reproduce or proof-of-concept.
@@ -74,9 +80,11 @@ For production deployments:
 1. Run `signet serve` behind a reverse proxy that terminates TLS.
 2. Restrict the bind interface (`--host 127.0.0.1` for sidecar; explicit network for public).
 3. Set `SIGNET_HMAC_SECRET` from a secrets manager — never check it into source.
-4. Use `--audit-log` on a path that's read-only to other processes.
-5. Run the audit verifier nightly via cron: `signet audit verify <log> --hmac-secret <secret>`.
-6. Subscribe to releases (https://github.com/jeranaias/signet/releases) so you see security advisories.
+4. **Tighten audit log file mode.** signet creates `--audit-log` with the OS default umask (typically `0644`, world-readable). Before you start the proxy, `touch` the path and `chmod 0600` it (owner-only) so non-signet processes on the host cannot read attribution data. signet does not enforce this from inside the process — it would prevent legitimate co-readers (verifier crons running as a different user) from working.
+5. Run with a single uvicorn worker. The HMAC chain is in-process locked; multi-worker deployments can fork the chain. Multi-process safe writers are roadmapped for v0.2.
+6. Cap inbound body size at the reverse-proxy layer too. signet enforces `SIGNET_MAX_REQUEST_BODY_BYTES` (default 4 MiB) but defense in depth.
+7. Run the audit verifier nightly via cron: `signet audit verify <log> --hmac-secret <secret>`.
+8. Subscribe to releases (https://github.com/jeranaias/signet/releases) so you see security advisories.
 
 ## Disclosure policy
 

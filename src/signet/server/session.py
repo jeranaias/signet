@@ -87,28 +87,44 @@ class SessionStore(Protocol):
 
 
 class InMemorySessionStore:
-    """Process-local session store. Fine for single-replica deployments.
+    """Process-local session store with bounded LRU eviction.
 
-    For multi-replica or persistent storage, implement
-    :class:`SessionStore` against your backing store of choice.
+    Without a bound, every distinct session ID a caller asserts grows
+    the store forever. The LRU bound caps memory at ``max_sessions``
+    entries; the least-recently touched session is evicted on
+    overflow. Default ceiling 10 000 covers the typical multi-tenant
+    deployment shape and keeps memory predictable. For multi-replica
+    or persistent storage, implement :class:`SessionStore` against
+    your backing store of choice.
     """
 
-    def __init__(self) -> None:
-        self._sessions: dict[str, Session] = {}
+    def __init__(self, *, max_sessions: int = 10_000) -> None:
+        if max_sessions < 1:
+            raise ValueError(f"max_sessions must be >= 1, got {max_sessions}")
+        from collections import OrderedDict
+
+        self._sessions: OrderedDict[str, Session] = OrderedDict()
+        self._max = max_sessions
 
     def get(self, session_id: str) -> Session | None:
-        return self._sessions.get(session_id)
+        existing = self._sessions.get(session_id)
+        if existing is not None:
+            self._sessions.move_to_end(session_id)
+        return existing
 
     def get_or_create(self, session_id: str) -> Session:
-        existing = self._sessions.get(session_id)
+        existing = self.get(session_id)
         if existing is not None:
             return existing
         new = Session(session_id=session_id)
-        self._sessions[session_id] = new
+        self.save(new)
         return new
 
     def save(self, session: Session) -> None:
         self._sessions[session.session_id] = session
+        self._sessions.move_to_end(session.session_id)
+        while len(self._sessions) > self._max:
+            self._sessions.popitem(last=False)
 
     def delete(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)

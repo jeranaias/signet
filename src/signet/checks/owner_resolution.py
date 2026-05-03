@@ -5,19 +5,31 @@ that every action must be attributable to an accountable owner. If a
 request arrives without one and no fallback resolves one, the gate
 refuses before the model ever sees the request.
 
-Resolution precedence (first match wins):
+Resolution precedence (first match wins, deterministic regardless of
+header order on the wire):
 
-1. ``X-Commit-Owner: human:<principal>`` header — direct human assertion.
-2. ``X-Agent-Id: <agent-id>`` header — autonomous-agent assertion.
-3. ``X-Policy-Name`` + optional ``X-Policy-Version`` headers — a named
-   organizational policy delegating authority.
-4. Already-resolved :class:`Owner` on the context (e.g. populated by
+1. Already-resolved :class:`Owner` on the context (e.g. populated by
    :class:`signet.checks.loopback_trust.LoopbackTrustCheck` or another
-   resolver running earlier in the pipeline).
+   resolver running earlier in the pipeline). Skips header parsing.
+2. ``X-Commit-Owner: human:<principal>`` — direct human assertion.
+3. ``X-Agent-Id: agent:<id>`` — autonomous-agent assertion.
+4. ``X-Policy-Name`` + optional ``X-Policy-Version`` — a named
+   organizational policy delegating authority.
 
 When all four miss, the check returns ``Decision.BLOCK`` with reason
 ``"no commit owner could be resolved"``. The proxy translates this to
-HTTP 403 with the reason in the response body.
+HTTP 403 with the reason in the response body. If a request supplies
+both ``X-Commit-Owner`` and ``X-Agent-Id``, the human assertion wins;
+the agent header is ignored without warning. To override, drop the
+human header at your reverse-proxy layer.
+
+Header lookup is case-insensitive (HTTP headers are case-insensitive
+on the wire; many ASGI servers preserve incoming case). All values are
+stripped of leading/trailing whitespace before matching.
+
+Caveat: signet does NOT authenticate these headers. The audit row
+records "the caller said X"; it does not prove X is the caller. See
+``SECURITY.md`` and ``docs/architecture.md`` trust-model section.
 
 Strict mode is the default and recommended setting. Permissive mode
 (``require_owner=False``) instead resolves the unresolved case to
@@ -33,20 +45,28 @@ from signet.core.context import RequestContext
 from signet.core.owner import Owner
 from signet.core.stage import Stage
 
-# Header names. We accept both the canonical form and a couple of common
-# casings — HTTP headers are case-insensitive but Python dicts aren't.
-_HEADER_COMMIT_OWNER = ("X-Commit-Owner", "x-commit-owner")
-_HEADER_AGENT_ID = ("X-Agent-Id", "X-Agent-ID", "x-agent-id")
-_HEADER_POLICY_NAME = ("X-Policy-Name", "x-policy-name")
-_HEADER_POLICY_VERSION = ("X-Policy-Version", "x-policy-version")
+# Canonical header names. Lookup is case-insensitive — see _get_header.
+_HEADER_COMMIT_OWNER = "X-Commit-Owner"
+_HEADER_AGENT_ID = "X-Agent-Id"
+_HEADER_POLICY_NAME = "X-Policy-Name"
+_HEADER_POLICY_VERSION = "X-Policy-Version"
 
 
-def _first_header(headers: dict[str, str], names: tuple[str, ...]) -> str:
-    """Return the first non-empty header value among ``names``."""
-    for n in names:
-        v = headers.get(n)
-        if v:
-            return v
+def _get_header(headers: dict[str, str], name: str) -> str:
+    """Case-insensitive single-header lookup; returns ``""`` when absent.
+
+    HTTP headers are case-insensitive but Python dicts are not. Some
+    ASGI servers normalize to lowercase, others preserve the case the
+    client sent. We try the canonical case first (cheapest), then walk
+    the dict with a case-fold compare.
+    """
+    v = headers.get(name)
+    if v:
+        return v.strip()
+    target = name.lower()
+    for k, val in headers.items():
+        if k.lower() == target and val:
+            return val.strip()
     return ""
 
 
@@ -95,11 +115,16 @@ class OwnerResolutionCheck(Check):
 
     @staticmethod
     def _resolve_from_headers(headers: dict[str, str]) -> Owner | None:
-        co = _first_header(headers, _HEADER_COMMIT_OWNER)
+        # Precedence: human > agent > policy. If two are sent the human
+        # claim wins and the others are silently dropped — documented in
+        # the module docstring.
+        co = _get_header(headers, _HEADER_COMMIT_OWNER)
         if co.startswith("human:"):
-            return Owner.human(co[len("human:") :])
+            principal = co[len("human:") :]
+            if principal:
+                return Owner.human(principal)
 
-        ai = _first_header(headers, _HEADER_AGENT_ID)
+        ai = _get_header(headers, _HEADER_AGENT_ID)
         if ai.startswith("agent:"):
             agent_id = ai[len("agent:") :]
             if agent_id:
@@ -109,9 +134,12 @@ class OwnerResolutionCheck(Check):
         # and so an attacker can't bypass owner resolution by sending an
         # arbitrary string in X-Agent-Id.
 
-        pn = _first_header(headers, _HEADER_POLICY_NAME)
+        pn = _get_header(headers, _HEADER_POLICY_NAME)
         if pn:
-            pv = _first_header(headers, _HEADER_POLICY_VERSION)
+            pv = _get_header(headers, _HEADER_POLICY_VERSION)
+            # Policy name + version are joined with a literal '@'. If
+            # your policy name contains '@', supply the joined form
+            # yourself in X-Policy-Name and leave X-Policy-Version unset.
             return Owner.policy(f"{pn}@{pv}" if pv else pn)
 
         return None

@@ -67,6 +67,12 @@ class ServerConfig:
     allow_ephemeral_key: bool = False
     receipt_header_name: str = "X-Signet-Receipt"
     emit_receipts: bool = True
+    max_request_body_bytes: int = 4 * 1024 * 1024
+    """Hard cap on inbound request body size. Anything larger gets a
+    413 before signet attempts to parse it. Default 4 MiB covers
+    typical chat-completion bodies (a few-thousand-message conversation
+    fits easily) and refuses obvious DoS payloads. Raise if you have
+    legitimate use of long contexts as raw text in the request body."""
 
     # Forwarded fields the user can tune via env-var: see _ENV_KEYS below.
     extra_forward_headers: tuple[str, ...] = field(
@@ -121,5 +127,7 @@ class ServerConfig:
             cfg.receipt_header_name = v
         if v := e.get("SIGNET_EMIT_RECEIPTS"):
             cfg.emit_receipts = v.lower() == "true"
+        if v := e.get("SIGNET_MAX_REQUEST_BODY_BYTES"):
+            cfg.max_request_body_bytes = int(v)
 
         return cfg

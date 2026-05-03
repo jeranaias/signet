@@ -56,16 +56,35 @@ class RateLimitState(Protocol):
 
 
 class InMemoryRateLimitState:
-    """Process-local bucket store. Fine for single-replica deployments."""
+    """Process-local bucket store with bounded LRU eviction.
 
-    def __init__(self) -> None:
-        self._buckets: dict[str, _Bucket] = {}
+    Without a bound, an attacker that rotates owner identities (each
+    with a one-token bucket) inflates the store unboundedly. The LRU
+    bound caps memory at ``max_owners`` entries; the least-recently
+    touched bucket gets evicted on overflow. Default ceiling 50 000 is
+    generous for legitimate fleets and cheap to keep in RAM.
+    """
+
+    def __init__(self, *, max_owners: int = 50_000) -> None:
+        if max_owners < 1:
+            raise ValueError(f"max_owners must be >= 1, got {max_owners}")
+        # OrderedDict gives O(1) LRU promotion via move_to_end + popitem.
+        from collections import OrderedDict
+
+        self._buckets: OrderedDict[str, _Bucket] = OrderedDict()
+        self._max = max_owners
 
     def get(self, owner_key: str) -> _Bucket | None:
-        return self._buckets.get(owner_key)
+        bucket = self._buckets.get(owner_key)
+        if bucket is not None:
+            self._buckets.move_to_end(owner_key)
+        return bucket
 
     def set(self, owner_key: str, bucket: _Bucket) -> None:
         self._buckets[owner_key] = bucket
+        self._buckets.move_to_end(owner_key)
+        while len(self._buckets) > self._max:
+            self._buckets.popitem(last=False)
 
 
 class RateLimitCheck(Check):

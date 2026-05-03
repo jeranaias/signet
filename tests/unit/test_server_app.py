@@ -270,3 +270,160 @@ class TestRegexOutputBlocksRequest:
         )
         assert r.status_code == 403
         assert "matched" in r.json()["reason"].lower()
+
+
+class TestBodySizeLimit:
+    def test_oversize_body_returns_413(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            max_request_body_bytes=1024,
+        )
+        signet_app = SignetApp(config=config, pipeline=Pipeline(checks=[]))
+        client = TestClient(signet_app.app)
+        big = b"x" * 4096
+        r = client.post(
+            "/v1/chat/completions",
+            content=big,
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 413
+        assert r.json()["limit_bytes"] == 1024
+
+
+class TestRedactAndEscalate:
+    def test_redact_modifies_body_before_forward(
+        self, monkeypatch: pytest.MonkeyPatch, upstream_response_body: dict[str, Any]
+    ) -> None:
+        from signet.checks.regex_content import Pattern, RegexContentCheck
+
+        forwarded: dict[str, Any] = {}
+
+        async def fake_post(_self, _url, **kwargs):
+            forwarded["body"] = kwargs.get("json")
+
+            class FakeResp:
+                status_code = 200
+                content = b""
+                headers: ClassVar[dict[str, str]] = {}
+
+                @staticmethod
+                def json() -> dict[str, Any]:
+                    return upstream_response_body
+
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        pipeline = Pipeline(
+            checks=[
+                OwnerResolutionCheck(require_owner=True),
+                RegexContentCheck(
+                    patterns=[
+                        Pattern(
+                            pattern=r"\b\d{3}-\d{2}-\d{4}\b",
+                            action="redact",
+                            label="ssn",
+                            replacement="[REDACTED-SSN]",
+                        )
+                    ]
+                ),
+            ]
+        )
+        config = ServerConfig(upstream_url="http://upstream-mock/v1", allow_ephemeral_key=True)
+        signet_app = SignetApp(config=config, pipeline=pipeline)
+        client = TestClient(signet_app.app)
+
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test",
+                "messages": [{"role": "user", "content": "my ssn is 123-45-6789"}],
+            },
+            headers={"X-Commit-Owner": "human:alice"},
+        )
+        # REDACT must NOT 403 — it must forward with replaced content.
+        assert r.status_code == 200
+        # Forwarded body should have the redaction in place
+        sent_msgs = forwarded["body"]["messages"]
+        assert "[REDACTED-SSN]" in sent_msgs[-1]["content"]
+        assert "123-45-6789" not in sent_msgs[-1]["content"]
+
+    def test_escalate_returns_202_with_audit_id(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        from signet.core.check import Check, CheckResult
+        from signet.core.context import RequestContext
+        from signet.core.stage import Stage
+
+        class _AlwaysEscalate(Check):
+            name = "always_escalate"
+            stage = Stage.ADMISSION
+
+            async def pre_request(self, _ctx: RequestContext) -> CheckResult:
+                return CheckResult.escalate("needs human review", risk="high")
+
+        config = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        pipeline = Pipeline(checks=[OwnerResolutionCheck(require_owner=True), _AlwaysEscalate()])
+        signet_app = SignetApp(config=config, pipeline=pipeline)
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Commit-Owner": "human:alice"},
+        )
+        assert r.status_code == 202
+        body = r.json()
+        assert body["status"] == "escalated"
+        assert body["audit_entry_id"]
+
+
+class TestPipelineCrashAudit:
+    def test_pre_request_exception_writes_audit_row(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        from signet.audit.backend import JsonlBackend
+        from signet.core.check import Check, CheckResult
+        from signet.core.context import RequestContext
+        from signet.core.stage import Stage
+
+        class _Boom(Check):
+            name = "boom"
+            stage = Stage.ADMISSION
+
+            async def pre_request(self, _ctx: RequestContext) -> CheckResult:
+                raise RuntimeError("kaboom")
+
+        log = tmp_path / "audit.jsonl"
+        config = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=log,
+        )
+        signet_app = SignetApp(config=config, pipeline=Pipeline(checks=[_Boom()]))
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Commit-Owner": "human:alice"},
+        )
+        assert r.status_code == 500
+        assert r.json()["exception"] == "RuntimeError"
+        # Audit row was still written for the crash
+        entries = list(JsonlBackend(log).iter_entries())
+        assert len(entries) == 1
+        assert "kaboom" in entries[0].reason
+
+
+class TestUnsupportedEndpoints:
+    def test_embeddings_returns_explicit_404(self, app_factory) -> None:
+        _, client = app_factory(Pipeline(checks=[]))
+        r = client.post("/v1/embeddings", json={"input": "hi"})
+        assert r.status_code == 404
+        body = r.json()
+        assert "not implemented" in body["error"]
+        assert body["endpoint"] == "/v1/embeddings"

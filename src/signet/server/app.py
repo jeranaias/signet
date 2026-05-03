@@ -152,10 +152,44 @@ class SignetApp:
         async def chat_completions(request: Request) -> Response:
             return await self._handle_chat(request)
 
+        # Explicit refusal for OpenAI endpoints we do NOT yet gate.
+        # Without this, requests would 404 with FastAPI's generic body
+        # and callers would assume the proxy is broken. Spelling it out
+        # is honest about scope.
+        @self.app.api_route(
+            "/v1/{path:path}",
+            methods=["POST", "GET", "PUT", "DELETE", "PATCH"],
+        )
+        async def unsupported_v1(path: str) -> Response:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "endpoint not implemented in signet v0.1",
+                    "endpoint": f"/v1/{path}",
+                    "note": (
+                        "v0.1 only gates POST /v1/chat/completions. "
+                        "Other OpenAI endpoints (embeddings, completions, "
+                        "audio, images) are roadmapped."
+                    ),
+                },
+            )
+
     async def _handle_chat(self, request: Request) -> Response:
-        # 1. Parse inbound
+        # 1. Read body with explicit size cap. Reject before parsing so a
+        # 10 GB junk POST cannot OOM the proxy.
         try:
-            body = await request.json()
+            raw = await self._read_capped_body(request)
+        except _BodyTooLarge as exc:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "error": "request body exceeds max-bytes",
+                    "limit_bytes": exc.limit,
+                },
+            )
+
+        try:
+            body = json.loads(raw) if raw else {}
         except json.JSONDecodeError as e:
             return JSONResponse(
                 status_code=400,
@@ -177,17 +211,94 @@ class SignetApp:
             session_id=session_id,
         )
 
-        # 2. ADMISSION pipeline
-        result = await self.pipeline.pre_request(ctx)
-        if not result.is_allow:
+        # 2. ADMISSION pipeline. Outcomes:
+        #   ALLOW    → forward
+        #   REDACT   → forward with replacement_content swapped into body
+        #   BLOCK    → 403/429 to caller, audit row with decision=BLOCK
+        #   ESCALATE → 202 Accepted; audit row with decision=ESCALATE.
+        #              The caller's responsibility is to poll/wait for a
+        #              human approval that this proxy does not orchestrate;
+        #              orchestration belongs in a higher-level system.
+        try:
+            result = await self.pipeline.pre_request(ctx)
+        except Exception as exc:
+            self._record_exception(ctx, exc, check_name="pipeline.admission")
+            logger.exception("pipeline.pre_request crashed")
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": "signet pipeline crashed during admission",
+                    "exception": type(exc).__name__,
+                },
+            )
+
+        if result.is_block:
             entry = self._record_decision(ctx, result=result, check_name="pipeline.admission")
             return self._refusal(result, entry)
+        if result.is_escalate:
+            entry = self._record_decision(ctx, result=result, check_name="pipeline.admission")
+            return self._escalation(result, entry)
+        if result.is_redact:
+            ctx.body = self._apply_redaction(ctx.body, result.replacement_content)
 
         # 3. Forward (stream-aware)
         is_stream = bool(body.get("stream", False))
-        if is_stream:
-            return await self._forward_stream(ctx)
-        return await self._forward_unary(ctx)
+        try:
+            if is_stream:
+                return await self._forward_stream(ctx)
+            return await self._forward_unary(ctx)
+        except Exception as exc:
+            self._record_exception(ctx, exc, check_name="pipeline.forward")
+            logger.exception("upstream forward crashed")
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": "upstream forward failed",
+                    "exception": type(exc).__name__,
+                },
+            )
+
+    async def _read_capped_body(self, request: Request) -> bytes:
+        """Stream the request body, refusing once it exceeds the cap.
+
+        Trusting the ``Content-Length`` header is not sufficient — a
+        chunked-transfer client can send unbounded data without a length.
+        We accumulate and check after each chunk.
+        """
+        limit = self.config.max_request_body_bytes
+        chunks: list[bytes] = []
+        total = 0
+        async for piece in request.stream():
+            total += len(piece)
+            if total > limit:
+                raise _BodyTooLarge(limit)
+            chunks.append(piece)
+        return b"".join(chunks)
+
+    @staticmethod
+    def _apply_redaction(body: dict[str, Any], replacement: str | None) -> dict[str, Any]:
+        """Swap the last user-message content for ``replacement``.
+
+        Best-effort: REDACT is intended for input-side checks
+        (``RegexContentCheck``) where the offending pattern lives in the
+        most recent user message. If your check needs to redact in a
+        different shape, return BLOCK and let the caller re-issue with
+        the correction; OSS does not pretend to know your full message
+        graph.
+        """
+        if replacement is None:
+            return body
+        out = dict(body)
+        messages = list(body.get("messages", ()))
+        for i in range(len(messages) - 1, -1, -1):
+            msg = messages[i]
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                new_msg = dict(msg)
+                new_msg["content"] = replacement
+                messages[i] = new_msg
+                break
+        out["messages"] = messages
+        return out
 
     async def _forward_unary(self, ctx: RequestContext) -> Response:
         client = self._ensure_http()
@@ -292,7 +403,7 @@ class SignetApp:
         return out
 
     def _refusal(self, result: Any, entry: AuditEntry | None) -> Response:
-        """Translate a refusal CheckResult into the appropriate HTTP error."""
+        """Translate a BLOCK CheckResult into the appropriate HTTP error."""
         body = {
             "error": "signet refused this request",
             "reason": result.reason,
@@ -311,6 +422,26 @@ class SignetApp:
             headers[self.config.receipt_header_name] = self._receipt_signer.sign(entry)
         return JSONResponse(status_code=status, content=body, headers=headers)
 
+    def _escalation(self, result: Any, entry: AuditEntry | None) -> Response:
+        """Translate an ESCALATE CheckResult into ``202 Accepted``.
+
+        202 is the right status: the gate received the request, did not
+        forward it, and is awaiting an out-of-band approval that signet
+        does not orchestrate. The caller (or a higher-level system) is
+        responsible for the approval workflow and resubmitting.
+        """
+        body = {
+            "status": "escalated",
+            "reason": result.reason,
+            "check": result.metadata.get("_check_name"),
+            "stage": result.metadata.get("_stage"),
+            "audit_entry_id": entry.entry_id if entry is not None else None,
+        }
+        headers = {}
+        if entry is not None and self._receipt_signer is not None:
+            headers[self.config.receipt_header_name] = self._receipt_signer.sign(entry)
+        return JSONResponse(status_code=202, content=body, headers=headers)
+
     def _record_decision(
         self,
         ctx: RequestContext,
@@ -319,11 +450,15 @@ class SignetApp:
         check_name: str,
         metadata: dict[str, Any] | None = None,
     ) -> AuditEntry | None:
+        """Persist one audit row.
+
+        Maps the four CheckResult outcomes to the four Decision values
+        one-to-one — earlier versions collapsed REDACT/ESCALATE into
+        BLOCK, which lost information needed for incident review.
+        """
         if self._chain is None:
             return None
-        decision = (
-            Decision.BLOCK if (result is not None and not result.is_allow) else Decision.ALLOW
-        )
+        decision = _result_to_decision(result)
         reason = result.reason if result is not None else "request completed"
         meta = dict(metadata or {})
         if result is not None:
@@ -336,6 +471,54 @@ class SignetApp:
             metadata=meta,
         )
         return self._chain.append(entry)
+
+    def _record_exception(
+        self,
+        ctx: RequestContext,
+        exc: BaseException,
+        *,
+        check_name: str,
+    ) -> AuditEntry | None:
+        """Persist a synthetic audit row when the pipeline crashes.
+
+        Audit consumers downstream rely on every request producing at
+        least one row; an unhandled exception leaving the chain silent
+        is itself a security-relevant gap.
+        """
+        if self._chain is None:
+            return None
+        entry = AuditEntry(
+            owner=ctx.owner,
+            check_name=check_name,
+            decision=Decision.BLOCK,
+            reason=f"pipeline raised {type(exc).__name__}: {exc}",
+            metadata={
+                "_exception_class": type(exc).__name__,
+                "_exception_message": str(exc),
+            },
+        )
+        return self._chain.append(entry)
+
+
+class _BodyTooLarge(Exception):
+    """Raised when the inbound request body exceeds the configured cap."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__(f"request body exceeds {limit} bytes")
+        self.limit = limit
+
+
+def _result_to_decision(result: Any) -> Decision:
+    """Map a CheckResult-or-None to the corresponding Decision."""
+    if result is None or result.is_allow:
+        return Decision.ALLOW
+    if result.is_block:
+        return Decision.BLOCK
+    if result.is_redact:
+        return Decision.REDACT
+    if result.is_escalate:
+        return Decision.ESCALATE
+    return Decision.BLOCK  # fail closed if a future Decision is added without a mapping
 
 
 def _extract_sse_content(chunk_text: str) -> str:

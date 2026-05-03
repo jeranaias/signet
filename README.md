@@ -55,9 +55,11 @@ Without `X-Commit-Owner` (or `X-Agent-Id: agent:<id>`, or a configured trusted-n
 
 ## Architecture in one paragraph
 
-A `Pipeline` runs an ordered list of `Check` objects against every request. Each check can `pre_request` (block before forward), `inspect_response_chunk` (abort mid-stream), `inspect_tool_call` (block tool execution), or `post_complete` (audit). All decisions are written to an HMAC-chained, tamper-evident audit log (NIST 800-53 AU-3 / AU-9 compatible).
+A `Pipeline` runs an ordered list of `Check` objects against every request. Each check can `pre_request` (block before forward), `inspect_response_chunk` (abort mid-stream), `inspect_tool_call` (block tool execution), or `post_complete` (audit). All decisions are written to an HMAC-chained, tamper-evident audit log designed to align with NIST 800-53 AU-3 / AU-9 audit-content and integrity requirements (verify against your own auditor — signet does not authenticate the owner identity it records).
 
-See [`docs/architecture.md`](docs/architecture.md) for the full design.
+See [`docs/architecture.md`](docs/architecture.md) for the full design and [`SECURITY.md`](SECURITY.md) for the threat model and what's explicitly out of scope.
+
+**Endpoint coverage in v0.1.** Only `POST /v1/chat/completions` is gated. Other OpenAI surfaces (`/v1/embeddings`, `/v1/completions`, `/v1/audio/*`, `/v1/images/*`) are not yet proxied. Calls to those endpoints will not reach signet's pipeline and will return 404 from the proxy.
 
 ## Built-in checks
 
