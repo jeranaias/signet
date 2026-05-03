@@ -39,7 +39,7 @@ OwnerResolutionCheck(require_owner=False)
 | Header | Example | Owner type |
 |---|---|---|
 | `X-Commit-Owner` | `human:alice@example.com` | human |
-| `X-Agent-Id` | `agent:nightly-syncer` | agent |
+| `X-Agent-Id` | `agent:nightly-syncer` | agent (requires the `agent:` prefix) |
 | `X-Policy-Name` | `acme.security` | policy |
 | `X-Policy-Version` | `v3` | (combined with name) |
 

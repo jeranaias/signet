@@ -11,7 +11,7 @@ the request along the way — useful when an agent action was approved by a
 human, or when a policy bundle delegated authority through several layers.
 
 This module is data-only; resolution logic lives in
-:mod:`signet.core.owner_resolver`.
+:mod:`signet.checks.owner_resolution`.
 """
 
 from __future__ import annotations

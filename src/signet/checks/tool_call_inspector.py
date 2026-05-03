@@ -50,12 +50,23 @@ _TIER_ALIASES: dict[str, RiskTier] = {
 }
 
 
+def _coerce_tier(value: str | int | RiskTier) -> RiskTier:
+    """Accept ``"low"`` / ``"high"`` / ``RiskTier.LOW`` / ``2`` interchangeably."""
+    if isinstance(value, RiskTier):
+        return value
+    if isinstance(value, int):
+        return RiskTier(value)
+    return _TIER_ALIASES[str(value).strip().lower()]
+
+
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
     """Registry entry for one tool.
 
     Attributes:
-        risk_tier: One of LOW / MEDIUM / HIGH / CRITICAL.
+        risk_tier: One of LOW / MEDIUM / HIGH / CRITICAL. Accepts the
+            enum, an integer ordinal, or a lowercase string for
+            ergonomics in YAML / JSON-loaded registries.
         irreversible: ``True`` for actions that cannot be undone (delete,
             send, transfer, irrevocably mutate). Used by the escalation
             policy.
@@ -68,13 +79,10 @@ class ToolSpec:
     irreversible: bool = False
     dryrun_supported: bool = False
 
-
-def _coerce_tier(value: str | int | RiskTier) -> RiskTier:
-    if isinstance(value, RiskTier):
-        return value
-    if isinstance(value, int):
-        return RiskTier(value)
-    return _TIER_ALIASES[str(value).strip().lower()]
+    def __post_init__(self) -> None:
+        # Accept string / int input but normalize to RiskTier enum
+        if not isinstance(self.risk_tier, RiskTier):
+            object.__setattr__(self, "risk_tier", _coerce_tier(self.risk_tier))
 
 
 @dataclass

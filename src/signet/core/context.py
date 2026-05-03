@@ -13,7 +13,7 @@ The context split mirrors the four hook timings:
 
 These are deliberately simple: dataclasses, mutable, single-request-scoped.
 A check that needs richer state should attach it to ``scratch`` or use
-:class:`signet.core.session.Session` for cross-request continuity.
+:class:`signet.server.session.Session` for cross-request continuity.
 """
 
 from __future__ import annotations

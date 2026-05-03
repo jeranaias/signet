@@ -83,6 +83,28 @@ class TestOwnerSpoofing:
         # Doesn't match human:/agent:/policy: prefix → blocked
         assert result.is_block
 
+    async def test_bare_agent_id_without_prefix_blocked(self) -> None:
+        """Regression test for owner-resolution bypass.
+
+        Earlier versions accepted ``X-Agent-Id: <anything>`` without the
+        ``agent:`` prefix, letting an attacker resolve an owner with an
+        arbitrary string. The prefix is now required.
+        """
+        check = OwnerResolutionCheck(require_owner=True)
+        result = await check.pre_request(_req({"X-Agent-Id": "alice"}))
+        assert result.is_block
+
+    async def test_garbage_agent_id_blocked(self) -> None:
+        check = OwnerResolutionCheck(require_owner=True)
+        result = await check.pre_request(_req({"X-Agent-Id": "$$$"}))
+        assert result.is_block
+
+    async def test_empty_agent_prefix_blocked(self) -> None:
+        check = OwnerResolutionCheck(require_owner=True)
+        # "agent:" with empty id should not resolve
+        result = await check.pre_request(_req({"X-Agent-Id": "agent:"}))
+        assert result.is_block
+
 
 # ----------------------------------------------------------------------
 # Category 2: Classification escalation

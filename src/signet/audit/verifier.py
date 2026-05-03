@@ -30,7 +30,6 @@ from enum import StrEnum
 from signet.audit.backend import AuditBackend
 from signet.audit.chain import KEY_ID_FIELD, _serialize_for_signing
 from signet.audit.keyring import KeyRing
-from signet.core.audit import AuditEntry
 
 
 class BreakKind(StrEnum):
@@ -109,8 +108,10 @@ class ChainVerifier:
         prev_hmac = ""
         last_good_idx = -1
         last_good_hmac = ""
+        total_entries = 0
 
         for index, entry in enumerate(self._backend.iter_entries()):
+            total_entries = index + 1
             # Link check: this entry's prev_hmac must match the prior entry's hmac
             if entry.prev_hmac != prev_hmac:
                 breaks.append(
@@ -177,23 +178,16 @@ class ChainVerifier:
             prev_hmac = entry.hmac
 
         return VerificationReport(
-            total_entries=index + 1 if "index" in locals() else 0,
+            total_entries=total_entries,
             breaks=tuple(breaks),
             last_known_good_index=last_good_idx,
             last_known_good_hmac=last_good_hmac,
         )
 
 
-# Helper imported at top of file but referenced via private name; expose to
-# tests and callers that build entries outside HmacChain (rare).
 __all__ = [
     "BreakKind",
     "ChainBreak",
     "ChainVerifier",
     "VerificationReport",
 ]
-
-
-def _entry_payload(entry: AuditEntry) -> bytes:
-    """Re-export of the canonical serializer for test convenience."""
-    return _serialize_for_signing(entry)

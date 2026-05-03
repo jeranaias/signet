@@ -101,10 +101,13 @@ class OwnerResolutionCheck(Check):
 
         ai = _first_header(headers, _HEADER_AGENT_ID)
         if ai.startswith("agent:"):
-            return Owner.agent(ai[len("agent:") :])
-        if ai:
-            # Bare agent ID (no prefix) is also accepted
-            return Owner.agent(ai)
+            agent_id = ai[len("agent:") :]
+            if agent_id:
+                return Owner.agent(agent_id)
+        # Bare X-Agent-Id values without the agent: prefix are NOT accepted.
+        # The prefix is required for symmetry with X-Commit-Owner: human:<id>
+        # and so an attacker can't bypass owner resolution by sending an
+        # arbitrary string in X-Agent-Id.
 
         pn = _first_header(headers, _HEADER_POLICY_NAME)
         if pn:

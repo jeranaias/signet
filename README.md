@@ -1,5 +1,3 @@
-![signet](.github/banner-placeholder.svg)
-
 # signet
 
 > Capability-based safety gates for LLM agents. The model proposes; signet authorizes.
@@ -24,11 +22,19 @@ pip install signet-sign
 
 ## Quickstart — drop-in OpenAI-compatible proxy
 
-Run the proxy in front of any OpenAI-compatible upstream:
+Scaffold a starter project and run the proxy in front of any OpenAI-compatible upstream:
 
 ```bash
-signet serve --upstream https://api.openai.com/v1 --port 8443
+signet init my-gate/
+cd my-gate
+signet serve \
+    --upstream https://api.openai.com/v1 \
+    --config pipeline.py \
+    --audit-log audit.jsonl \
+    --allow-ephemeral-key
 ```
+
+(Drop `--allow-ephemeral-key` and set `SIGNET_HMAC_SECRET=$(openssl rand -hex 32)` for production.)
 
 Point your client at `http://localhost:8443/v1` and add an owner header:
 
@@ -39,10 +45,13 @@ client = OpenAI(
     base_url="http://localhost:8443/v1",
     default_headers={"X-Commit-Owner": "human:alice@example.com"},
 )
-client.chat.completions.create(model="gpt-4o", messages=[...])
+client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "hello"}],
+)
 ```
 
-Without `X-Commit-Owner` (or `X-Agent-Id`, or a configured trusted-network fallback), the proxy returns `403 Pyros owner-resolution refusal` and writes an audit row.
+Without `X-Commit-Owner` (or `X-Agent-Id: agent:<id>`, or a configured trusted-network fallback), the proxy returns `403` with a refusal payload and writes an audit row.
 
 ## Architecture in one paragraph
 

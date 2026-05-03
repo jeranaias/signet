@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write  # for trusted publishing to PyPI (no API token needed)
 
 jobs:
   build:
@@ -40,21 +39,15 @@ jobs:
     name: Publish to PyPI
     needs: build
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/signet-sign
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
-      - name: Publish to PyPI via trusted publishing
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          # No password — trusted publishing uses the OIDC token from
-          # id-token: write above. PyPI must be configured with this
-          # repository as a trusted publisher first; see
-          # https://docs.pypi.org/trusted-publishers/
+          password: ${{ secrets.PYPI_API_TOKEN }}
           packages-dir: dist/
 
   github-release:

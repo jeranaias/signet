@@ -24,8 +24,9 @@ two options:
 1. Run signet as an OpenAI-compatible front-end to a translator
    (recommended; this adapter handles the SDK side).
 2. Call Anthropic without signet for the request itself, but use
-   signet's pipeline programmatically to evaluate decisions
-   (see :doc:`docs/embed`).
+   signet's pipeline programmatically to evaluate decisions —
+   construct a :class:`signet.core.pipeline.Pipeline` and call its
+   hook methods directly without the HTTP proxy.
 """
 
 from __future__ import annotations

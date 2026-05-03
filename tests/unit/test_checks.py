@@ -72,6 +72,13 @@ class TestOwnerResolution:
         assert ctx.owner.owner_type is OwnerType.AGENT
         assert ctx.owner.owner_id == "nightly-syncer"
 
+    async def test_bare_agent_id_rejected(self) -> None:
+        """X-Agent-Id requires the 'agent:' prefix; bare values are not accepted."""
+        check = OwnerResolutionCheck(require_owner=True)
+        ctx = _request(headers={"X-Agent-Id": "nightly-syncer"})
+        result = await check.pre_request(ctx)
+        assert result.is_block
+
     async def test_policy_with_version(self) -> None:
         check = OwnerResolutionCheck()
         ctx = _request(headers={"X-Policy-Name": "acme", "X-Policy-Version": "v3"})

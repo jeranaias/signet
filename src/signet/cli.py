@@ -99,8 +99,6 @@ def serve(
     config_path: Path | None,
 ) -> None:
     """Run the signet proxy."""
-    import importlib.util
-
     import uvicorn
 
     from signet.core.pipeline import Pipeline
@@ -129,8 +127,6 @@ def serve(
     app = SignetApp(config=cfg, pipeline=pipeline).app
     click.echo(f"signet {__version__} → {upstream_url}  (listening on {host}:{port})")
     uvicorn.run(app, host=host, port=port, log_level="info")
-    # Reference importlib.util to silence flake8/mypy when unused
-    _ = importlib.util
 
 
 @main.group()

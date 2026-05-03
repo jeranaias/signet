@@ -87,4 +87,4 @@ signet does **not** trust:
 
 ---
 
-For check-by-check details see `docs/checks/`. For writing your own checks see `docs/plugin_dev.md` (coming in v0.1).
+For check-by-check details see `docs/checks/`. For writing your own checks see [`docs/plugin_dev.md`](plugin_dev.md).
