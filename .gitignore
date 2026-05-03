@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+wheels/
+*.egg
+MANIFEST
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# Type checkers
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Linters
+.ruff_cache/
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Docs
+site/
+docs/_build/
+
+# Local env / secrets
+.env
+.env.local
+*.key
+*.pem
+
+# signet runtime
+*.audit.jsonl
+.signet-audit/
