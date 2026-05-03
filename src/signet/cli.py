@@ -19,10 +19,14 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
 from signet import __version__
+
+if TYPE_CHECKING:
+    from signet.core.pipeline import Pipeline
 
 logger = logging.getLogger("signet.cli")
 
@@ -236,7 +240,7 @@ def init(target_dir: Path) -> None:
     click.echo("    --audit-log audit.jsonl --allow-ephemeral-key")
 
 
-def _load_pipeline_from_path(path: Path):
+def _load_pipeline_from_path(path: Path) -> "Pipeline":
     """Import a Python file and return its ``pipeline`` attribute."""
     import importlib.util
 
