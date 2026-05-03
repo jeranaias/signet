@@ -142,7 +142,7 @@ class SignetApp:
 
         # Build RequestContext. Owner starts unresolved; the
         # OwnerResolutionCheck (or LoopbackTrustCheck before it) populates it.
-        headers = {k: v for k, v in request.headers.items()}
+        headers = dict(request.headers.items())
         client_ip = request.client.host if request.client else None
         session_id = headers.get(SESSION_HEADER) or headers.get(SESSION_HEADER.lower())
 
@@ -260,9 +260,7 @@ class SignetApp:
         """Headers to forward to the upstream. Strip signet-only headers."""
         out: dict[str, str] = {}
         for h in self.config.extra_forward_headers:
-            if v := ctx.headers.get(h):
-                out[h] = v
-            elif v := ctx.headers.get(h.lower()):
+            if (v := ctx.headers.get(h)) or (v := ctx.headers.get(h.lower())):
                 out[h] = v
         if self.config.upstream_api_key and "Authorization" not in out:
             out["Authorization"] = f"Bearer {self.config.upstream_api_key}"
@@ -299,7 +297,9 @@ class SignetApp:
     ) -> AuditEntry | None:
         if self._chain is None:
             return None
-        decision = Decision.BLOCK if (result is not None and not result.is_allow) else Decision.ALLOW
+        decision = (
+            Decision.BLOCK if (result is not None and not result.is_allow) else Decision.ALLOW
+        )
         reason = result.reason if result is not None else "request completed"
         meta = dict(metadata or {})
         if result is not None:
