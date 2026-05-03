@@ -71,7 +71,15 @@ nav:
   - Architecture: architecture.md
   - Checks:
     - Owner Resolution: checks/owner_resolution.md
+    - Loopback Trust: checks/loopback_trust.md
     - Classification Gate: checks/classification_gate.md
+    - Rate Limit: checks/rate_limit.md
+    - Token Budget: checks/token_budget.md
+    - Regex Content / Output: checks/regex_content.md
+    - Prompt Injection: checks/prompt_injection.md
+    - Scope Drift: checks/scope_drift.md
+    - Continuing Consent: checks/continuing_consent.md
+    - Tool Call Inspector: checks/tool_call_inspector.md
   - Plugin development: plugin_dev.md
   - Integrations:
     - Authentication (mTLS / JWT / OIDC): integrations/auth.md

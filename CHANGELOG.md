@@ -8,6 +8,41 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-05-03
+
+### Documentation accuracy pass
+
+This is a doc-only release so the README on PyPI's project page
+reflects what v0.1.3 actually shipped. No code changes.
+
+- README "Honest scope" section rewritten. Removed stale "roadmap
+  for v0.2" claims about ed25519 receipts, RFC 3161 anchoring,
+  multi-process audit writers, and embeddings/completions —
+  all shipped in v0.1.3. Restructured into "architectural
+  boundaries" (things signet doesn't do because they belong
+  elsewhere) + "When you need more than the OSS" (the legitimate
+  Pro/Thornveil call for production-tuned LLM-judge calibration,
+  behavioral fingerprinting, HSM integrations, compliance
+  attestation, custom check development).
+- README built-in-checks table updated to reflect the v0.1.3
+  PromptInjection improvements (NFKC, confusables fold, multi-
+  encoding decoders).
+- `SECURITY.md` threat model updated: tamper-evidence now points
+  at the actually-shipped `Rfc3161Anchor`; receipt symmetry now
+  points at the actually-shipped `Ed25519ReceiptSigner`; multi-
+  process writer warning now points at the actually-shipped
+  `FileLockingJsonlBackend`. Stale "v0.2 supply-chain roadmap"
+  removed.
+- `docs/architecture.md` "two limits" section reframed as "two
+  architectural choices" — both choices are now operator-config
+  decisions, not future work.
+- 7 new check pages: `loopback_trust`, `rate_limit`, `regex_content`,
+  `prompt_injection`, `token_budget`, `scope_drift`,
+  `continuing_consent`, `tool_call_inspector`. Each documents
+  what the check does, configuration patterns, audit-row shapes,
+  and known false-positive surface. The mkdocs nav now lists all
+  10 built-in checks.
+
 ## [0.1.3] — 2026-05-03
 
 ### Added — Phase 1: bulletproof OSS
@@ -451,7 +486,8 @@ Test count: 220 unit + adversarial green. mypy clean. ruff clean.
 - Test matrix: Python 3.11 / 3.12 / 3.13 × Linux / macOS / Windows = 9 jobs per push
 - mkdocs-material site builds + deploys to GitHub Pages
 
-[Unreleased]: https://github.com/jeranaias/signet/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/jeranaias/signet/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/jeranaias/signet/releases/tag/v0.1.4
 [0.1.3]: https://github.com/jeranaias/signet/releases/tag/v0.1.3
 [0.1.2]: https://github.com/jeranaias/signet/releases/tag/v0.1.2
 [0.1.1]: https://github.com/jeranaias/signet/releases/tag/v0.1.1

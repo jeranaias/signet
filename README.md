@@ -68,7 +68,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full design. See [`SE
 | `RegexContentCheck` | ADMISSION | Block / redact patterns in input |
 | `RegexOutputCheck` | INSPECTION | Same matcher against streaming output |
 | `ClassificationGateCheck` | ADMISSION | 5-level UNCLASS → TS/SCI architectural enforcement |
-| `PromptInjectionCheck` | ADMISSION | Pattern + heuristic + base64-decoded scan |
+| `PromptInjectionCheck` | ADMISSION | Pattern + heuristic, NFKC + confusables fold, multi-encoding decoders |
 | `TokenBudgetCheck` | ADMISSION + RECORD | Per-owner output-token quota with reconciliation |
 | `ScopeDriftCheck` | INSPECTION | Token / character / classification-marker drift |
 | `ContinuingConsentCheck` | INSPECTION | Periodic mid-stream owner-authority revalidation |
@@ -135,18 +135,92 @@ resp = client.chat.completions.create(
 
 Symmetric `wrap_anthropic` for Anthropic's SDK; `SignetCallbackHandler` for LangChain.
 
-## Honest scope (read this before deploying)
+## What signet does NOT do (and what you do about it)
 
-signet is v0.1, Apache-2.0 OSS, no support contract. Production deployments should understand:
+The OSS is genuinely production-grade; the items below are not gaps in
+the gate, they are responsibilities that belong to other layers or
+to Day-2 operational concerns. Read this before deploying.
 
-- **Owner identity is caller-asserted, not authenticated.** signet records what the caller said the owner was; it does not verify a JWT, OIDC token, or mTLS cert. Stack real auth (mTLS, OIDC, an SSO-fronting reverse proxy, a tailnet) in front of the proxy. The audit row says "the caller said X did this," not "X cryptographically authorized this."
-- **The audit log is tamper-*evident*, not tamper-*proof*.** Detects modification by anyone who doesn't hold the HMAC key. Doesn't prevent rewrites by your own root operator. Production needs WORM storage or RFC 3161 timestamping anchored externally — roadmap for v0.2.
-- **Receipt signing is symmetric (HMAC).** Anyone who can verify a receipt can also forge one. Fine for internal auditors; not fine for handing receipts to outside parties as unforgeable proof. Asymmetric (ed25519) is roadmap.
-- **Built-in `PromptInjectionCheck` is coarse.** Catches the obvious patterns; sophisticated attacks (homoglyph, non-English, adversarial suffixes) pass. Layer an LLM-judge plugin for richer detection.
-- **Multi-process safe writers not yet shipped.** Run uvicorn `--workers 1` in v0.1, or implement a backend with cross-process locking.
-- **Endpoint coverage in v0.1.** Only `POST /v1/chat/completions` is gated. Other OpenAI surfaces (`/v1/embeddings`, `/v1/completions`, `/v1/audio/*`, `/v1/images/*`) return explicit 404s with a roadmap note.
+### Architectural boundaries — by design, not by omission
 
-Full threat model and what's explicitly out of scope: [`SECURITY.md`](SECURITY.md).
+- **Owner identity is caller-asserted.** signet records what the
+  caller said the owner was; it does not verify a JWT, OIDC token,
+  or mTLS cert. Authentication belongs in front of the gate. Three
+  concrete recipes (nginx + mTLS, FastAPI + JWT, oauth2-proxy +
+  OIDC) ship at [`docs/integrations/auth.md`](docs/integrations/auth.md).
+  After that layer is wired, the audit row's text doesn't change but
+  the trust behind it is now real.
+
+- **`/v1/audio/*` and `/v1/images/*` are not gated.** Their request
+  shapes (binary uploads, multi-part forms) don't fit the JSON-body
+  pipeline; gating them needs vision-aware / audio-transcript checks
+  that will land as their own protocol additions. v0.1.3 returns
+  explicit 404s with a roadmap note. `/v1/chat/completions`,
+  `/v1/completions`, and `/v1/embeddings` are all gated.
+
+### What's hard about prompt injection (and what we do about it)
+
+`PromptInjectionCheck` ships with NFKC normalization, Cyrillic /
+Greek / Cherokee confusables fold, zero-width-character stripping,
+"stretched" letter-spacing collapse, and decoders for base64
+(standard + URL-safe), base32, hex, and ROT13. The trivial obfuscations
+(`іgnore previous`, `i g n o r e`, ROT13-encoded attacks) all hit.
+
+What it still doesn't catch: semantic prompt injection in non-English
+syntax, adversarial-suffix attacks (GCG/AutoDAN-discovered token
+strings), and multi-turn cumulative attacks. Those need a calibrated
+LLM-judge with labeled adversarial corpora — see "When you need more
+than the OSS" below.
+
+### What's tamper-evident vs. tamper-proof
+
+The HMAC chain detects modification by anyone who **doesn't** hold
+the HMAC key. To also defend against rewrites by an operator who
+**does** hold the key (insider threat, root compromise), pair the
+chain with `signet.audit.anchor.Rfc3161Anchor` — every entry's HMAC
+is anchored against a public RFC 3161 Time Stamp Authority (FreeTSA
+by default; works against any TSA you have a contract with). The
+anchor receipt is bound to the entry by the chain HMAC, so swapping
+either fails verification. No extra dependencies.
+
+### What's symmetric vs. asymmetric (receipts)
+
+The default `HmacReceiptSigner` is symmetric — fine when the
+verifier is in your trust domain (your own auditor reads your own
+logs). When you hand receipts to outside parties (customers,
+regulators) and want them to be unforgeable by anyone but the proxy,
+swap in `Ed25519ReceiptSigner`. The proxy holds the private key;
+verifiers hold only the public key and cannot forge. Generate keys
+with `signet keys generate-ed25519`. Optional dep
+`pip install signet-sign[ed25519]`.
+
+### When you need more than the OSS
+
+Some capabilities require ongoing investment that doesn't fit the
+"ship as code" model. If you need any of the following, dedicated
+support is appropriate — from Thornveil (the maintainers, signet-aware)
+or your preferred provider:
+
+- **Production-tuned attack detection** beyond the OSS pattern
+  matchers (calibrated LLM-judge prompts, labeled adversarial
+  corpora, ongoing threat-intel feeds, multilingual semantic
+  detection)
+- **Behavioral fingerprinting / proof-of-inference** — proving which
+  specific model actually served a response (separate from signet's
+  chain proving signet processed the request)
+- **HSM- or KMS-backed receipt signing** (custom integration per
+  enterprise environment — CloudHSM, Azure Key Vault, on-prem
+  nCipher)
+- **Compliance attestation packages** (FedRAMP, IL5, SOC2)
+- **Custom check development** against your specific threat model
+- **24/7 incident response and SLA**
+
+For Thornveil-specific engagements: jeranaias@gmail.com. For DIY,
+the [plugin interface](docs/plugin_dev.md) is the right starting
+point — signet's plugin protocol is designed so production-grade
+additions don't require forking the core.
+
+Full threat model and the granular hardening checklist: [`SECURITY.md`](SECURITY.md).
 
 ## Operations cheat sheet
 

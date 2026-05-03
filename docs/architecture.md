@@ -60,10 +60,10 @@ Every decision the pipeline makes — allow, block, redact, escalate — becomes
 
 For each *response* the proxy emits, an `X-Signet-Receipt` HTTP header is returned to the caller. The receipt is signed (HMAC-SHA256 in v0.1; the format carries an `alg=` tag so asymmetric signers can be added without a downgrade attack) over a canonicalized summary of the audit row. Callers verify the receipt against the signing key.
 
-**Two limits to internalize before relying on this:**
+**Two architectural choices to make at deploy time, not gaps:**
 
-1. **HMAC is symmetric.** The party that verifies a receipt holds the secret to forge one. Fine when verifier and proxy share a trust domain (your own auditor reads your own logs). Not fine for handing receipts to outside parties as unforgeable proof. Asymmetric (ed25519) signers are roadmapped for v0.2.
-2. **The chain is tamper-evident, not write-once.** An attacker with both file-write access *and* the HMAC secret can replace the chain end-to-end and the verifier sees nothing. True append-only requires WORM storage, RFC 3161 timestamping, or transparency-log anchoring — all v0.2 work.
+1. **Symmetric vs. asymmetric receipts.** The default `HmacReceiptSigner` is symmetric — the party that verifies a receipt holds the secret to forge one. Fine when verifier and proxy share a trust domain (your own auditor reads your own logs). For receipts handed to outside parties (customers, regulators) and required to be unforgeable by anyone but the proxy, swap in `Ed25519ReceiptSigner` (verifiers hold only the public key; cannot forge). Generate keys with `signet keys generate-ed25519`. Optional dep `signet-sign[ed25519]`.
+2. **Tamper-evident vs. tamper-proof.** The HMAC chain alone is tamper-*evident* — detects modification by anyone without the key. To also defend against rewrites by the operator who *holds* the key, pair the chain with an `AnchorBackend`. v0.1.3 ships `Rfc3161Anchor` (FreeTSA / any free public RFC 3161 TSA, no extra deps). The anchor receipt is bound to the entry by the chain HMAC, so swapping either fails verification. WORM storage (S3 Object Lock, immutable filesystem) stacks cleanly with anchoring for defense in depth.
 
 ## Replay
 
@@ -96,8 +96,8 @@ signet does **not** trust:
 - **Network-level enforcement.** signet enforces at the application layer. Network isolation, mTLS, and outbound firewall rules are out of scope.
 - **Comprehensive PII detection.** The built-in `RegexContentCheck` handles common patterns; richer detection (Presidio, custom NER) is a plugin concern.
 - **Sophisticated prompt-injection defense.** `PromptInjectionCheck` catches obvious English patterns; non-English, homoglyph, whitespace-obfuscated, and adversarial-suffix attacks all pass. Layer an LLM-judge plugin if you need real coverage.
-- **Multi-process safe audit writes.** v0.1 ships with a single-writer chain; multi-worker uvicorn deployments need a custom backend with cross-process locking.
-- **Tamper-proof audit storage.** The HMAC chain is tamper-evident (detects modification by parties without the key) but not write-once. WORM storage / RFC 3161 timestamping / transparency-log anchoring is v0.2 work.
+- **Multi-process safe audit writes** *out of the box*. The default `JsonlBackend` is single-writer; `uvicorn --workers N>1` needs `FileLockingJsonlBackend` + `HmacChain(cache_prev=False)` (both ship in v0.1.3, just opt-in).
+- **Bundled WORM storage adapter.** External anchoring (RFC 3161 via `Rfc3161Anchor`) ships in v0.1.3 and closes the rewrite-by-key-holder gap; immutable filesystem / S3 Object Lock are operator choices, not bundled adapters.
 - **Solving social engineering by AI.** A model that produces a sufficiently persuasive justification for a bad action can still get a tired human reviewer to approve it. That is a residual problem signet does not claim to solve.
 
 ---
