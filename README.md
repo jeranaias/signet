@@ -17,8 +17,10 @@ signet takes a different path: separate **deciding what to do** from **being all
 ## Install
 
 ```bash
-pip install signet-py
+pip install signet-sign
 ```
+
+(The PyPI namespace `signet` was claimed by an unrelated abandoned project in 2014; the import name in code is still `import signet`.)
 
 ## Quickstart — drop-in OpenAI-compatible proxy
 
