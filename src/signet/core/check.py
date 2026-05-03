@@ -29,7 +29,6 @@ checks just don't ``await`` anything.
 
 from __future__ import annotations
 
-from abc import ABC
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -104,12 +103,15 @@ class CheckResult:
         return self.decision is Decision.ESCALATE
 
 
-class Check(ABC):
-    """Abstract base class for all checks.
+class Check:
+    """Base class for all checks.
 
     Subclasses must override :attr:`name` and :attr:`stage`. They override
     the hooks they care about; unimplemented hooks return a permissive
-    ``CheckResult.allow()``.
+    ``CheckResult.allow()``. The class is not formally ``ABC`` because its
+    hooks have permissive defaults rather than abstract methods, but the
+    ``__init_subclass__`` validator enforces the same "you must declare
+    these" contract.
 
     A check instance is reused across many requests; do not stash per-request
     state on ``self``. If you need it, use the ``RequestContext.scratch`` dict

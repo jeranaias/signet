@@ -72,18 +72,18 @@ class TestCheckResultConstructors:
 class TestCheckSubclassValidation:
     def test_subclass_without_name_raises_at_definition(self) -> None:
         with pytest.raises(TypeError, match="non-empty `name`"):
-            class _BadCheck(Check):  # noqa: N801
+            class _BadCheck(Check):
                 stage = Stage.ADMISSION
                 # name omitted
 
     def test_subclass_without_stage_raises_at_definition(self) -> None:
         with pytest.raises(TypeError, match="`stage` to a Stage"):
-            class _BadCheck(Check):  # noqa: N801
+            class _BadCheck(Check):
                 name = "bad"
                 stage = "admission"  # type: ignore[assignment]  # not a Stage enum
 
     def test_well_formed_subclass_accepts(self) -> None:
-        class _GoodCheck(Check):  # noqa: N801
+        class _GoodCheck(Check):
             name = "good"
             stage = Stage.ADMISSION
 
@@ -95,7 +95,7 @@ class TestCheckSubclassValidation:
 class TestCheckDefaultHooksAreAllow:
     @pytest.fixture
     def check(self) -> Check:
-        class _NoOpCheck(Check):  # noqa: N801
+        class _NoOpCheck(Check):
             name = "noop"
             stage = Stage.ADMISSION
 

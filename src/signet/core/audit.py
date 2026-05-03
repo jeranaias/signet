@@ -21,7 +21,7 @@ from typing import Any
 from signet.core.owner import Owner
 
 
-class Decision(str, enum.Enum):
+class Decision(enum.StrEnum):
     """The outcome of evaluating a request through one or more checks."""
 
     ALLOW = "allow"

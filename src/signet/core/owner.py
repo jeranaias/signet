@@ -20,7 +20,7 @@ import enum
 from dataclasses import dataclass, field
 
 
-class OwnerType(str, enum.Enum):
+class OwnerType(enum.StrEnum):
     """Discriminator for the kind of actor responsible for a commit."""
 
     HUMAN = "human"

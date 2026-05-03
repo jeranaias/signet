@@ -57,8 +57,8 @@ from __future__ import annotations
 import enum
 
 
-class Stage(str, enum.Enum):
-    """The four stages of the signet check hierarchy.
+class Stage(enum.StrEnum):
+    """The four stages of signet's check hierarchy.
 
     Order matters: lower-ordinal stages run first, and a block at any stage
     short-circuits all later stages.
