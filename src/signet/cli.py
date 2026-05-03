@@ -249,11 +249,17 @@ def _load_pipeline_from_path(path: Path) -> Pipeline:
         raise click.ClickException(f"could not load config from {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    from signet.core.pipeline import Pipeline as _Pipeline
+
     pipeline = getattr(module, "pipeline", None)
     if pipeline is None:
         raise click.ClickException(
             f"{path} does not define a `pipeline` variable. "
             "Run `signet init` for a starter template."
+        )
+    if not isinstance(pipeline, _Pipeline):
+        raise click.ClickException(
+            f"{path}'s `pipeline` is {type(pipeline).__name__}, expected signet.core.pipeline.Pipeline"
         )
     return pipeline
 
