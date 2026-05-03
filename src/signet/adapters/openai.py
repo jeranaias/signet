@@ -92,9 +92,9 @@ def wrap_openai(
     # a hard dependency; runtime duck-typing is enough.
     client.base_url = signet_url  # type: ignore[attr-defined]
     if hasattr(client, "default_headers"):
-        existing = dict(client.default_headers or {})  # type: ignore[attr-defined]
+        existing = dict(client.default_headers or {})
         existing.update(headers)
-        client.default_headers = existing  # type: ignore[attr-defined]
+        client.default_headers = existing
     else:
         # Older SDK versions: stash on a custom attribute the user can
         # supply manually. Document this in the migration notes.
