@@ -8,11 +8,17 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
-### Hardened — pre-release polish (round 1-4 review)
+## [0.1.0] — 2026-05-03
 
-Real fixes informed by an adversarial self-review pass before tagging
-v0.1.0. None are wire-format breaking; some change response semantics
-in ways that match the documented intent.
+First public release. Apache-2.0 OSS prior art for the gate-pattern thesis.
+
+### Hardened — pre-release adversarial review
+
+Five rounds of self-review against a fresh "hater" lens before tagging,
+producing ~50 fixes across the audit chain, receipt format, proxy
+semantics, owner resolution, memory safety, and documentation honesty.
+None are wire-format breaking; some change response semantics in ways
+that match the documented intent.
 
 #### Audit chain
 - `HmacChain.append` now holds an internal `threading.Lock`; concurrent
@@ -181,11 +187,7 @@ in ways that match the documented intent.
 - `signet init` writes `.gitignore` and does not overwrite existing
   one.
 
-Test count: 219 unit + adversarial green. mypy clean. ruff clean.
-
-## [0.1.0] — 2026-05-03
-
-First public release. Apache-2.0 OSS prior art for the gate-pattern thesis.
+Test count: 220 unit + adversarial green. mypy clean. ruff clean.
 
 ### Added — core abstractions
 
