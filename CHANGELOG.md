@@ -8,6 +8,15 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-05-03
+
+### Fixed
+
+- `signet serve` startup banner used `→` (U+2192) which crashes Python's
+  default cp1252 stdout on Windows with `UnicodeEncodeError`. Caught
+  immediately on the first post-publish smoketest. Replaced with `->`
+  for portability across console code pages.
+
 ## [0.1.0] — 2026-05-03
 
 First public release. Apache-2.0 OSS prior art for the gate-pattern thesis.
@@ -278,5 +287,6 @@ Test count: 220 unit + adversarial green. mypy clean. ruff clean.
 - Test matrix: Python 3.11 / 3.12 / 3.13 × Linux / macOS / Windows = 9 jobs per push
 - mkdocs-material site builds + deploys to GitHub Pages
 
-[Unreleased]: https://github.com/jeranaias/signet/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jeranaias/signet/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/jeranaias/signet/releases/tag/v0.1.1
 [0.1.0]: https://github.com/jeranaias/signet/releases/tag/v0.1.0

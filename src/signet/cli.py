@@ -133,7 +133,10 @@ def serve(
     )
 
     app = SignetApp(config=cfg, pipeline=pipeline).app
-    click.echo(f"signet {__version__} → {upstream_url}  (listening on {host}:{port})")
+    # ASCII arrow (-> not →) so the banner renders on Windows cp1252 stdout
+    # without UnicodeEncodeError when the user has not reconfigured their
+    # console code page. See v0.1.0 → v0.1.1 release notes.
+    click.echo(f"signet {__version__} -> {upstream_url}  (listening on {host}:{port})")
 
     # Print loaded checks so operators can verify the configuration
     # without re-reading the file. Quiet on the empty-pipeline path
