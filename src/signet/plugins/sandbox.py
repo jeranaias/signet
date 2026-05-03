@@ -126,7 +126,7 @@ class SandboxPreviewCheck(Check):
 
         try:
             result = await self.runner(ctx.tool_name, ctx.arguments)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "sandbox runner failed for %s: %s: %s",
                 ctx.tool_name,

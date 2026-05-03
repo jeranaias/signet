@@ -98,13 +98,9 @@ class TribunalCheck(Check):
 
         a, b = verdicts
         if a == "ALLOW" and b == "ALLOW":
-            return CheckResult.allow(
-                "tribunal: both judges allow", judge_a=a, judge_b=b
-            )
+            return CheckResult.allow("tribunal: both judges allow", judge_a=a, judge_b=b)
         if a == "BLOCK" and b == "BLOCK":
-            return CheckResult.block(
-                "tribunal: both judges block", judge_a=a, judge_b=b
-            )
+            return CheckResult.block("tribunal: both judges block", judge_a=a, judge_b=b)
         # Disagreement
         if self.require_unanimous_block:
             return CheckResult.allow(
@@ -118,9 +114,7 @@ class TribunalCheck(Check):
             judge_b=b,
         )
 
-    async def _ask_judge(
-        self, client: httpx.AsyncClient, url: str, model: str, prompt: str
-    ) -> str:
+    async def _ask_judge(self, client: httpx.AsyncClient, url: str, model: str, prompt: str) -> str:
         """Returns ``"ALLOW"``, ``"BLOCK"``, or ``"BLOCK"`` on any error."""
         body = {
             "model": model,
@@ -133,12 +127,9 @@ class TribunalCheck(Check):
             resp.raise_for_status()
             data = resp.json()
             text = (
-                (data.get("choices") or [{}])[0]
-                .get("message", {})
-                .get("content", "")[:200]
-                .upper()
+                (data.get("choices") or [{}])[0].get("message", {}).get("content", "")[:200].upper()
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("tribunal judge %s failed: %s: %s", url, type(exc).__name__, exc)
             return "BLOCK"
 

@@ -48,7 +48,7 @@ def discover(*, refresh: bool = False) -> dict[str, type[Check]]:
     for ep in _iter_entry_points():
         try:
             obj = ep.load()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "signet plugin %r failed to load: %s: %s",
                 ep.name,
