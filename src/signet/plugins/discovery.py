@@ -103,7 +103,7 @@ def _iter_entry_points() -> list[EntryPoint]:
     if callable(select):
         return list(select(group=ENTRY_POINT_GROUP))
     # Fallback for very old shapes
-    return list(eps.get(ENTRY_POINT_GROUP, []))  # type: ignore[union-attr]
+    return list(eps.get(ENTRY_POINT_GROUP, []))
 
 
 __all__ = ["ENTRY_POINT_GROUP", "discover", "load_by_name", "reset_cache"]
