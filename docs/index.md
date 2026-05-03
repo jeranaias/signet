@@ -1,16 +1,18 @@
 # signet
 
-Capability-based safety gates for LLM agents. **The model proposes; signet authorizes.**
+> **The model decides what to do. signet decides whether the decision is allowed to fire.**
 
-## What it is
+Your AI agents are issuing refunds, calling APIs, running tools, writing to databases. Each of those actions is being authorized by a non-deterministic system that can be talked into anything by a sufficiently clever prompt. **The blast radius of "the model held commit authority" is your next incident report.**
 
-signet sits between an LLM and any system that can execute its outputs. It is a small set of programmatic checks — owner resolution, classification gating, dual-judge dissent, sandbox preview, HMAC-chained audit — that decide whether the model's proposed action is allowed to actually run.
+signet is a small Apache-2.0 proxy that sits between your callers and the LLM. Every request runs through programmatic checks before the model sees it; every response is re-checked before the caller sees it; every tool call is gated before it executes. Every decision lands in a tamper-evident, HMAC-chained audit log compatible with NIST 800-53 audit-content and integrity requirements.
 
-The model never holds commit authority. Same shape as a junior employee who can fill out a purchase order but cannot sign the check.
+**The model never holds commit authority — same shape as a junior employee who fills out the purchase order but can't sign the check.**
+
+Drop-in: existing OpenAI/Anthropic SDK code keeps working with one config change. Runs in your VPC. No data sent to third parties. < 100 MB memory. < 5 ms overhead per request.
 
 ## Why this exists
 
-LLM agents that "wait for human input" rely on the model itself to comply with the instruction. Sufficiently capable models ignore the instruction whenever their objective gradient outweighs it. No prompt fixes that.
+LLMs are non-deterministic software being deployed under deterministic-software governance assumptions. The standard "make the model wait for human approval" pattern depends on the model itself complying with the instruction in its system prompt. Sufficiently capable models ignore that whenever their objective gradient outweighs it. **No prompt fixes that.**
 
 signet takes a different path: separate **deciding what to do** from **being allowed to do it**. The model decides; signet decides whether the decision can fire. The model's compliance is no longer load-bearing for the gate.
 
@@ -22,22 +24,26 @@ pip install signet-sign
 
 (The PyPI namespace `signet` was claimed by an unrelated abandoned project in 2014; the import name in code is still `import signet`.)
 
-## Quickstart
+## Quickstart — three commands to a working gate
 
 ```bash
-signet init my-gate/
+signet init my-gate           # scaffold pipeline.py + client_example.py + .env + .gitignore
 cd my-gate
-# review pipeline.py, edit to taste
-signet serve --upstream http://localhost:11434/v1 --config pipeline.py \
-  --audit-log audit.jsonl --allow-ephemeral-key
+signet serve --upstream http://localhost:11434/v1 --dev
 ```
 
-Now point your OpenAI-compatible client at `http://localhost:8443/v1` with an `X-Commit-Owner: human:<your-id>` header.
+`--dev` bundles `--allow-ephemeral-key`, `--audit-log audit.jsonl`, and `--config pipeline.py` so local development is one flag instead of three.
+
+Then point any OpenAI-compatible client at `http://localhost:8443/v1` with an `X-Commit-Owner: human:<your-id>` header. A complete example client lives in the scaffold:
+
+```bash
+python client_example.py
+```
 
 ## Where to next
 
-- [Architecture](architecture.md) — the four-stage hierarchy, continuing-consent and scope-drift patterns, trust model
+- [Architecture](architecture.md) — the four-stage hierarchy, continuing-consent and scope-drift patterns, trust model, and what's intentionally out of scope
 - [Checks](checks/owner_resolution.md) — per-check reference
 - [Plugin development](plugin_dev.md) — write your own checks
 - [Contributing](https://github.com/jeranaias/signet/blob/main/CONTRIBUTING.md)
-- [Security policy](https://github.com/jeranaias/signet/blob/main/SECURITY.md)
+- [Security policy](https://github.com/jeranaias/signet/blob/main/SECURITY.md) — threat model, reporting, hardening recommendations

@@ -67,6 +67,11 @@ class ServerConfig:
     allow_ephemeral_key: bool = False
     receipt_header_name: str = "X-Signet-Receipt"
     emit_receipts: bool = True
+    upstream_label: str | None = None
+    """Optional label surfaced in the ``X-Signet-Upstream`` response
+    header so callers can finger-point upstream errors vs. signet
+    errors at a glance. ``None`` (default) means ``X-Signet-Upstream``
+    carries the host portion of ``upstream_url``."""
     max_request_body_bytes: int = 4 * 1024 * 1024
     """Hard cap on inbound request body size. Anything larger gets a
     413 before signet attempts to parse it. Default 4 MiB covers
@@ -129,5 +134,7 @@ class ServerConfig:
             cfg.emit_receipts = v.lower() == "true"
         if v := e.get("SIGNET_MAX_REQUEST_BODY_BYTES"):
             cfg.max_request_body_bytes = int(v)
+        if v := e.get("SIGNET_UPSTREAM_LABEL"):
+            cfg.upstream_label = v
 
         return cfg

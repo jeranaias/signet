@@ -8,6 +8,59 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-03
+
+### Added — UX polish from first-user smoketest
+
+- `signet serve --dev` shorthand. Bundles `--allow-ephemeral-key`,
+  `--audit-log audit.jsonl`, and `--config pipeline.py` into one
+  flag. Each is only set if not otherwise specified. The most
+  common local invocation drops from five flags to one.
+- `signet doctor` command. Prints versions and probes endpoints:
+  `--upstream <url>` checks the LLM upstream is reachable;
+  `--self <url>` hits a running signet's `/health`, `/version`,
+  and sends a no-owner refusal probe to confirm the gate is
+  enforcing. Exits non-zero on any probe failure.
+- `signet audit show <entry-id>` is the new (honest) name for what
+  `signet replay` did. The `replay` alias still works but prints a
+  deprecation warning; it will be removed in v0.2 alongside the
+  actual pipeline-replay feature.
+- `signet init` writes a `client_example.py` alongside the
+  pipeline scaffold. New users no longer have to read the README
+  to find out how to call signet from Python — both raw httpx and
+  `wrap_openai` patterns are demonstrated.
+- `signet serve` prints the ephemeral HMAC key on startup when
+  `--allow-ephemeral-key` is in effect. Lets the user save it
+  externally if they want to verify the audit log later instead
+  of losing the key on shutdown.
+- `OwnerResolutionCheck` refusal hint now lists three concrete
+  header examples (`X-Commit-Owner: human:alice@example.com`,
+  `X-Agent-Id: agent:nightly-syncer`, `X-Policy-Name: acme-default`)
+  instead of just naming the field shapes. Refusal payload also
+  carries an `examples` array.
+- `X-Signet-Upstream` and `X-Signet-Upstream-Status` response
+  headers on every reply so callers can finger-point upstream
+  errors vs. signet errors at a glance. Configurable label via
+  `--upstream-label` / `SIGNET_UPSTREAM_LABEL` (defaults to the
+  upstream URL host).
+- `ServerConfig.upstream_label` field exposed for embedded use.
+
+### Documentation
+
+- README rewritten to lead with the "why you need this now" pitch:
+  three concrete attack scenarios, then the architecture, then the
+  honest-scope section. Designed so a CEO can read the first three
+  paragraphs and a CTO can read the rest.
+- `docs/architecture.md` opens with a one-paragraph layman
+  summary that names the junior-employee analogy before diving
+  into the technical section. Trust model and out-of-scope
+  list cleaned up.
+- `docs/index.md` matches the README's framing for the docs site
+  landing page.
+- `docs/checks/owner_resolution.md` corrected — `X-Agent-Id`
+  bare values are no longer accepted (the `agent:` prefix is
+  required, fixed during pre-release security review).
+
 ## [0.1.1] — 2026-05-03
 
 ### Fixed
@@ -287,6 +340,7 @@ Test count: 220 unit + adversarial green. mypy clean. ruff clean.
 - Test matrix: Python 3.11 / 3.12 / 3.13 × Linux / macOS / Windows = 9 jobs per push
 - mkdocs-material site builds + deploys to GitHub Pages
 
-[Unreleased]: https://github.com/jeranaias/signet/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/jeranaias/signet/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/jeranaias/signet/releases/tag/v0.1.2
 [0.1.1]: https://github.com/jeranaias/signet/releases/tag/v0.1.1
 [0.1.0]: https://github.com/jeranaias/signet/releases/tag/v0.1.0

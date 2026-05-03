@@ -412,7 +412,7 @@ class SignetApp:
                 "accumulated_text_truncated": rctx.accumulated_text_truncated,
             },
         )
-        headers = {}
+        headers = self._upstream_attribution_headers(upstream_resp.status_code)
         if entry is not None and self._receipt_signer is not None:
             headers[self.config.receipt_header_name] = self._receipt_signer.sign(entry)
         return JSONResponse(content=data, status_code=upstream_resp.status_code, headers=headers)
@@ -509,7 +509,15 @@ class SignetApp:
                         },
                     )
 
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            # Receipt and per-row chain entries can't be set on a
+            # streaming response (no entry exists yet), but the upstream
+            # attribution headers can fire at handshake time so callers
+            # see them before they parse a single chunk.
+            headers=self._upstream_attribution_headers(None),
+        )
 
     def _upstream_headers(self, ctx: RequestContext) -> dict[str, str]:
         """Headers to forward to the upstream. Strip signet-only headers."""
@@ -520,6 +528,23 @@ class SignetApp:
         if self.config.upstream_api_key and "Authorization" not in out:
             out["Authorization"] = f"Bearer {self.config.upstream_api_key}"
         out["Content-Type"] = "application/json"
+        return out
+
+    def _upstream_attribution_headers(self, upstream_status: int | None) -> dict[str, str]:
+        """Headers that let callers tell upstream errors from signet errors.
+
+        Set on every forwarded response. ``X-Signet-Upstream`` carries
+        either the configured label or the upstream URL host.
+        ``X-Signet-Upstream-Status`` carries the upstream's HTTP status
+        when known so a 500 the user sees can be unambiguously
+        attributed to the upstream rather than to the gate.
+        """
+        from urllib.parse import urlparse
+
+        label = self.config.upstream_label or urlparse(self.config.upstream_url).netloc
+        out: dict[str, str] = {"X-Signet-Upstream": label}
+        if upstream_status is not None:
+            out["X-Signet-Upstream-Status"] = str(upstream_status)
         return out
 
     def _refusal(self, result: Any, entry: AuditEntry | None) -> Response:
@@ -537,7 +562,10 @@ class SignetApp:
         if "rate limit" in result.reason.lower():
             status = 429
 
-        headers = {}
+        # Refusals never reach the upstream, so X-Signet-Upstream-Status
+        # is omitted; X-Signet-Upstream still fires so consumers can
+        # confirm the gate-of-record.
+        headers = self._upstream_attribution_headers(None)
         if entry is not None and self._receipt_signer is not None:
             headers[self.config.receipt_header_name] = self._receipt_signer.sign(entry)
         return JSONResponse(status_code=status, content=body, headers=headers)
@@ -557,7 +585,7 @@ class SignetApp:
             "stage": result.metadata.get("_stage"),
             "audit_entry_id": entry.entry_id if entry is not None else None,
         }
-        headers = {}
+        headers = self._upstream_attribution_headers(None)
         if entry is not None and self._receipt_signer is not None:
             headers[self.config.receipt_header_name] = self._receipt_signer.sign(entry)
         return JSONResponse(status_code=202, content=body, headers=headers)

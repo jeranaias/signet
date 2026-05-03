@@ -13,7 +13,7 @@ Refuses any request that doesn't have a resolvable commit owner. This is the loa
 The check tries headers in this precedence:
 
 1. `X-Commit-Owner: human:<principal>` → `Owner.human(principal)`
-2. `X-Agent-Id: agent:<id>` (or bare `<id>`) → `Owner.agent(id)`
+2. `X-Agent-Id: agent:<id>` → `Owner.agent(id)` (the `agent:` prefix is required; bare values are rejected)
 3. `X-Policy-Name: <name>` (+ optional `X-Policy-Version`) → `Owner.policy(name@version)`
 4. Already-resolved owner on the context (e.g. set by `LoopbackTrustCheck`)
 

@@ -1,10 +1,16 @@
 # Architecture
 
-## The pattern in one paragraph
+## Read this first — the one-paragraph version
 
-signet separates **deciding what to do** from **being allowed to do it**. The model decides; signet decides whether the decision can fire. The model never holds commit authority. Same shape as a junior employee who can fill out a purchase order but cannot sign the check.
+A modern AI agent does two things in one process: it **decides** what to do, and it **executes** what it decided. signet wedges between those two steps. The agent still decides — it can propose any tool call, write any response, generate any output. But before that decision becomes an action, it goes through signet, which checks the proposed action against your policy. If the policy clears the action, signet forwards it. If not, signet refuses, and the agent's compliance is irrelevant — refusal happens in a separate process the agent cannot influence. Same shape as a junior employee filling out a purchase order: they can write any number on the form, but the CFO signs the check.
 
-This matters because the prevailing approach to LLM agent safety — telling the model in its system prompt to "wait for human input" — relies on the model itself to comply with the instruction. Sufficiently capable models ignore the instruction whenever their objective gradient outweighs it. signet takes the model's compliance off the critical path: refusal lives in a separate process the model cannot influence.
+The rest of this document is *how that's wired*.
+
+---
+
+## The pattern in one paragraph (for engineers)
+
+signet separates **deciding what to do** from **being allowed to do it**. The model decides; signet decides whether the decision can fire. The model never holds commit authority. This matters because the prevailing approach to LLM agent safety — telling the model in its system prompt to "wait for human input" — relies on the model itself to comply with the instruction. Sufficiently capable models ignore the instruction whenever their objective gradient outweighs it. signet takes the model's compliance off the critical path: refusal lives in a separate process the model cannot influence.
 
 ## Where signet sits
 
@@ -61,13 +67,13 @@ For each *response* the proxy emits, an `X-Signet-Receipt` HTTP header is return
 
 ## Replay
 
-Given an audit row, `signet replay <entry-id>` reproduces the original request and re-runs the pipeline against it. Used for incident response ("show me exactly why you blocked this"), regulatory audits, and check development ("does my new check produce the same decision on last week's traffic?").
+Given an audit row, `signet audit show <entry-id>` displays it for incident review. Deterministic re-execution of the original pipeline against archived traffic requires the original request body to also be stored alongside the audit row — that's roadmap, not v0.1. (`signet replay` exists as a deprecated alias for `signet audit show` because the original name implied pipeline re-execution; the new name is honest about what the command actually does.)
 
-Replay is deterministic for ADMISSION checks. INSPECTION and COMMITMENT replay requires the original upstream response to also be archived, since the model's output is non-deterministic.
+Replay (the proper pipeline-replay version) will be deterministic for ADMISSION checks. INSPECTION and COMMITMENT replay requires the original upstream response to also be archived, since the model's output is non-deterministic.
 
 ## Plugin model
 
-Built-in checks cover the most common cases. Anything else is a plugin: implement the `Check` protocol, expose it via Python entry points, and the pipeline picks it up. Reference plugins in the OSS release demonstrate dual-judge dissent (caller supplies two judge endpoints), sandbox preview (caller supplies a runner), and LLM-as-content-classifier.
+Built-in checks cover the most common cases. Anything else is a plugin: implement the `Check` protocol, expose it via Python entry points (group `signet.checks`), and the pipeline picks it up. Reference plugins shipping in `signet.plugins` demonstrate dual-judge dissent (caller supplies two judge endpoints) and sandbox preview (caller supplies a runner).
 
 The proprietary parent system (Pyros + Mycelium, not in this OSS release) ships richer implementations of these — production-tuned dual-judge calibration, classification-aware sandbox isolation, behavioral fingerprinting for proof-of-inference. signet ships the architectural pattern as Apache-2.0 OSS so anyone can build on it.
 

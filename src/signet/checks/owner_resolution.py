@@ -105,8 +105,19 @@ class OwnerResolutionCheck(Check):
         if self.require_owner:
             return CheckResult.block(
                 "no commit owner could be resolved",
-                hint="set X-Commit-Owner: human:<principal>, X-Agent-Id: <id>, "
-                "or X-Policy-Name: <name> on the request",
+                hint=(
+                    "Send one of these headers (the prefix is required):\n"
+                    "  X-Commit-Owner: human:alice@example.com\n"
+                    "  X-Agent-Id: agent:nightly-syncer\n"
+                    "  X-Policy-Name: acme-default   (with optional X-Policy-Version: v3)\n"
+                    "Headers are caller-asserted attribution, not authentication — "
+                    "see SECURITY.md trust model."
+                ),
+                examples=[
+                    "X-Commit-Owner: human:alice@example.com",
+                    "X-Agent-Id: agent:nightly-syncer",
+                    "X-Policy-Name: acme-default",
+                ],
             )
 
         # Permissive fallback: assume an unattributed policy
