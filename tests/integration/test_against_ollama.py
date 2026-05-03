@@ -63,9 +63,7 @@ class TestOllamaForward:
             "/v1/chat/completions",
             json={
                 "model": ollama_model,
-                "messages": [
-                    {"role": "user", "content": "Reply with exactly: pong"}
-                ],
+                "messages": [{"role": "user", "content": "Reply with exactly: pong"}],
                 "max_tokens": 10,
                 "stream": False,
             },
