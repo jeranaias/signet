@@ -46,6 +46,13 @@ class Key:
                 "32 bytes recommended for HMAC-SHA256"
             )
 
+    def __repr__(self) -> str:
+        # Override the default dataclass repr so the secret never lands in
+        # logs, exception tracebacks, or REPL output. The length is exposed
+        # because it's useful for diagnosing key-size misconfiguration and
+        # does not weaken the secret.
+        return f"Key(key_id={self.key_id!r}, secret=<{len(self.secret)} bytes redacted>)"
+
     @classmethod
     def generate(cls, key_id: str, *, length: int = 32) -> Key:
         """Generate a new key with a cryptographically-random secret.

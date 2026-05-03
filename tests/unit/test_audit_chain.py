@@ -249,6 +249,17 @@ class TestKeyRingValidation:
         with pytest.raises(ValueError, match="non-empty string"):
             Key(key_id="", secret=b"x" * 32)
 
+    def test_repr_does_not_leak_secret(self) -> None:
+        # Regression: prior versions used the default dataclass repr,
+        # which would print the raw secret in any log line or exception
+        # trace that touched a Key. Redaction must be explicit.
+        secret = b"super-sensitive-hmac-key-that-must-not-be-printed"
+        k = Key(key_id="k1", secret=secret)
+        rendered = repr(k)
+        assert "super-sensitive" not in rendered
+        assert "redacted" in rendered
+        assert "k1" in rendered
+
     def test_rotate_to_same_id_rejected(self) -> None:
         ring = KeyRing(active=Key.generate("k1"))
         with pytest.raises(ValueError, match="same ID"):
