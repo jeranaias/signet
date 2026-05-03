@@ -18,14 +18,13 @@ Coverage:
 
 from __future__ import annotations
 
-import json
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from signet.checks import OwnerResolutionCheck, RateLimitCheck, RegexOutputCheck
+from signet.checks import OwnerResolutionCheck, RateLimitCheck
 from signet.checks.regex_content import Pattern
 from signet.core.pipeline import Pipeline
 from signet.server.app import SignetApp
@@ -58,16 +57,15 @@ def app_factory(monkeypatch: pytest.MonkeyPatch, upstream_response_body: dict[st
     """
 
     def _make(pipeline: Pipeline) -> tuple[SignetApp, TestClient]:
-        async def fake_post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]):  # noqa: ARG001
+        async def fake_post(_self, _url, **_kwargs):
             class FakeResp:
                 status_code = 200
+                content = b""
+                headers: ClassVar[dict[str, str]] = {}
 
                 @staticmethod
                 def json() -> dict[str, Any]:
                     return upstream_response_body
-
-                content = b""
-                headers: dict[str, str] = {}
 
             return FakeResp()
 
@@ -157,16 +155,15 @@ class TestReceiptIntegration:
     def test_receipt_emits_when_audit_configured(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path, upstream_response_body: dict[str, Any]
     ) -> None:
-        async def fake_post(self, url: str, *, json: dict[str, Any], headers: dict[str, str]):  # noqa: ARG001
+        async def fake_post(_self, _url, **_kwargs):
             class FakeResp:
                 status_code = 200
+                content = b""
+                headers: ClassVar[dict[str, str]] = {}
 
                 @staticmethod
                 def json() -> dict[str, Any]:
                     return upstream_response_body
-
-                content = b""
-                headers: dict[str, str] = {}
 
             return FakeResp()
 
