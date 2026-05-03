@@ -28,4 +28,12 @@ names, same async/sync semantics, same return types. They only:
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from signet.adapters.anthropic import wrap_anthropic
+from signet.adapters.langchain import SignetCallbackHandler
+from signet.adapters.openai import wrap_openai
+
+__all__ = [
+    "SignetCallbackHandler",
+    "wrap_anthropic",
+    "wrap_openai",
+]
