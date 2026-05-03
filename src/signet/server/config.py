@@ -72,6 +72,39 @@ class ServerConfig:
     header so callers can finger-point upstream errors vs. signet
     errors at a glance. ``None`` (default) means ``X-Signet-Upstream``
     carries the host portion of ``upstream_url``."""
+    cors_allowed_origins: tuple[str, ...] = ()
+    """Origins permitted via ``Access-Control-Allow-Origin``. Empty
+    (default) disables CORS entirely. Use ``("*",)`` to allow all
+    origins (dev only). For browser-based callers in production,
+    list the exact origins. signet emits the matching CORS preflight
+    + credentialed-response headers via Starlette's CORSMiddleware."""
+    cors_allowed_methods: tuple[str, ...] = ("GET", "POST", "OPTIONS")
+    """HTTP methods allowed for CORS. Override only if you proxy
+    additional methods through an embedded SignetApp."""
+    cors_allowed_headers: tuple[str, ...] = (
+        "Authorization",
+        "Content-Type",
+        "X-Commit-Owner",
+        "X-Agent-Id",
+        "X-Policy-Name",
+        "X-Policy-Version",
+        "X-Classification",
+        "X-Caller-Clearance",
+        "X-Signet-Session",
+    )
+    """Request headers callers can send via CORS. The default set
+    covers signet's own attribution + classification headers."""
+    cors_allow_credentials: bool = False
+    """Whether to set ``Access-Control-Allow-Credentials: true``.
+    Required when callers send cookies or HTTP auth via CORS;
+    incompatible with ``cors_allowed_origins=("*",)`` per the spec."""
+    shutdown_grace_seconds: float = 10.0
+    """On lifespan shutdown (SIGTERM, uvicorn graceful stop), wait up
+    to this many seconds for in-flight streaming responses to finish
+    before tearing down the upstream HTTP client. Streams that don't
+    complete by the deadline are abandoned; their audit rows are
+    still written by the streaming generator's finally block. Set 0
+    to skip the grace period (production should keep this > 0)."""
     max_request_body_bytes: int = 4 * 1024 * 1024
     """Hard cap on inbound request body size. Anything larger gets a
     413 before signet attempts to parse it. Default 4 MiB covers

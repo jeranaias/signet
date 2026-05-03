@@ -11,11 +11,18 @@ The pipeline is the only thing in :mod:`signet.core` that knows about
 multiple checks at once. Concrete checks live in :mod:`signet.checks`; the
 HTTP proxy in :mod:`signet.server` invokes the pipeline at the appropriate
 points in request handling.
+
+Per-check timeouts: any check whose ``timeout_seconds`` attribute is set
+gets its hook calls wrapped in :func:`asyncio.wait_for`. A timeout is
+translated to ``CheckResult.block(...)`` with a timeout reason —
+fail-closed, so a stuck external dependency (LLM judge, sandbox runner,
+oracle) cannot halt the proxy.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import asyncio
+from collections.abc import Awaitable, Iterable
 
 from signet.core.check import Check, CheckResult
 from signet.core.context import RequestContext, ResponseContext, ToolCallContext
@@ -66,7 +73,7 @@ class Pipeline:
         ``CheckResult.allow("admission cleared")`` if all checks pass.
         """
         for check in self.checks_for_stage(Stage.ADMISSION):
-            result = await check.pre_request(ctx)
+            result = await _run_with_timeout(check, "pre_request", check.pre_request(ctx))
             if not result.is_allow:
                 return _annotate(result, check)
         return CheckResult.allow("admission cleared")
@@ -79,7 +86,9 @@ class Pipeline:
         upstream stream on a non-allow result here.
         """
         for check in self.checks_for_stage(Stage.INSPECTION):
-            result = await check.inspect_response_chunk(ctx, chunk)
+            result = await _run_with_timeout(
+                check, "inspect_response_chunk", check.inspect_response_chunk(ctx, chunk)
+            )
             if not result.is_allow:
                 return _annotate(result, check)
         return CheckResult.allow()
@@ -91,7 +100,9 @@ class Pipeline:
         ``CheckResult.allow("tool call approved")`` if all checks pass.
         """
         for check in self.checks_for_stage(Stage.COMMITMENT):
-            result = await check.inspect_tool_call(ctx)
+            result = await _run_with_timeout(
+                check, "inspect_tool_call", check.inspect_tool_call(ctx)
+            )
             if not result.is_allow:
                 return _annotate(result, check)
         return CheckResult.allow("tool call approved")
@@ -106,9 +117,32 @@ class Pipeline:
         """
         results: list[CheckResult] = []
         for check in self.checks_for_stage(Stage.RECORD):
-            result = await check.post_complete(ctx)
+            result = await _run_with_timeout(check, "post_complete", check.post_complete(ctx))
             results.append(_annotate(result, check))
         return results
+
+
+async def _run_with_timeout(
+    check: Check, hook_name: str, coro: Awaitable[CheckResult]
+) -> CheckResult:
+    """Await ``coro`` with the check's timeout (if any), fail-closed on timeout.
+
+    A timeout is translated to ``CheckResult.block(...)`` with a clear
+    reason; any other exception bubbles to the proxy, which records a
+    pipeline-crash audit row and returns 500.
+    """
+    timeout = getattr(check, "timeout_seconds", None)
+    if timeout is None:
+        return await coro
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except TimeoutError:
+        return CheckResult.block(
+            f"check {check.name!r}.{hook_name} timed out after {timeout}s",
+            check=check.name,
+            hook=hook_name,
+            timeout_seconds=timeout,
+        )
 
 
 def _annotate(result: CheckResult, check: Check) -> CheckResult:

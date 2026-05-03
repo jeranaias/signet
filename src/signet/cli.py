@@ -26,7 +26,7 @@ import json
 import logging
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import click
 
@@ -114,6 +114,17 @@ def main() -> None:
     "if not otherwise specified. Equivalent to typing all three; "
     "intended for local development only.",
 )
+@click.option(
+    "--log-format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    show_default=True,
+    envvar="SIGNET_LOG_FORMAT",
+    help="Output format for application logs. 'text' (default) is the "
+    "human-readable plain logging format. 'json' emits one JSON object "
+    "per line via structlog — wire to your log aggregator (Loki, "
+    "Datadog, ELK, etc.) for searchable structured logs.",
+)
 def serve(
     upstream_url: str,
     host: str,
@@ -124,9 +135,13 @@ def serve(
     config_path: Path | None,
     upstream_label: str | None,
     dev: bool,
+    log_format: str,
 ) -> None:
     """Run the signet proxy."""
     import uvicorn
+
+    if log_format == "json":
+        _configure_structlog_json()
 
     from signet.core.pipeline import Pipeline
     from signet.server.app import SignetApp
@@ -452,7 +467,14 @@ def audit() -> None:
     envvar="SIGNET_HMAC_KEY_ID",
     help="ID of the active key. Match the writer's --hmac-key-id.",
 )
-def audit_verify(log_path: Path, hmac_secret: str, key_id: str) -> None:
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit machine-readable JSON instead of colored text. Use this "
+    "from cron jobs, CI checks, and any scripted invocation.",
+)
+def audit_verify(log_path: Path, hmac_secret: str, key_id: str, as_json: bool) -> None:
     """Walk LOG_PATH and report any tampering."""
     from signet.audit.backend import JsonlBackend
     from signet.audit.keyring import Key, KeyRing
@@ -466,6 +488,25 @@ def audit_verify(log_path: Path, hmac_secret: str, key_id: str) -> None:
     )
     backend = JsonlBackend(log_path)
     report = ChainVerifier(backend, keyring).verify()
+
+    if as_json:
+        payload = {
+            "ok": report.ok,
+            "total_entries": report.total_entries,
+            "last_known_good_index": report.last_known_good_index,
+            "last_known_good_hmac": report.last_known_good_hmac,
+            "breaks": [
+                {
+                    "index": b.index,
+                    "entry_id": b.entry_id,
+                    "kind": b.kind.value,
+                    "detail": b.detail,
+                }
+                for b in report.breaks
+            ],
+        }
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        sys.exit(0 if report.ok else 2)
 
     if report.ok:
         click.secho(
@@ -485,6 +526,139 @@ def audit_verify(log_path: Path, hmac_secret: str, key_id: str) -> None:
     if len(report.breaks) > 50:
         click.echo(f"  ... and {len(report.breaks) - 50} more")
     sys.exit(2)
+
+
+@audit.command("count")
+@click.argument("log_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option(
+    "--by",
+    "group_by",
+    type=click.Choice(["check", "owner", "decision", "owner_type", "stage"]),
+    default=None,
+    help="Group counts by this field. Default: just print total entries.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit machine-readable JSON.",
+)
+def audit_count(log_path: Path, group_by: str | None, as_json: bool) -> None:
+    """Count entries in LOG_PATH, optionally grouped by a field.
+
+    Quick incident-response primitive: how many blocks today? how many
+    by which check? how many per owner? Reads the log lazily so it's
+    safe on multi-GB chains.
+    """
+    from collections import Counter
+
+    from signet.audit.backend import JsonlBackend
+
+    backend = JsonlBackend(log_path)
+    if group_by is None:
+        total = sum(1 for _ in backend.iter_entries())
+        if as_json:
+            click.echo(json.dumps({"total": total}))
+        else:
+            click.echo(f"{total} entries")
+        return
+
+    counts: Counter[str] = Counter()
+    for entry in backend.iter_entries():
+        if group_by == "check":
+            counts[entry.check_name] += 1
+        elif group_by == "decision":
+            counts[entry.decision.value] += 1
+        elif group_by == "owner":
+            counts[str(entry.owner)] += 1
+        elif group_by == "owner_type":
+            counts[entry.owner.owner_type.value] += 1
+        elif group_by == "stage":
+            stage = str(entry.metadata.get("_stage", "unknown"))
+            counts[stage] += 1
+
+    if as_json:
+        click.echo(json.dumps(dict(counts.most_common()), indent=2, sort_keys=True))
+        return
+    width = max((len(k) for k in counts), default=10)
+    for key, n in counts.most_common():
+        click.echo(f"  {key:<{width}}  {n}")
+    click.echo(f"({sum(counts.values())} total)")
+
+
+@audit.command("tail")
+@click.argument("log_path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("-n", "n_lines", type=int, default=10, show_default=True, help="Show last N entries.")
+@click.option(
+    "--filter",
+    "filter_expr",
+    default=None,
+    help="Filter expression in form FIELD=VALUE (check, decision, owner_type). "
+    "Multiple comma-separated. Example: decision=block,check=owner_resolution",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit one JSON object per line (JSONL, the same shape as the chain).",
+)
+def audit_tail(log_path: Path, n_lines: int, filter_expr: str | None, as_json: bool) -> None:
+    """Show the last N entries from LOG_PATH (optionally filtered)."""
+    from signet.audit.backend import JsonlBackend
+
+    filters: dict[str, str] = {}
+    if filter_expr:
+        for clause in filter_expr.split(","):
+            if "=" not in clause:
+                raise click.ClickException(f"bad --filter clause {clause!r}; expected FIELD=VALUE")
+            k, v = clause.split("=", 1)
+            filters[k.strip()] = v.strip()
+
+    from signet.core.audit import AuditEntry
+
+    backend = JsonlBackend(log_path)
+    matched: list[AuditEntry] = []
+    for entry in backend.iter_entries():
+        if filters:
+            ok = True
+            for f, v in filters.items():
+                actual = (
+                    entry.check_name
+                    if f == "check"
+                    else entry.decision.value
+                    if f == "decision"
+                    else entry.owner.owner_type.value
+                    if f == "owner_type"
+                    else None
+                )
+                if actual != v:
+                    ok = False
+                    break
+            if not ok:
+                continue
+        matched.append(entry)
+        if len(matched) > n_lines:
+            matched.pop(0)
+
+    for entry in matched:
+        if as_json:
+            click.echo(json.dumps(entry.to_dict(), separators=(",", ":"), sort_keys=True))
+        else:
+            ts_iso = _ns_to_iso(entry.ts_ns)
+            click.echo(
+                f"{ts_iso}  {entry.decision.value:8s} "
+                f"{entry.check_name:20s} owner={entry.owner} "
+                f"reason={entry.reason}"
+            )
+
+
+def _ns_to_iso(ts_ns: int) -> str:
+    """Format a nanosecond wall-clock timestamp as ISO 8601 in UTC."""
+    import datetime
+
+    return datetime.datetime.fromtimestamp(ts_ns / 1e9, tz=datetime.UTC).isoformat(
+        timespec="seconds"
+    )
 
 
 @audit.command("show")
@@ -589,6 +763,67 @@ def init(target_dir: Path) -> None:
     click.echo("  signet serve --upstream http://localhost:11434/v1 --dev")
     click.echo("\nthen, in another terminal:")
     click.echo("  python client_example.py")
+
+
+def _configure_structlog_json() -> None:
+    """Configure structlog to emit JSON via the stdlib logging handler.
+
+    All existing ``logging.getLogger(...)`` calls in signet then route
+    through structlog's processor chain and emit one JSON object per
+    line. The output goes to stderr (the standard signal-handler-safe
+    stream for daemon logs).
+
+    Required because all signet code uses stdlib ``logging`` (it predates
+    this CLI flag); we don't rewrite every module to import structlog
+    directly. Calling this function is enough.
+    """
+    import logging
+
+    import structlog
+
+    timestamper = structlog.processors.TimeStamper(fmt="iso", utc=True)
+    pre_chain: list[Any] = [  # structlog's processor types vary; loose typing here
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        timestamper,
+    ]
+
+    logging.basicConfig(
+        format="%(message)s",
+        stream=sys.stderr,
+        level=logging.INFO,
+        force=True,
+    )
+
+    # Replace the root handler's formatter with structlog's JSON renderer
+    handler = logging.getLogger().handlers[0]
+    handler.setFormatter(
+        structlog.stdlib.ProcessorFormatter(
+            foreign_pre_chain=pre_chain,
+            processors=[
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                structlog.processors.JSONRenderer(),
+            ],
+        )
+    )
+
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.stdlib.filter_by_level,
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            timestamper,
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
 
 
 def _parse_hex_secret(value: str, source: str) -> bytes:

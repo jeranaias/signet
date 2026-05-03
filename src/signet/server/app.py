@@ -46,6 +46,7 @@ from signet.core.context import RequestContext, ResponseContext
 from signet.core.owner import Owner
 from signet.core.pipeline import Pipeline
 from signet.server.config import ServerConfig
+from signet.server.metrics import Metrics
 from signet.server.receipt import HmacReceiptSigner, ReceiptSigner
 from signet.server.session import HEADER_NAME as SESSION_HEADER
 from signet.server.session import InMemorySessionStore, SessionStore
@@ -70,10 +71,12 @@ class SignetApp:
         pipeline: Pipeline,
         session_store: SessionStore | None = None,
         receipt_signer: ReceiptSigner | None = None,
+        metrics: Metrics | None = None,
     ) -> None:
         self.config = config
         self.pipeline = pipeline
         self.session_store: SessionStore = session_store or InMemorySessionStore()
+        self.metrics: Metrics = metrics or Metrics()
 
         self._keyring = self._build_keyring(config)
         self._chain = self._build_chain(config, self._keyring)
@@ -91,7 +94,32 @@ class SignetApp:
             description="Capability-based safety gate for LLM agents.",
             lifespan=self._lifespan,
         )
+        self._register_cors()
         self._register_routes()
+
+    def _register_cors(self) -> None:
+        """Add CORSMiddleware when ``cors_allowed_origins`` is set.
+
+        Skipped when the tuple is empty (default), so non-browser
+        deployments incur zero CORS overhead.
+        """
+        origins = self.config.cors_allowed_origins
+        if not origins:
+            return
+        from fastapi.middleware.cors import CORSMiddleware
+
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(origins),
+            allow_methods=list(self.config.cors_allowed_methods),
+            allow_headers=list(self.config.cors_allowed_headers),
+            allow_credentials=self.config.cors_allow_credentials,
+            expose_headers=[
+                self.config.receipt_header_name,
+                "X-Signet-Upstream",
+                "X-Signet-Upstream-Status",
+            ],
+        )
 
     @staticmethod
     def _build_keyring(config: ServerConfig) -> KeyRing:
@@ -117,13 +145,41 @@ class SignetApp:
 
     @asynccontextmanager
     async def _lifespan(self, _: FastAPI) -> AsyncIterator[None]:
-        """Open + close the upstream HTTP client across the app lifetime."""
+        """Open + close the upstream HTTP client across the app lifetime.
+
+        Graceful shutdown: on lifespan exit (SIGTERM, etc.), wait up
+        to ``ServerConfig.shutdown_grace_seconds`` for in-flight
+        streams to drain before tearing down the upstream client.
+        Streams that haven't completed by the deadline are abandoned;
+        their audit rows are still written by the streaming generator's
+        finally block.
+        """
         # Idempotent: if _http already exists (e.g. TestClient triggered
         # this twice, or _ensure_http was called first), reuse it.
         self._ensure_http()
+        # Track in-flight streaming requests so shutdown can drain.
+        self._in_flight_streams = 0
         try:
             yield
         finally:
+            grace = self.config.shutdown_grace_seconds
+            if grace > 0 and self._in_flight_streams > 0:
+                logger.info(
+                    "shutdown: waiting up to %.1fs for %d in-flight streams to drain",
+                    grace,
+                    self._in_flight_streams,
+                )
+                import asyncio
+                import time as _time
+
+                deadline = _time.monotonic() + grace
+                while self._in_flight_streams > 0 and _time.monotonic() < deadline:
+                    await asyncio.sleep(0.1)
+                if self._in_flight_streams > 0:
+                    logger.warning(
+                        "shutdown: %d streams still in flight after grace period; abandoning",
+                        self._in_flight_streams,
+                    )
             await self._http.aclose()
             del self._http
 
@@ -148,6 +204,21 @@ class SignetApp:
         @self.app.get("/version")
         async def version() -> dict[str, str]:
             return {"version": __version__, "service": "signet"}
+
+        @self.app.get("/metrics")
+        async def metrics() -> Response:
+            """Prometheus exposition-format counters.
+
+            See :mod:`signet.server.metrics` for the counter set.
+            Output is plain text; scrape with the standard Prometheus
+            scrape config or any Prometheus-compatible collector
+            (Grafana Agent, VictoriaMetrics, OpenTelemetry collector
+            with the prometheus receiver, etc.).
+            """
+            return Response(
+                content=self.metrics.render_prometheus(),
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
 
         @self.app.post("/v1/chat/completions")
         async def chat_completions(request: Request) -> Response:
@@ -266,6 +337,7 @@ class SignetApp:
         return ctx
 
     async def _handle_chat(self, request: Request) -> Response:
+        self.metrics.inc("signet_requests_total", {"path": "/v1/chat/completions"})
         admitted = await self._admit(request, path="/v1/chat/completions")
         if isinstance(admitted, Response):
             return admitted
@@ -295,6 +367,7 @@ class SignetApp:
         ScopeDriftCheck and similar text-scanning checks read from
         ``ResponseContext.accumulated_text`` and work uniformly.
         """
+        self.metrics.inc("signet_requests_total", {"path": "/v1/completions"})
         admitted = await self._admit(request, path="/v1/completions")
         if isinstance(admitted, Response):
             return admitted
@@ -328,6 +401,7 @@ class SignetApp:
         output to scan. Tool-call-inspector (COMMITMENT) is also
         skipped — embeddings don't emit tool calls.
         """
+        self.metrics.inc("signet_requests_total", {"path": "/v1/embeddings"})
         admitted = await self._admit(request, path="/v1/embeddings")
         if isinstance(admitted, Response):
             return admitted
@@ -507,6 +581,13 @@ class SignetApp:
             client = self._ensure_http()
             completed_normally = False
             inspection_aborted = False
+            # Bump in-flight counter so graceful shutdown waits for us.
+            # getattr handles the embedded-app case where _lifespan
+            # never ran (e.g. mounting SignetApp.app inside a parent
+            # FastAPI app that owns its own lifespan).
+            if not hasattr(self, "_in_flight_streams"):
+                self._in_flight_streams = 0
+            self._in_flight_streams += 1
             try:
                 async with client.stream(
                     "POST",
@@ -591,6 +672,10 @@ class SignetApp:
                             "chunk_count": rctx.chunk_count,
                         },
                     )
+                # Decrement in-flight counter outside the inspection
+                # branch so it always fires whether we completed
+                # normally, were aborted, or the caller disconnected.
+                self._in_flight_streams = max(0, self._in_flight_streams - 1)
 
         return StreamingResponse(
             event_stream(),
@@ -687,9 +772,15 @@ class SignetApp:
         one-to-one — earlier versions collapsed REDACT/ESCALATE into
         BLOCK, which lost information needed for incident review.
         """
+        decision = _result_to_decision(result)
+        # Always tally pipeline decisions, even when no audit chain
+        # is configured (developer mode, ephemeral runs).
+        self.metrics.inc(
+            "signet_pipeline_decisions_total",
+            {"check": check_name, "decision": decision.value},
+        )
         if self._chain is None:
             return None
-        decision = _result_to_decision(result)
         reason = result.reason if result is not None else "request completed"
         meta = dict(metadata or {})
         if result is not None:
@@ -702,7 +793,19 @@ class SignetApp:
             metadata=meta,
             request_fingerprint=ctx.scratch.get("_request_fingerprint", ""),
         )
-        return self._chain.append(entry)
+        appended = self._chain.append(entry)
+        self.metrics.inc("signet_audit_chain_appends_total")
+        # If anchor backend is configured and reported a failure on
+        # this entry, count it so operators can alert on anchor SLO.
+        from signet.audit.anchor import ANCHOR_FIELD
+
+        anchor_meta = appended.metadata.get(ANCHOR_FIELD, {})
+        if isinstance(anchor_meta, dict) and anchor_meta.get("success") is False:
+            self.metrics.inc(
+                "signet_audit_anchor_failures_total",
+                {"backend": str(anchor_meta.get("backend", "unknown"))},
+            )
+        return appended
 
     def _record_exception(
         self,

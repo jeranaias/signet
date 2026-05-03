@@ -128,6 +128,15 @@ class Check:
     SHOULD override to declare their stage explicitly even when ADMISSION
     is correct, to make intent obvious."""
 
+    timeout_seconds: float | None = None
+    """Maximum wall-clock time the pipeline waits for any single hook on
+    this check. ``None`` (default) means no timeout; the pipeline waits
+    indefinitely. When set and exceeded, the pipeline treats the check
+    as having returned ``CheckResult.block(...)`` with a timeout reason —
+    fail-closed semantics. Set per-check to bound external dependencies
+    (LLM-judge calls, sandbox runners) so a stuck dependency cannot
+    halt the proxy."""
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         if not getattr(cls, "name", None):

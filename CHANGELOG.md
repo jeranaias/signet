@@ -8,6 +8,117 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-05-03
+
+### Added — Phase 1: bulletproof OSS
+
+- **Asymmetric receipt signing (ed25519)** via
+  `signet.server.receipt.Ed25519ReceiptSigner` and
+  `signet keys generate-ed25519` CLI command. Verifiers hold only
+  the public key and cannot forge. Optional dep
+  `pip install signet-sign[ed25519]`.
+- **External anchor backends** for tamper-proof audit chains.
+  `signet.audit.anchor.AnchorBackend` Protocol + `NoopAnchor` (default,
+  byte-compat) + `Rfc3161Anchor` (FreeTSA / any free public RFC 3161
+  TSA, requires no extra deps). Anchor receipt embedded in entry
+  metadata BEFORE the chain HMAC is computed, so the HMAC binds the
+  receipt to the entry.
+- **Multi-process safe audit writer** via
+  `signet.audit.backend.FileLockingJsonlBackend` (fcntl on POSIX,
+  msvcrt on Windows). Pair with `HmacChain(cache_prev=False)` to run
+  uvicorn `--workers N>1` safely.
+- **Endpoint coverage**: `/v1/embeddings` and `/v1/completions` are
+  now gated through the full pipeline. `/v1/audio/*` and
+  `/v1/images/*` remain explicit 404s with a roadmap note (their
+  non-JSON request shapes need their own check protocols).
+- **PromptInjection obfuscation hardening**: Unicode NFKC
+  normalization, Cyrillic / Greek / Cherokee confusables fold,
+  zero-width / bidi character stripping, "stretched" letter-spaced
+  text collapse (`i g n o r e` → `ignore`), wider encoding decoders
+  (URL-safe base64, base32, hex, ROT13). Module docstring documents
+  the bypass surface still left open and points at production-tuned
+  LLM-judge layer for the rest.
+- **Auth integration recipes** at `docs/integrations/auth.md` —
+  three concrete patterns (nginx + mTLS, FastAPI middleware + JWT,
+  oauth2-proxy + OIDC) for putting real authentication in front of
+  signet's owner-resolution gate.
+
+### Added — Phase 2: production-grade ops
+
+- **`/metrics` Prometheus endpoint** with counters:
+  `signet_requests_total{path}`,
+  `signet_pipeline_decisions_total{check, decision}`,
+  `signet_audit_chain_appends_total`,
+  `signet_audit_anchor_failures_total{backend}`, plus a
+  `signet_uptime_seconds` gauge. No external dep — exposition
+  format written manually.
+- **CORS support** via `ServerConfig.cors_allowed_origins` (+
+  methods / headers / credentials / preflight-cache fields). Skipped
+  entirely when origins is empty (default), so non-browser
+  deployments incur zero overhead.
+- **Per-check timeout** via `Check.timeout_seconds`. Pipeline wraps
+  each hook call in `asyncio.wait_for`; timeout fails closed (BLOCK
+  with a clear reason). Bounds external dependencies (LLM-judge
+  calls, sandbox runners) so a stuck dependency cannot halt the proxy.
+- **Graceful shutdown**: lifespan exit waits up to
+  `ServerConfig.shutdown_grace_seconds` (default 10s) for in-flight
+  streaming responses to drain before tearing down the upstream
+  client. Audit rows for abandoned streams still write via the
+  generator's finally block.
+- **`signet audit count`** / **`signet audit tail`** CLI
+  subcommands. `audit count --by check|owner|decision|owner_type|stage`
+  for incident-response counts; `audit tail -n 50 --filter
+  decision=block` for log inspection. Both support `--json` for
+  scripting.
+- **`signet audit verify --json`** machine-readable output mode
+  for CI cron consumers.
+- **Redis-backed state stores**:
+  `signet.server.redis_session_store.RedisSessionStore` and
+  `signet.checks.redis_rate_limit_state.RedisRateLimitState` —
+  drop-in replacements for the in-memory defaults when running
+  multiple replicas. Optional dep
+  `pip install signet-sign[redis]`.
+- **`--log-format json`** flag on `signet serve` switches stdlib
+  logging output to structlog's JSON renderer (one JSON object per
+  line). Wire to Loki/Datadog/ELK without changing signet code.
+
+### Documentation polish
+
+- **Docs site nav** keeps Contributing / Security / Changelog
+  inside the site (mkdocs `pymdownx.snippets` mirrors the canonical
+  root files; GitHub keeps auto-discovering the originals). README
+  gets explicit "📚 Documentation: jeranaias.github.io/signet" link
+  with PyPI / docs / license / Python badges at the top.
+- `CONTRIBUTING.md` internal links upgraded to absolute GitHub URLs
+  so they resolve cleanly in both the repo browser and the included
+  docs-site page.
+- GitHub repo description corrected — `signet` is a proper noun, not
+  preceded by an article.
+
+### Tooling
+
+- `pyproject.toml` extras: `[ed25519]`, `[redis]`,
+  `[prometheus]`. `[all]` includes them all. `[dev]` pulls them
+  for dev-environment coverage.
+- `ruff` per-file-ignores for the deliberately-non-ASCII confusables
+  table in `prompt_injection.py` + the obfuscation-attack tests.
+- Cross-platform mypy fix: file-locking implementation selected at
+  module import time via `sys.platform` narrowing — keeps mypy clean
+  on both Linux and Windows.
+
+### Tests
+
+- 242 unit + adversarial green. mypy `--strict` clean. ruff lint
+  clean. mkdocs `--strict` build clean.
+- New tests: ed25519 sign/verify roundtrip + verify-only-cannot-sign +
+  alg-downgrade rejection + PEM-roundtrip; anchor receipt binding
+  to chain HMAC + failing-anchor-recorded-as-failure +
+  require_anchor_success raises; FileLockingJsonlBackend basic +
+  two-instance shared-file safety; PromptInjection obfuscation-
+  busting (5 homoglyph variants + ROT13 + URL-safe base64);
+  embeddings/completions endpoint round-trips; Redis adapters
+  (sessions + rate-limit) end-to-end via fakeredis.
+
 ## [0.1.2] — 2026-05-03
 
 ### Added — UX polish from first-user smoketest
@@ -340,7 +451,8 @@ Test count: 220 unit + adversarial green. mypy clean. ruff clean.
 - Test matrix: Python 3.11 / 3.12 / 3.13 × Linux / macOS / Windows = 9 jobs per push
 - mkdocs-material site builds + deploys to GitHub Pages
 
-[Unreleased]: https://github.com/jeranaias/signet/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/jeranaias/signet/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/jeranaias/signet/releases/tag/v0.1.3
 [0.1.2]: https://github.com/jeranaias/signet/releases/tag/v0.1.2
 [0.1.1]: https://github.com/jeranaias/signet/releases/tag/v0.1.1
 [0.1.0]: https://github.com/jeranaias/signet/releases/tag/v0.1.0
