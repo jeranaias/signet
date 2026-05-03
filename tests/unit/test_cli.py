@@ -50,6 +50,87 @@ class TestInit:
         assert result.exit_code == 0
         assert gi.read_text(encoding="utf-8") == "# user-managed\n"
 
+
+class TestHexSecretParsing:
+    def test_audit_verify_clear_error_for_bad_hex(self, tmp_path: Path) -> None:
+        # Pre-create a non-empty audit log so click's exists=True passes
+        log_path = tmp_path / "audit.jsonl"
+        log_path.write_text("{}\n", encoding="utf-8")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "verify",
+                str(log_path),
+                "--hmac-secret",
+                "not-real-hex",
+                "--key-id",
+                "k1",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "not valid hex" in result.output
+        assert "openssl rand -hex 32" in result.output
+
+    def test_audit_verify_clear_error_for_short_hex(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        log_path.write_text("{}\n", encoding="utf-8")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "verify",
+                str(log_path),
+                "--hmac-secret",
+                "abcd",  # 2 bytes, way too short
+                "--key-id",
+                "k1",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "too short" in result.output.lower() or "needs at least" in result.output
+
+    def test_audit_verify_strips_whitespace_and_0x_prefix(self, tmp_path: Path) -> None:
+        # Build a real chain so the verifier has something to walk
+        from signet.audit.backend import JsonlBackend
+        from signet.audit.chain import HmacChain
+        from signet.audit.keyring import Key, KeyRing
+        from signet.core.audit import AuditEntry, Decision
+        from signet.core.owner import Owner
+
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        ring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), ring)
+        chain.append(
+            AuditEntry(
+                owner=Owner.human("a"),
+                check_name="x",
+                decision=Decision.ALLOW,
+                reason="ok",
+            )
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "verify",
+                str(log_path),
+                "--hmac-secret",
+                f"  0x{secret.hex()}  ",
+                "--key-id",
+                "k1",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "OK:" in result.output
+
     def test_init_refuses_overwrite(self, tmp_path: Path) -> None:
         (tmp_path / "pipeline.py").write_text("# pre-existing", encoding="utf-8")
         runner = CliRunner()

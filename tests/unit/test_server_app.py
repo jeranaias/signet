@@ -429,6 +429,92 @@ class TestUnsupportedEndpoints:
         assert body["endpoint"] == "/v1/embeddings"
 
 
+class TestEmptyBody:
+    def test_empty_body_returns_explicit_400(self, app_factory) -> None:
+        _, client = app_factory(Pipeline(checks=[]))
+        r = client.post(
+            "/v1/chat/completions",
+            content=b"",
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 400
+        assert r.json()["error"] == "empty request body"
+
+
+class TestSessionWiring:
+    def test_session_id_loads_session_into_scratch(
+        self, monkeypatch: pytest.MonkeyPatch, upstream_response_body: dict[str, Any]
+    ) -> None:
+        from signet.core.check import Check, CheckResult
+        from signet.core.context import RequestContext
+        from signet.core.stage import Stage
+
+        seen: dict[str, Any] = {}
+
+        class _Snitch(Check):
+            name = "snitch"
+            stage = Stage.ADMISSION
+
+            async def pre_request(self, ctx: RequestContext) -> CheckResult:
+                seen["session"] = ctx.scratch.get("_session")
+                return CheckResult.allow()
+
+        async def fake_post(_self, _url, **_kwargs):
+            class FakeResp:
+                status_code = 200
+                content = b""
+                headers: ClassVar[dict[str, str]] = {}
+
+                @staticmethod
+                def json() -> dict[str, Any]:
+                    return upstream_response_body
+
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+        config = ServerConfig(upstream_url="http://m/v1", allow_ephemeral_key=True)
+        signet_app = SignetApp(
+            config=config,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True), _Snitch()]),
+        )
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            headers={
+                "X-Commit-Owner": "human:alice",
+                "X-Signet-Session": "sess-xyz",
+            },
+        )
+        assert r.status_code == 200
+        sess = seen["session"]
+        assert sess is not None
+        assert sess.session_id == "sess-xyz"
+        assert sess.request_count >= 1
+
+
+class TestSseExtractor:
+    def test_multi_line_data_event_is_joined(self) -> None:
+        from signet.server.app import _extract_sse_content
+
+        # Two data: lines for one event, blank line dispatches the event.
+        # The OpenAI SSE shape works equally well via single-line data:
+        # but other upstreams send multi-line; we should handle both.
+        chunk = (
+            'data: {"choices":[{"delta":{"content":"hello "}}]}\n'
+            "\n"
+            'data: {"choices":[{"delta":{"content":"world"}}]}\n'
+            "\n"
+        )
+        assert _extract_sse_content(chunk) == "hello world"
+
+    def test_done_marker_ignored(self) -> None:
+        from signet.server.app import _extract_sse_content
+
+        chunk = "data: [DONE]\n\n"
+        assert _extract_sse_content(chunk) == ""
+
+
 class TestRequestFingerprint:
     def test_audit_rows_share_fingerprint_per_request(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path, upstream_response_body: dict[str, Any]

@@ -82,6 +82,22 @@ class TribunalCheck(Check):
     def __post_init__(self) -> None:
         if not self.judge_a_url or not self.judge_b_url:
             raise ValueError("TribunalCheck requires both judge_a_url and judge_b_url")
+        # Lazily-built shared client; reusing the connection pool across
+        # tool calls cuts connection-setup overhead under load.
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.timeout_s)
+        return self._client
+
+    async def aclose(self) -> None:
+        """Close the shared HTTP client. Call from a teardown hook
+        in long-running embeddings; the proxy's lifespan does not
+        know about plugin-owned resources."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
     async def inspect_tool_call(self, ctx: ToolCallContext) -> CheckResult:
         prompt = self.prompt_template.format(
@@ -93,12 +109,12 @@ class TribunalCheck(Check):
         # the other mid-flight (which would leak the surviving HTTP
         # connection and discard a usable verdict). Convert exceptions
         # to BLOCK explicitly here to keep the fail-closed semantics.
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            raw = await asyncio.gather(
-                self._ask_judge(client, self.judge_a_url, self.judge_a_model, prompt),
-                self._ask_judge(client, self.judge_b_url, self.judge_b_model, prompt),
-                return_exceptions=True,
-            )
+        client = self._get_client()
+        raw = await asyncio.gather(
+            self._ask_judge(client, self.judge_a_url, self.judge_a_model, prompt),
+            self._ask_judge(client, self.judge_b_url, self.judge_b_model, prompt),
+            return_exceptions=True,
+        )
 
         verdicts: list[str] = []
         for url, value in zip((self.judge_a_url, self.judge_b_url), raw, strict=True):

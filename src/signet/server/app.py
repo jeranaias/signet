@@ -189,8 +189,18 @@ class SignetApp:
                 },
             )
 
+        if not raw:
+            # Forwarding an empty {} to upstream just produces an
+            # opaque 400 from the LLM service. Reject at signet's
+            # boundary with a clear message so the caller knows where
+            # the problem is.
+            return JSONResponse(
+                status_code=400,
+                content={"error": "empty request body"},
+            )
+
         try:
-            body = json.loads(raw) if raw else {}
+            body = json.loads(raw)
         except json.JSONDecodeError as e:
             return JSONResponse(
                 status_code=400,
@@ -218,6 +228,15 @@ class SignetApp:
             session_id=session_id,
         )
         ctx.scratch["_request_fingerprint"] = request_fingerprint
+
+        # Load (or create) the Session and stash it on scratch so checks
+        # can read cross-request state without each having to reach into
+        # the store directly. Touch updates last_seen_at + request_count.
+        if session_id:
+            session = self.session_store.get_or_create(session_id)
+            session.touch()
+            self.session_store.save(session)
+            ctx.scratch["_session"] = session
 
         # 2. ADMISSION pipeline. Outcomes:
         #   ALLOW    → forward
@@ -403,63 +422,92 @@ class SignetApp:
 
         async def event_stream() -> AsyncIterator[bytes]:
             client = self._ensure_http()
-            async with client.stream(
-                "POST",
-                f"{self.config.upstream_url.rstrip('/')}/chat/completions",
-                json=ctx.body,
-                headers=self._upstream_headers(ctx),
-            ) as upstream:
-                async for raw_chunk in upstream.aiter_bytes():
-                    rctx.chunk_count += 1
-                    chunk_text = raw_chunk.decode("utf-8", errors="replace")
-                    # Best-effort accumulator for SSE 'data:' frames.
-                    # extend_text enforces the per-response cap so a
-                    # multi-megabyte stream cannot OOM the proxy.
-                    rctx.extend_text(_extract_sse_content(chunk_text))
+            completed_normally = False
+            inspection_aborted = False
+            try:
+                async with client.stream(
+                    "POST",
+                    f"{self.config.upstream_url.rstrip('/')}/chat/completions",
+                    json=ctx.body,
+                    headers=self._upstream_headers(ctx),
+                ) as upstream:
+                    async for raw_chunk in upstream.aiter_bytes():
+                        rctx.chunk_count += 1
+                        chunk_text = raw_chunk.decode("utf-8", errors="replace")
+                        # extend_text enforces the per-response cap so a
+                        # multi-megabyte stream cannot OOM the proxy.
+                        rctx.extend_text(_extract_sse_content(chunk_text))
 
-                    inspection = await self.pipeline.inspect_response_chunk(rctx, chunk_text)
-                    if not inspection.is_allow:
-                        # Abort the stream with a trailer event
-                        yield (
-                            b"data: "
-                            + json.dumps(
-                                {
-                                    "signet_aborted": True,
-                                    "reason": inspection.reason,
-                                    "check": inspection.metadata.get("_check_name"),
-                                }
-                            ).encode("utf-8")
-                            + b"\n\n"
-                        )
-                        yield b"data: [DONE]\n\n"
-                        rctx.finish_reason = "abort"
-                        await self.pipeline.post_complete(rctx)
-                        self._record_decision(
-                            ctx,
-                            result=inspection,
-                            check_name="pipeline.inspection",
-                        )
-                        return
+                        inspection = await self.pipeline.inspect_response_chunk(rctx, chunk_text)
+                        if not inspection.is_allow:
+                            # Abort the stream with a trailer event.
+                            yield (
+                                b"data: "
+                                + json.dumps(
+                                    {
+                                        "signet_aborted": True,
+                                        "reason": inspection.reason,
+                                        "check": inspection.metadata.get("_check_name"),
+                                    }
+                                ).encode("utf-8")
+                                + b"\n\n"
+                            )
+                            yield b"data: [DONE]\n\n"
+                            rctx.finish_reason = "abort"
+                            self._record_decision(
+                                ctx,
+                                result=inspection,
+                                check_name="pipeline.inspection",
+                            )
+                            inspection_aborted = True
+                            return
 
-                    yield raw_chunk
+                        yield raw_chunk
 
-            rctx.finish_reason = rctx.finish_reason or "stop"
-            for record_result in await self.pipeline.post_complete(rctx):
-                if not record_result.is_allow:
+                rctx.finish_reason = rctx.finish_reason or "stop"
+                completed_normally = True
+            finally:
+                # Two reasons we land here without completed_normally:
+                # 1. The caller disconnected mid-stream and the
+                #    StreamingResponse cancelled the generator.
+                # 2. The upstream raised after we already started
+                #    yielding (the outer 502 path is too late —
+                #    bytes were already on the wire).
+                # In both cases we still want exactly one terminal row
+                # in the chain so audit consumers can see the request
+                # ended and how. inspection_aborted already wrote its
+                # own row — don't double-count. Avoid `return` in
+                # finally (would swallow in-flight exceptions); guard
+                # the body instead.
+                if not inspection_aborted:
+                    if not completed_normally:
+                        rctx.finish_reason = rctx.finish_reason or "client_disconnect"
+                    # Run RECORD checks even on disconnect — they may flag
+                    # cumulative drift, partial-output PII, etc.
+                    try:
+                        record_results = await self.pipeline.post_complete(rctx)
+                    except Exception:
+                        logger.exception("pipeline.post_complete crashed")
+                        record_results = []
+                    for record_result in record_results:
+                        if not record_result.is_allow:
+                            self._record_decision(
+                                ctx,
+                                result=record_result,
+                                check_name=record_result.metadata.get(
+                                    "_check_name", "pipeline.record"
+                                ),
+                            )
                     self._record_decision(
                         ctx,
-                        result=record_result,
-                        check_name=record_result.metadata.get("_check_name", "pipeline.record"),
+                        result=None,
+                        check_name="pipeline.complete",
+                        metadata={
+                            "finish_reason": rctx.finish_reason,
+                            "accumulated_text_truncated": rctx.accumulated_text_truncated,
+                            "chunk_count": rctx.chunk_count,
+                        },
                     )
-            self._record_decision(
-                ctx,
-                result=None,
-                check_name="pipeline.complete",
-                metadata={
-                    "finish_reason": rctx.finish_reason,
-                    "accumulated_text_truncated": rctx.accumulated_text_truncated,
-                },
-            )
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -600,21 +648,46 @@ def _extract_sse_content(chunk_text: str) -> str:
 
     Best-effort. Used only to feed checks like ScopeDriftCheck that
     scan accumulated output text. Non-content frames return empty string.
+
+    Per the WHATWG EventSource spec, multiple consecutive ``data:``
+    lines within a single event get joined with ``\\n`` before being
+    delivered. OpenAI ships one event per data line so this almost
+    never matters in practice, but other OpenAI-compatible upstreams
+    (LiteLLM, vLLM with prompt-streaming) do emit multi-line events.
+    Coalesce them so INSPECTION sees the full text.
     """
     out: list[str] = []
-    for line in chunk_text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[len("data:") :].strip()
+    pending: list[str] = []  # data: lines for the current event
+
+    def _flush_event() -> None:
+        if not pending:
+            return
+        payload = "\n".join(pending)
+        pending.clear()
         if payload in ("[DONE]", ""):
-            continue
+            return
         try:
             obj = json.loads(payload)
         except json.JSONDecodeError:
-            continue
+            return
         for choice in obj.get("choices", []):
             delta = choice.get("delta", {})
             if isinstance(delta, dict) and isinstance(delta.get("content"), str):
                 out.append(delta["content"])
+
+    for raw_line in chunk_text.splitlines():
+        # Per spec, a blank line dispatches the pending event.
+        if raw_line.strip() == "":
+            _flush_event()
+            continue
+        if not raw_line.startswith("data:"):
+            continue
+        # Per spec: strip a single leading space after the colon, not
+        # arbitrary whitespace; preserve any further leading whitespace
+        # in the payload.
+        payload_line = raw_line[len("data:") :]
+        if payload_line.startswith(" "):
+            payload_line = payload_line[1:]
+        pending.append(payload_line)
+    _flush_event()
     return "".join(out)

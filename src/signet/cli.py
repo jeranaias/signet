@@ -126,7 +126,9 @@ def serve(
         host=host,
         port=port,
         audit_log_path=audit_log_path,
-        hmac_secret=bytes.fromhex(hmac_secret) if hmac_secret else None,
+        hmac_secret=_parse_hex_secret(hmac_secret, "--hmac-secret/SIGNET_HMAC_SECRET")
+        if hmac_secret
+        else None,
         allow_ephemeral_key=allow_ephemeral_key,
     )
 
@@ -162,7 +164,12 @@ def audit_verify(log_path: Path, hmac_secret: str, key_id: str) -> None:
     from signet.audit.keyring import Key, KeyRing
     from signet.audit.verifier import ChainVerifier
 
-    keyring = KeyRing(active=Key(key_id=key_id, secret=bytes.fromhex(hmac_secret)))
+    keyring = KeyRing(
+        active=Key(
+            key_id=key_id,
+            secret=_parse_hex_secret(hmac_secret, "--hmac-secret/SIGNET_HMAC_SECRET"),
+        )
+    )
     backend = JsonlBackend(log_path)
     report = ChainVerifier(backend, keyring).verify()
 
@@ -251,6 +258,33 @@ def init(target_dir: Path) -> None:
     click.echo("\nnext: review the files, then run:")
     click.echo("  signet serve --upstream http://localhost:11434/v1 --config pipeline.py \\")
     click.echo("    --audit-log audit.jsonl --allow-ephemeral-key")
+
+
+def _parse_hex_secret(value: str, source: str) -> bytes:
+    """Decode a hex-encoded HMAC secret with a clear error on failure.
+
+    Strips the optional ``0x`` prefix and any surrounding whitespace —
+    real users paste from terminals and copy-managers that add either.
+    Re-raises with the source name (env var or flag) so the operator
+    knows where to fix the input.
+    """
+    cleaned = value.strip()
+    if cleaned.startswith(("0x", "0X")):
+        cleaned = cleaned[2:]
+    try:
+        out = bytes.fromhex(cleaned)
+    except ValueError as exc:
+        raise click.ClickException(
+            f"{source} is not valid hex ({exc}). "
+            "Generate a fresh secret with `openssl rand -hex 32` "
+            "and pass the resulting 64-character string."
+        ) from exc
+    if len(out) < 16:
+        raise click.ClickException(
+            f"{source} decoded to {len(out)} bytes; HMAC-SHA256 needs at "
+            "least 16 (32 recommended). Use `openssl rand -hex 32`."
+        )
+    return out
 
 
 def _load_pipeline_from_path(path: Path) -> Pipeline:
