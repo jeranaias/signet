@@ -124,12 +124,13 @@ class SignetApp:
         TestClient doesn't have to drive the lifespan to get a working app
         (FastAPI's TestClient supports lifespan but not every embedding
         does)."""
-        existing = getattr(self, "_http", None)
+        existing: httpx.AsyncClient | None = getattr(self, "_http", None)
         if existing is not None:
             return existing
         timeout = httpx.Timeout(self.config.request_timeout_s, connect=10.0)
-        self._http = httpx.AsyncClient(timeout=timeout)
-        return self._http
+        client = httpx.AsyncClient(timeout=timeout)
+        self._http = client
+        return client
 
     def _register_routes(self) -> None:
         @self.app.get("/health")
