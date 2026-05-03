@@ -136,3 +136,34 @@ class TestCheckDefaultHooksAreAllow:
         rctx = ResponseContext(request=ctx)
         result = await check.post_complete(rctx)
         assert result.is_allow
+
+
+class TestResponseContextAccumulator:
+    def test_extend_text_under_cap_appends(self) -> None:
+        from signet.core.context import ResponseContext
+
+        rctx = ResponseContext(request=RequestContext(owner=Owner.unresolved()))
+        rctx.accumulated_text_cap = 100
+        rctx.extend_text("hello")
+        rctx.extend_text(" world")
+        assert rctx.accumulated_text == "hello world"
+        assert not rctx.accumulated_text_truncated
+
+    def test_extend_text_overflow_truncates_and_flags(self) -> None:
+        from signet.core.context import ResponseContext
+
+        rctx = ResponseContext(request=RequestContext(owner=Owner.unresolved()))
+        rctx.accumulated_text_cap = 10
+        rctx.extend_text("0123456789EXTRA")
+        assert rctx.accumulated_text == "0123456789"
+        assert rctx.accumulated_text_truncated
+
+    def test_extend_text_after_full_drops_silently(self) -> None:
+        from signet.core.context import ResponseContext
+
+        rctx = ResponseContext(request=RequestContext(owner=Owner.unresolved()))
+        rctx.accumulated_text_cap = 5
+        rctx.extend_text("HELLO")
+        rctx.extend_text("DROPPED")
+        assert rctx.accumulated_text == "HELLO"
+        assert rctx.accumulated_text_truncated

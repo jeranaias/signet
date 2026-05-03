@@ -107,6 +107,12 @@ def serve(
 
     # Load pipeline from config file or use empty one.
     if config_path:
+        click.secho(
+            f"warning: --config executes arbitrary Python from {config_path}. "
+            "Only run with config files you control.",
+            err=True,
+            fg="yellow",
+        )
         pipeline = _load_pipeline_from_path(config_path)
     else:
         click.echo(
@@ -191,12 +197,15 @@ def audit_verify(log_path: Path, hmac_secret: str, key_id: str) -> None:
     help="Path to the JSONL audit chain.",
 )
 def replay(entry_id: str, audit_log_path: Path) -> None:
-    """Display the audit row for ENTRY_ID and the original decision context.
+    """Show the audit row for ENTRY_ID. (Does NOT re-execute the pipeline yet.)
 
     Deterministic re-evaluation of ADMISSION-stage checks against an
-    archived request requires the original request body to also be
-    stored — pipeline integration roadmap. For v0.1, ``replay`` reads
-    the entry, prints it, and exits 0.
+    archived request requires the original request body to be stored
+    alongside the audit row — that's roadmap, not v0.1. For now this
+    command reads the matching entry, pretty-prints it, and exits 0.
+    Useful for incident response (`why did we block this entry?`) and
+    for confirming receipts; not yet useful for pipeline regression
+    testing against historical traffic.
     """
     from signet.audit.backend import JsonlBackend
 
@@ -221,6 +230,7 @@ def init(target_dir: Path) -> None:
 
     pipeline_path = target_dir / "pipeline.py"
     env_path = target_dir / ".env.example"
+    gitignore_path = target_dir / ".gitignore"
 
     if pipeline_path.exists():
         click.secho(f"refusing to overwrite existing {pipeline_path}", fg="yellow")
@@ -228,6 +238,13 @@ def init(target_dir: Path) -> None:
 
     pipeline_path.write_text(_PIPELINE_TEMPLATE, encoding="utf-8")
     env_path.write_text(_ENV_TEMPLATE, encoding="utf-8")
+    # Also drop a .gitignore so the user doesn't accidentally commit
+    # their HMAC secret (.env) or audit log (potentially sensitive
+    # owner attribution data) on first push. Leave any existing
+    # .gitignore alone.
+    if not gitignore_path.exists():
+        gitignore_path.write_text(_GITIGNORE_TEMPLATE, encoding="utf-8")
+        click.secho(f"  wrote {gitignore_path}", fg="green")
 
     click.secho(f"  wrote {pipeline_path}", fg="green")
     click.secho(f"  wrote {env_path}", fg="green")
@@ -237,7 +254,13 @@ def init(target_dir: Path) -> None:
 
 
 def _load_pipeline_from_path(path: Path) -> Pipeline:
-    """Import a Python file and return its ``pipeline`` attribute."""
+    """Import a Python file and return its ``pipeline`` attribute.
+
+    SECURITY: this calls ``importlib.exec_module`` on the file at
+    ``path``, which is arbitrary-code execution by design. Only point
+    ``signet serve --config`` at files you control. The CLI prints a
+    warning at startup; this function is the actual gun.
+    """
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("signet_user_config", path)
@@ -255,7 +278,8 @@ def _load_pipeline_from_path(path: Path) -> Pipeline:
         )
     if not isinstance(pipeline, _Pipeline):
         raise click.ClickException(
-            f"{path}'s `pipeline` is {type(pipeline).__name__}, expected signet.core.pipeline.Pipeline"
+            f"{path}'s `pipeline` is {type(pipeline).__name__}, "
+            "expected signet.core.pipeline.Pipeline"
         )
     return pipeline
 
@@ -321,6 +345,17 @@ SIGNET_AUDIT_LOG_PATH=./audit.jsonl
 # Bind address. 127.0.0.1 = loopback only; 0.0.0.0 = all interfaces.
 SIGNET_HOST=127.0.0.1
 SIGNET_PORT=8443
+"""
+
+# Generated alongside the scaffold so first-time users do not commit
+# their HMAC secret or audit-log contents on first push.
+_GITIGNORE_TEMPLATE = """# signet — keep secrets and audit logs out of version control.
+.env
+.env.*
+!.env.example
+*.jsonl
+__pycache__/
+*.pyc
 """
 
 

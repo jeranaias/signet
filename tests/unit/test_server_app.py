@@ -427,3 +427,74 @@ class TestUnsupportedEndpoints:
         body = r.json()
         assert "not implemented" in body["error"]
         assert body["endpoint"] == "/v1/embeddings"
+
+
+class TestRequestFingerprint:
+    def test_audit_rows_share_fingerprint_per_request(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, upstream_response_body: dict[str, Any]
+    ) -> None:
+        from signet.audit.backend import JsonlBackend
+
+        async def fake_post(_self, _url, **_kwargs):
+            class FakeResp:
+                status_code = 200
+                content = b""
+                headers: ClassVar[dict[str, str]] = {}
+
+                @staticmethod
+                def json() -> dict[str, Any]:
+                    return upstream_response_body
+
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+        log = tmp_path / "audit.jsonl"
+        config = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=log,
+        )
+        signet_app = SignetApp(
+            config=config,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True)]),
+        )
+        client = TestClient(signet_app.app)
+
+        for _ in range(2):
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+                headers={"X-Commit-Owner": "human:alice"},
+            )
+
+        entries = list(JsonlBackend(log).iter_entries())
+        assert all(e.request_fingerprint.startswith("sha256:") for e in entries)
+        # Identical bodies → identical fingerprints (audit consumers can group)
+        unique = {e.request_fingerprint for e in entries}
+        assert len(unique) == 1
+
+
+class TestMultimodalRedaction:
+    def test_redact_preserves_image_parts(self) -> None:
+        from signet.server.app import SignetApp
+
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "my ssn is 123-45-6789"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;..."}},
+                    ],
+                }
+            ]
+        }
+        out = SignetApp._apply_redaction(body, "[REDACTED]")
+        new_content = out["messages"][-1]["content"]
+        assert isinstance(new_content, list)
+        # image part survived
+        assert any(p.get("type") == "image_url" for p in new_content)
+        # text part replaced
+        text_parts = [p for p in new_content if p.get("type") == "text"]
+        assert len(text_parts) == 1
+        assert text_parts[0]["text"] == "[REDACTED]"

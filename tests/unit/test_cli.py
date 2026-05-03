@@ -34,6 +34,21 @@ class TestInit:
         assert result.exit_code == 0, result.output
         assert (tmp_path / "pipeline.py").exists()
         assert (tmp_path / ".env.example").exists()
+        # .gitignore is generated so users do not commit their HMAC
+        # secret or audit log on first push.
+        gi = tmp_path / ".gitignore"
+        assert gi.exists()
+        text = gi.read_text(encoding="utf-8")
+        assert ".env" in text
+        assert "*.jsonl" in text
+
+    def test_init_does_not_overwrite_existing_gitignore(self, tmp_path: Path) -> None:
+        gi = tmp_path / ".gitignore"
+        gi.write_text("# user-managed\n", encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(main, ["init", str(tmp_path)])
+        assert result.exit_code == 0
+        assert gi.read_text(encoding="utf-8") == "# user-managed\n"
 
     def test_init_refuses_overwrite(self, tmp_path: Path) -> None:
         (tmp_path / "pipeline.py").write_text("# pre-existing", encoding="utf-8")

@@ -26,6 +26,7 @@ appropriate hook timings:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -202,6 +203,12 @@ class SignetApp:
         client_ip = request.client.host if request.client else None
         session_id = headers.get(SESSION_HEADER) or headers.get(SESSION_HEADER.lower())
 
+        # Compute the request fingerprint over the raw bytes BEFORE
+        # any redaction modifies the body. Two audit rows from the same
+        # request will share this fingerprint, letting downstream tools
+        # group by request without inventing a separate request_id.
+        request_fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest() if raw else ""
+
         ctx = RequestContext(
             owner=Owner.unresolved(),
             headers=headers,
@@ -210,6 +217,7 @@ class SignetApp:
             client_ip=client_ip,
             session_id=session_id,
         )
+        ctx.scratch["_request_fingerprint"] = request_fingerprint
 
         # 2. ADMISSION pipeline. Outcomes:
         #   ALLOW    → forward
@@ -277,7 +285,7 @@ class SignetApp:
 
     @staticmethod
     def _apply_redaction(body: dict[str, Any], replacement: str | None) -> dict[str, Any]:
-        """Swap the last user-message content for ``replacement``.
+        """Swap the last user-message text content for ``replacement``.
 
         Best-effort: REDACT is intended for input-side checks
         (``RegexContentCheck``) where the offending pattern lives in the
@@ -285,6 +293,13 @@ class SignetApp:
         different shape, return BLOCK and let the caller re-issue with
         the correction; OSS does not pretend to know your full message
         graph.
+
+        Multimodal handling: when the last user message uses the
+        OpenAI vision shape (``content`` is a list of ``{"type": ...}``
+        parts), only the **text** parts are replaced. Image and audio
+        parts pass through untouched — dropping them would silently
+        change request semantics far beyond what a redact decision
+        promises.
         """
         if replacement is None:
             return body
@@ -292,11 +307,36 @@ class SignetApp:
         messages = list(body.get("messages", ()))
         for i in range(len(messages) - 1, -1, -1):
             msg = messages[i]
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                new_msg = dict(msg)
+            if not (isinstance(msg, dict) and msg.get("role") == "user"):
+                continue
+            new_msg = dict(msg)
+            content = msg.get("content")
+            if isinstance(content, str):
                 new_msg["content"] = replacement
-                messages[i] = new_msg
-                break
+            elif isinstance(content, list):
+                # Vision-style: keep non-text parts (images, audio) intact
+                new_parts: list[Any] = []
+                replaced_any = False
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        if not replaced_any:
+                            new_parts.append({"type": "text", "text": replacement})
+                            replaced_any = True
+                        # Subsequent text parts are dropped — the single
+                        # replacement covers all redacted text.
+                    else:
+                        new_parts.append(part)
+                if not replaced_any:
+                    # No text parts existed; prepend the replacement so the
+                    # redaction is at least represented in the message.
+                    new_parts.insert(0, {"type": "text", "text": replacement})
+                new_msg["content"] = new_parts
+            else:
+                # Unknown content shape — replace wholesale rather than
+                # leave the offending pattern in place.
+                new_msg["content"] = replacement
+            messages[i] = new_msg
+            break
         out["messages"] = messages
         return out
 
@@ -326,16 +366,32 @@ class SignetApp:
         choice = (data.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
         if isinstance(msg.get("content"), str):
-            rctx.accumulated_text = msg["content"]
+            rctx.extend_text(msg["content"])
         rctx.chunk_count = 1
 
-        await self.pipeline.post_complete(rctx)
+        record_results = await self.pipeline.post_complete(rctx)
+
+        # Each non-allow RECORD result becomes its own audit row so the
+        # specific check name and metadata survive into the chain.
+        # The aggregate "request completed" row is always written so
+        # consumers can pivot from request → entries via fingerprint.
+        for record_result in record_results:
+            if not record_result.is_allow:
+                self._record_decision(
+                    ctx,
+                    result=record_result,
+                    check_name=record_result.metadata.get("_check_name", "pipeline.record"),
+                )
 
         entry = self._record_decision(
             ctx,
-            result=None,  # post-complete already ran; record an aggregate allow
+            result=None,
             check_name="pipeline.complete",
-            metadata={"finish_reason": rctx.finish_reason, "tokens": rctx.usage},
+            metadata={
+                "finish_reason": rctx.finish_reason,
+                "tokens": rctx.usage,
+                "accumulated_text_truncated": rctx.accumulated_text_truncated,
+            },
         )
         headers = {}
         if entry is not None and self._receipt_signer is not None:
@@ -356,8 +412,10 @@ class SignetApp:
                 async for raw_chunk in upstream.aiter_bytes():
                     rctx.chunk_count += 1
                     chunk_text = raw_chunk.decode("utf-8", errors="replace")
-                    # Best-effort accumulator for SSE 'data:' frames
-                    rctx.accumulated_text += _extract_sse_content(chunk_text)
+                    # Best-effort accumulator for SSE 'data:' frames.
+                    # extend_text enforces the per-response cap so a
+                    # multi-megabyte stream cannot OOM the proxy.
+                    rctx.extend_text(_extract_sse_content(chunk_text))
 
                     inspection = await self.pipeline.inspect_response_chunk(rctx, chunk_text)
                     if not inspection.is_allow:
@@ -386,8 +444,22 @@ class SignetApp:
                     yield raw_chunk
 
             rctx.finish_reason = rctx.finish_reason or "stop"
-            await self.pipeline.post_complete(rctx)
-            self._record_decision(ctx, result=None, check_name="pipeline.complete")
+            for record_result in await self.pipeline.post_complete(rctx):
+                if not record_result.is_allow:
+                    self._record_decision(
+                        ctx,
+                        result=record_result,
+                        check_name=record_result.metadata.get("_check_name", "pipeline.record"),
+                    )
+            self._record_decision(
+                ctx,
+                result=None,
+                check_name="pipeline.complete",
+                metadata={
+                    "finish_reason": rctx.finish_reason,
+                    "accumulated_text_truncated": rctx.accumulated_text_truncated,
+                },
+            )
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -469,6 +541,7 @@ class SignetApp:
             decision=decision,
             reason=reason,
             metadata=meta,
+            request_fingerprint=ctx.scratch.get("_request_fingerprint", ""),
         )
         return self._chain.append(entry)
 
@@ -496,6 +569,7 @@ class SignetApp:
                 "_exception_class": type(exc).__name__,
                 "_exception_message": str(exc),
             },
+            request_fingerprint=ctx.scratch.get("_request_fingerprint", ""),
         )
         return self._chain.append(entry)
 
