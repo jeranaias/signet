@@ -55,15 +55,15 @@ def chain(backend: JsonlBackend, keyring: KeyRing) -> HmacChain:
 
 
 class TestRoundtrip:
-    def test_empty_chain_verifies_clean(
-        self, backend: JsonlBackend, keyring: KeyRing
-    ) -> None:
+    def test_empty_chain_verifies_clean(self, backend: JsonlBackend, keyring: KeyRing) -> None:
         report = ChainVerifier(backend, keyring).verify()
         assert report.ok
         assert report.total_entries == 0
         assert report.last_known_good_index == -1
 
-    def test_single_entry_verifies_clean(self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing) -> None:
+    def test_single_entry_verifies_clean(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
         appended = chain.append(_entry("first"))
         assert appended.hmac  # populated
         assert appended.prev_hmac == ""  # first entry has no predecessor
@@ -85,9 +85,7 @@ class TestRoundtrip:
         assert report.total_entries == 50
         assert report.last_known_good_index == 49
 
-    def test_each_entry_links_to_predecessor(
-        self, chain: HmacChain, backend: JsonlBackend
-    ) -> None:
+    def test_each_entry_links_to_predecessor(self, chain: HmacChain, backend: JsonlBackend) -> None:
         a = chain.append(_entry("a"))
         b = chain.append(_entry("b"))
         c = chain.append(_entry("c"))
@@ -193,9 +191,7 @@ class TestLinkMismatchDetection:
 
 
 class TestKeyRotation:
-    def test_chain_spanning_rotation_verifies(
-        self, backend: JsonlBackend
-    ) -> None:
+    def test_chain_spanning_rotation_verifies(self, backend: JsonlBackend) -> None:
         # Era 1
         ring = KeyRing(active=Key.generate("k1"))
         chain = HmacChain(backend, ring)
@@ -212,9 +208,7 @@ class TestKeyRotation:
         assert report.ok, f"breaks: {report.breaks}"
         assert report.total_entries == 4
 
-    def test_unknown_key_reported_distinctly(
-        self, backend: JsonlBackend
-    ) -> None:
+    def test_unknown_key_reported_distinctly(self, backend: JsonlBackend) -> None:
         # Sign two entries under k1
         ring = KeyRing(active=Key.generate("k1"))
         chain = HmacChain(backend, ring)

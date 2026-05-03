@@ -94,9 +94,7 @@ class KeyRing:
         if a key with the same ID is already registered.
         """
         if key.key_id == self._active.key_id:
-            raise ValueError(
-                f"Cannot add legacy key with same ID as active key: {key.key_id!r}"
-            )
+            raise ValueError(f"Cannot add legacy key with same ID as active key: {key.key_id!r}")
         if key.key_id in self._legacy:
             raise ValueError(f"Legacy key {key.key_id!r} already registered")
         self._legacy[key.key_id] = key
@@ -109,13 +107,9 @@ class KeyRing:
         ring under any role.
         """
         if new_active.key_id == self._active.key_id:
-            raise ValueError(
-                f"New active key has same ID as current active: {new_active.key_id!r}"
-            )
+            raise ValueError(f"New active key has same ID as current active: {new_active.key_id!r}")
         if new_active.key_id in self._legacy:
-            raise ValueError(
-                f"New active key {new_active.key_id!r} already exists as legacy"
-            )
+            raise ValueError(f"New active key {new_active.key_id!r} already exists as legacy")
         self._legacy[self._active.key_id] = self._active
         self._active = new_active
 
