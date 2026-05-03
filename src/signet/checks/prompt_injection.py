@@ -61,11 +61,13 @@ def _r(name: str, regex: str, severity: Severity, *, flags: int = re.IGNORECASE)
 
 
 _DEFAULT_RULES: tuple[_Rule, ...] = (
-    # Override patterns
+    # Override patterns. Permissive interior to catch "ignore all previous
+    # instructions", "ignore all of the prior messages", etc., where one or
+    # more qualifier words sit between the verb and the noun.
     _r(
         "ignore_previous",
-        r"\bignore\s+(?:the\s+)?(?:previous|prior|all|above)\s+"
-        r"(?:instructions?|prompts?|rules?|messages?)\b",
+        r"\bignore\b[^.!?\n]{0,80}?\b(?:instructions?|prompts?|rules?|messages?|"
+        r"(?:system\s+)?prompt|directives?)\b",
         Severity.HIGH,
     ),
     _r("disregard", r"\bdisregard\s+(?:the\s+)?(?:above|previous|prior|all)\b", Severity.HIGH),

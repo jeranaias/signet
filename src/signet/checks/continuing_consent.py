@@ -76,8 +76,11 @@ class ContinuingConsentCheck(Check):
             raise ValueError("check_every_chunks must be >= 1")
 
     async def inspect_response_chunk(self, ctx: ResponseContext, chunk: str) -> CheckResult:
-        # Throttle: only revalidate on every Nth chunk to keep cost down.
-        if ctx.chunk_count % self.check_every_chunks != 1:
+        # Throttle: fire on chunk 1, then every Nth chunk after. Using
+        # (chunk_count - 1) % every == 0 instead of chunk_count % every == 1
+        # so the every=1 case fires on every chunk (1 % 1 == 0, breaks the
+        # naive formula).
+        if ctx.chunk_count < 1 or (ctx.chunk_count - 1) % self.check_every_chunks != 0:
             return CheckResult.allow()
 
         try:
