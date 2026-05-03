@@ -46,11 +46,18 @@ def main() -> None:
     help="OpenAI-compatible upstream URL (e.g. http://localhost:11434/v1).",
 )
 @click.option(
-    "--host", default="127.0.0.1", envvar="SIGNET_HOST", show_default=True,
+    "--host",
+    default="127.0.0.1",
+    envvar="SIGNET_HOST",
+    show_default=True,
     help="Bind interface.",
 )
 @click.option(
-    "--port", default=8443, type=int, envvar="SIGNET_PORT", show_default=True,
+    "--port",
+    default=8443,
+    type=int,
+    envvar="SIGNET_PORT",
+    show_default=True,
     help="Bind port.",
 )
 @click.option(
