@@ -26,8 +26,10 @@ from __future__ import annotations
 from signet.server.app import SignetApp
 from signet.server.config import ServerConfig
 from signet.server.receipt import (
+    ALG_ED25519,
     ALG_HMAC_SHA256,
     DEFAULT_HEADER_NAME,
+    Ed25519ReceiptSigner,
     HmacReceiptSigner,
     ReceiptSigner,
     parse_header,
@@ -43,9 +45,11 @@ from signet.server.session import (
 )
 
 __all__ = [
+    "ALG_ED25519",
     "ALG_HMAC_SHA256",
     "DEFAULT_HEADER_NAME",
     "SESSION_HEADER_NAME",
+    "Ed25519ReceiptSigner",
     "HmacReceiptSigner",
     "InMemorySessionStore",
     "ReceiptSigner",

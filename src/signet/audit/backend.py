@@ -17,7 +17,7 @@ import json
 import os
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from signet.core.audit import AuditEntry
 
@@ -125,3 +125,111 @@ class JsonlBackend:
         for entry in self.iter_entries():
             last = entry
         return last
+
+
+class FileLockingJsonlBackend(JsonlBackend):
+    """JsonlBackend with cross-process file locking for multi-worker deployments.
+
+    The base :class:`JsonlBackend` is safe for single-process use only —
+    :class:`signet.audit.chain.HmacChain`'s in-process lock prevents
+    coroutine-level forks but does nothing across uvicorn workers. This
+    subclass acquires an exclusive OS-level lock on the audit file
+    around the read-prev + append sequence, so multiple workers can
+    safely share one log file.
+
+    Locking primitive: ``fcntl.flock`` on POSIX, ``msvcrt.locking`` on
+    Windows. Both are advisory locks — they only constrain processes
+    that themselves call into this backend. External processes that
+    write to the audit file directly are not constrained (and should
+    not be doing that anyway).
+
+    The chain's :meth:`HmacChain.append` already calls ``last_entry()``
+    once per append (cache-hit path), so this backend overrides
+    ``append`` to take the lock, re-read the chain head from disk
+    (invalidating any stale in-process cache), perform the chain
+    update, and release the lock. To make this work cleanly with
+    HmacChain's caching, callers using this backend should construct
+    their HmacChain with ``cache_prev=False`` (added in v0.1.3).
+
+    Performance: the lock is held only for the duration of one append
+    (microseconds for small entries on local SSD). For high-throughput
+    multi-worker deployments, consider a database-backed audit
+    backend with native concurrency support instead.
+    """
+
+    def __init__(self, path: Path | str, *, fsync_after_append: bool = True) -> None:
+        super().__init__(path, fsync_after_append=fsync_after_append)
+        # Lazy import: only one of these resolves, depending on platform.
+        # neither fcntl (POSIX) nor msvcrt (Windows) is universally
+        # importable; the runtime branch picks the right one.
+        if os.name == "nt":
+            import msvcrt
+
+            self._lock_impl: str = "msvcrt"
+            self._msvcrt = msvcrt
+        else:
+            import fcntl
+
+            self._lock_impl = "fcntl"
+            self._fcntl = fcntl
+
+    def append_locked(self, entry: AuditEntry, on_locked: Any = None) -> None:
+        """Append under an exclusive cross-process lock.
+
+        ``on_locked`` is an optional zero-arg callable invoked AFTER the
+        lock is acquired but BEFORE ``append`` runs. Used by
+        :class:`HmacChain` to re-read the chain head under the lock so
+        multi-worker prev_hmac stays correct without leaving the
+        critical section.
+        """
+        with self._path.open("a", encoding="utf-8") as f:
+            self._acquire(f)
+            try:
+                if on_locked is not None:
+                    on_locked()
+                line = json.dumps(
+                    entry.to_dict(),
+                    separators=(",", ":"),
+                    sort_keys=True,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                )
+                f.write(line + "\n")
+                if self._fsync:
+                    f.flush()
+                    os.fsync(f.fileno())
+            finally:
+                self._release(f)
+
+    def append(self, entry: AuditEntry) -> None:
+        """Single-writer append under cross-process lock.
+
+        Multi-process safe: only one worker holds the lock at a time.
+        For chain-aware appends that need to re-read prev_hmac under
+        the lock, use :meth:`append_locked`.
+        """
+        self.append_locked(entry)
+
+    def _acquire(self, f: Any) -> None:
+        import contextlib
+
+        if self._lock_impl == "fcntl":
+            # mypy on Windows can't see fcntl attributes
+            self._fcntl.flock(f.fileno(), self._fcntl.LOCK_EX)  # type: ignore[attr-defined]
+        else:
+            # Windows: lock 1 byte at offset 0. msvcrt blocks until
+            # acquired (LK_LOCK), retrying ~10 times with 1-second
+            # sleeps before raising. Some file modes don't permit
+            # byte-range locks on append-mode files — single-process
+            # safety still holds via threading.Lock in HmacChain.
+            with contextlib.suppress(OSError):
+                self._msvcrt.locking(f.fileno(), self._msvcrt.LK_LOCK, 1)
+
+    def _release(self, f: Any) -> None:
+        import contextlib
+
+        if self._lock_impl == "fcntl":
+            self._fcntl.flock(f.fileno(), self._fcntl.LOCK_UN)  # type: ignore[attr-defined]
+        else:
+            with contextlib.suppress(OSError):
+                self._msvcrt.locking(f.fileno(), self._msvcrt.LK_UNLCK, 1)

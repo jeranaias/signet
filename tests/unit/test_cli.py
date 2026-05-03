@@ -192,6 +192,54 @@ class TestAuditShowAlias:
         assert "deprecated" in result.output.lower()
 
 
+class TestKeysGenerateEd25519:
+    def test_generate_writes_priv_and_pub(self, tmp_path: Path) -> None:
+        runner = CliRunner()
+        priv_path = tmp_path / "signet.key"
+        result = runner.invoke(
+            main,
+            [
+                "keys",
+                "generate-ed25519",
+                "--out",
+                str(priv_path),
+                "--key-id",
+                "smoketest",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert priv_path.exists()
+        pub_path = tmp_path / "signet.key.pub"
+        assert pub_path.exists()
+        # Both files are PEM-encoded
+        assert b"-----BEGIN PRIVATE KEY-----" in priv_path.read_bytes()
+        assert b"-----BEGIN PUBLIC KEY-----" in pub_path.read_bytes()
+
+    def test_refuses_overwrite_without_force(self, tmp_path: Path) -> None:
+        priv_path = tmp_path / "signet.key"
+        priv_path.write_text("existing", encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["keys", "generate-ed25519", "--out", str(priv_path)],
+        )
+        assert result.exit_code != 0
+        assert "refusing to overwrite" in result.output
+
+    def test_force_overwrites(self, tmp_path: Path) -> None:
+        priv_path = tmp_path / "signet.key"
+        priv_path.write_text("existing", encoding="utf-8")
+        pub_path = tmp_path / "signet.key.pub"
+        pub_path.write_text("existing-pub", encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["keys", "generate-ed25519", "--out", str(priv_path), "--force"],
+        )
+        assert result.exit_code == 0
+        assert b"-----BEGIN PRIVATE KEY-----" in priv_path.read_bytes()
+
+
 class TestDoctor:
     def test_doctor_with_no_flags_prints_versions(self) -> None:
         runner = CliRunner()

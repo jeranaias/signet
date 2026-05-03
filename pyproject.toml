@@ -62,10 +62,16 @@ dependencies = [
 openai = ["openai>=1.40"]
 anthropic = ["anthropic>=0.30"]
 langchain = ["langchain-core>=0.2"]
+ed25519 = ["cryptography>=42.0"]
+redis = ["redis>=5.0"]
+prometheus = ["prometheus-client>=0.20"]
 all = [
     "openai>=1.40",
     "anthropic>=0.30",
     "langchain-core>=0.2",
+    "cryptography>=42.0",
+    "redis>=5.0",
+    "prometheus-client>=0.20",
 ]
 dev = [
     "pytest>=8.0",
@@ -76,6 +82,11 @@ dev = [
     "mypy>=1.10",
     "types-pyyaml>=6.0",
     "pre-commit>=3.7",
+    # Optional-dep stand-ins so the dev environment exercises the full surface
+    "cryptography>=42.0",
+    "redis>=5.0",
+    "fakeredis>=2.20",
+    "prometheus-client>=0.20",
 ]
 docs = [
     "mkdocs>=1.6",
@@ -131,7 +142,11 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S", "B"]
+"tests/**/*.py" = ["S", "B", "RUF001", "RUF002", "RUF003"]
+# The PromptInjection check + its tests deliberately contain Unicode
+# confusables (Cyrillic / Greek / Cherokee lookalikes, full-width ASCII)
+# because the whole purpose of the file is to detect / fold them.
+"src/signet/checks/prompt_injection.py" = ["RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.format]
 quote-style = "double"

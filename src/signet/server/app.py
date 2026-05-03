@@ -153,10 +153,21 @@ class SignetApp:
         async def chat_completions(request: Request) -> Response:
             return await self._handle_chat(request)
 
+        @self.app.post("/v1/completions")
+        async def completions(request: Request) -> Response:
+            return await self._handle_completions(request)
+
+        @self.app.post("/v1/embeddings")
+        async def embeddings(request: Request) -> Response:
+            return await self._handle_embeddings(request)
+
         # Explicit refusal for OpenAI endpoints we do NOT yet gate.
-        # Without this, requests would 404 with FastAPI's generic body
-        # and callers would assume the proxy is broken. Spelling it out
-        # is honest about scope.
+        # /v1/audio/* and /v1/images/* are deferred because their
+        # request shapes (binary uploads, multi-part forms) don't fit
+        # the JSON-body assumptions baked into the pipeline's check
+        # surface. Adding them is roadmap for v0.2 and they will need
+        # their own check protocols (vision-aware checks, audio
+        # transcript checks, etc.).
         @self.app.api_route(
             "/v1/{path:path}",
             methods=["POST", "GET", "PUT", "DELETE", "PATCH"],
@@ -165,19 +176,25 @@ class SignetApp:
             return JSONResponse(
                 status_code=404,
                 content={
-                    "error": "endpoint not implemented in signet v0.1",
+                    "error": "endpoint not implemented in signet v0.1.3",
                     "endpoint": f"/v1/{path}",
                     "note": (
-                        "v0.1 only gates POST /v1/chat/completions. "
-                        "Other OpenAI endpoints (embeddings, completions, "
-                        "audio, images) are roadmapped."
+                        "v0.1.3 gates /v1/chat/completions, /v1/completions, "
+                        "and /v1/embeddings. /v1/audio/* and /v1/images/* are "
+                        "roadmapped — their non-JSON request shapes need "
+                        "their own check protocols and aren't a copy-paste "
+                        "addition."
                     ),
                 },
             )
 
-    async def _handle_chat(self, request: Request) -> Response:
-        # 1. Read body with explicit size cap. Reject before parsing so a
-        # 10 GB junk POST cannot OOM the proxy.
+    async def _admit(self, request: Request, *, path: str) -> Response | RequestContext:
+        """Shared body-read + JSON-parse + admission-pipeline preamble.
+
+        Returns either a Response (caller should return immediately
+        because admission refused/escalated/errored) or the populated
+        RequestContext to proceed with forwarding.
+        """
         try:
             raw = await self._read_capped_body(request)
         except _BodyTooLarge as exc:
@@ -190,10 +207,6 @@ class SignetApp:
             )
 
         if not raw:
-            # Forwarding an empty {} to upstream just produces an
-            # opaque 400 from the LLM service. Reject at signet's
-            # boundary with a clear message so the caller knows where
-            # the problem is.
             return JSONResponse(
                 status_code=400,
                 content={"error": "empty request body"},
@@ -207,45 +220,27 @@ class SignetApp:
                 content={"error": f"invalid JSON in request body: {e}"},
             )
 
-        # Build RequestContext. Owner starts unresolved; the
-        # OwnerResolutionCheck (or LoopbackTrustCheck before it) populates it.
         headers = dict(request.headers.items())
         client_ip = request.client.host if request.client else None
         session_id = headers.get(SESSION_HEADER) or headers.get(SESSION_HEADER.lower())
-
-        # Compute the request fingerprint over the raw bytes BEFORE
-        # any redaction modifies the body. Two audit rows from the same
-        # request will share this fingerprint, letting downstream tools
-        # group by request without inventing a separate request_id.
         request_fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest() if raw else ""
 
         ctx = RequestContext(
             owner=Owner.unresolved(),
             headers=headers,
             body=body,
-            path="/v1/chat/completions",
+            path=path,
             client_ip=client_ip,
             session_id=session_id,
         )
         ctx.scratch["_request_fingerprint"] = request_fingerprint
 
-        # Load (or create) the Session and stash it on scratch so checks
-        # can read cross-request state without each having to reach into
-        # the store directly. Touch updates last_seen_at + request_count.
         if session_id:
             session = self.session_store.get_or_create(session_id)
             session.touch()
             self.session_store.save(session)
             ctx.scratch["_session"] = session
 
-        # 2. ADMISSION pipeline. Outcomes:
-        #   ALLOW    → forward
-        #   REDACT   → forward with replacement_content swapped into body
-        #   BLOCK    → 403/429 to caller, audit row with decision=BLOCK
-        #   ESCALATE → 202 Accepted; audit row with decision=ESCALATE.
-        #              The caller's responsibility is to poll/wait for a
-        #              human approval that this proxy does not orchestrate;
-        #              orchestration belongs in a higher-level system.
         try:
             result = await self.pipeline.pre_request(ctx)
         except Exception as exc:
@@ -268,12 +263,80 @@ class SignetApp:
         if result.is_redact:
             ctx.body = self._apply_redaction(ctx.body, result.replacement_content)
 
-        # 3. Forward (stream-aware)
-        is_stream = bool(body.get("stream", False))
+        return ctx
+
+    async def _handle_chat(self, request: Request) -> Response:
+        admitted = await self._admit(request, path="/v1/chat/completions")
+        if isinstance(admitted, Response):
+            return admitted
+        ctx = admitted
+
+        is_stream = bool(ctx.body.get("stream", False))
         try:
             if is_stream:
-                return await self._forward_stream(ctx)
-            return await self._forward_unary(ctx)
+                return await self._forward_stream(ctx, "/chat/completions")
+            return await self._forward_unary(ctx, "/chat/completions")
+        except Exception as exc:
+            self._record_exception(ctx, exc, check_name="pipeline.forward")
+            logger.exception("upstream forward crashed")
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": "upstream forward failed",
+                    "exception": type(exc).__name__,
+                },
+            )
+
+    async def _handle_completions(self, request: Request) -> Response:
+        """Legacy /v1/completions endpoint (text completion, pre-chat).
+
+        Same pipeline shape as chat completions. The response body
+        differs (``choices[].text`` instead of ``choices[].message``);
+        ScopeDriftCheck and similar text-scanning checks read from
+        ``ResponseContext.accumulated_text`` and work uniformly.
+        """
+        admitted = await self._admit(request, path="/v1/completions")
+        if isinstance(admitted, Response):
+            return admitted
+        ctx = admitted
+
+        is_stream = bool(ctx.body.get("stream", False))
+        try:
+            if is_stream:
+                return await self._forward_stream(ctx, "/completions")
+            return await self._forward_unary(
+                ctx, "/completions", content_path=("choices", 0, "text")
+            )
+        except Exception as exc:
+            self._record_exception(ctx, exc, check_name="pipeline.forward")
+            logger.exception("upstream forward crashed")
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": "upstream forward failed",
+                    "exception": type(exc).__name__,
+                },
+            )
+
+    async def _handle_embeddings(self, request: Request) -> Response:
+        """Embeddings endpoint — non-streaming, no INSPECTION text content.
+
+        ADMISSION runs (owner, classification, rate limit, regex on
+        input strings) and RECORD runs (token-budget reconciliation
+        from upstream usage). INSPECTION-stage checks that scan
+        accumulated output text are skipped — embeddings have no text
+        output to scan. Tool-call-inspector (COMMITMENT) is also
+        skipped — embeddings don't emit tool calls.
+        """
+        admitted = await self._admit(request, path="/v1/embeddings")
+        if isinstance(admitted, Response):
+            return admitted
+        ctx = admitted
+
+        try:
+            return await self._forward_unary(
+                ctx, "/embeddings", content_path=None, skip_inspection_text=True
+            )
         except Exception as exc:
             self._record_exception(ctx, exc, check_name="pipeline.forward")
             logger.exception("upstream forward crashed")
@@ -359,10 +422,28 @@ class SignetApp:
         out["messages"] = messages
         return out
 
-    async def _forward_unary(self, ctx: RequestContext) -> Response:
+    async def _forward_unary(
+        self,
+        ctx: RequestContext,
+        upstream_path: str = "/chat/completions",
+        *,
+        content_path: tuple[Any, ...] | None = ("choices", 0, "message", "content"),
+        skip_inspection_text: bool = False,
+    ) -> Response:
+        """Forward a non-streaming request to the upstream.
+
+        ``upstream_path`` is appended to ``ServerConfig.upstream_url``.
+        ``content_path`` walks the upstream response to find the text
+        that RECORD-stage checks should see in
+        ``ResponseContext.accumulated_text``. Default targets the
+        chat-completions shape; pass ``("choices", 0, "text")`` for
+        legacy /completions. Pass ``None`` (with
+        ``skip_inspection_text=True``) for endpoints with no text
+        output (embeddings).
+        """
         client = self._ensure_http()
         upstream_resp = await client.post(
-            f"{self.config.upstream_url.rstrip('/')}/chat/completions",
+            f"{self.config.upstream_url.rstrip('/')}{upstream_path}",
             json=ctx.body,
             headers=self._upstream_headers(ctx),
         )
@@ -375,17 +456,15 @@ class SignetApp:
                 media_type=upstream_resp.headers.get("content-type", "text/plain"),
             )
 
-        # Build a ResponseContext from the upstream usage + content
         rctx = ResponseContext(request=ctx)
         rctx.usage = data.get("usage", {})
         rctx.finish_reason = (
             data.get("choices", [{}])[0].get("finish_reason") if data.get("choices") else None
         )
-        # Accumulate the text for any post-complete checks that scan it
-        choice = (data.get("choices") or [{}])[0]
-        msg = choice.get("message") or {}
-        if isinstance(msg.get("content"), str):
-            rctx.extend_text(msg["content"])
+        if not skip_inspection_text and content_path is not None:
+            text = _walk_path(data, content_path)
+            if isinstance(text, str):
+                rctx.extend_text(text)
         rctx.chunk_count = 1
 
         record_results = await self.pipeline.post_complete(rctx)
@@ -417,7 +496,11 @@ class SignetApp:
             headers[self.config.receipt_header_name] = self._receipt_signer.sign(entry)
         return JSONResponse(content=data, status_code=upstream_resp.status_code, headers=headers)
 
-    async def _forward_stream(self, ctx: RequestContext) -> StreamingResponse:
+    async def _forward_stream(
+        self,
+        ctx: RequestContext,
+        upstream_path: str = "/chat/completions",
+    ) -> StreamingResponse:
         rctx = ResponseContext(request=ctx)
 
         async def event_stream() -> AsyncIterator[bytes]:
@@ -427,7 +510,7 @@ class SignetApp:
             try:
                 async with client.stream(
                     "POST",
-                    f"{self.config.upstream_url.rstrip('/')}/chat/completions",
+                    f"{self.config.upstream_url.rstrip('/')}{upstream_path}",
                     json=ctx.body,
                     headers=self._upstream_headers(ctx),
                 ) as upstream:
@@ -669,6 +752,24 @@ def _result_to_decision(result: Any) -> Decision:
     if result.is_escalate:
         return Decision.ESCALATE
     return Decision.BLOCK  # fail closed if a future Decision is added without a mapping
+
+
+def _walk_path(data: Any, path: tuple[Any, ...]) -> Any:
+    """Walk a (key, key, ...) path through nested dict/list, returning ``None``
+    if any step is missing or the wrong type. Used by :meth:`_forward_unary`
+    to extract the response text from upstreams of different shapes
+    (chat → choices[0].message.content, completions → choices[0].text)."""
+    cur = data
+    for key in path:
+        if isinstance(cur, dict):
+            cur = cur.get(key)
+        elif isinstance(cur, list) and isinstance(key, int) and 0 <= key < len(cur):
+            cur = cur[key]
+        else:
+            return None
+        if cur is None:
+            return None
+    return cur
 
 
 def _extract_sse_content(chunk_text: str) -> str:

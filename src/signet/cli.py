@@ -205,6 +205,118 @@ def serve(
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
+@main.group()
+def keys() -> None:
+    """Cryptographic key management commands."""
+
+
+@keys.command("generate-ed25519")
+@click.option(
+    "--out",
+    "out_path",
+    required=True,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to write the PEM-encoded ed25519 private key. "
+    "File mode is set to 0600 (owner read/write only) where supported.",
+)
+@click.option(
+    "--public-out",
+    "public_out_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional path to write the matching public key. Defaults to "
+    "<--out>.pub if not specified.",
+)
+@click.option(
+    "--key-id",
+    default=None,
+    help="Optional key identifier to print alongside the public key for "
+    "convenience. Not embedded in the key files themselves.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite the output files if they already exist.",
+)
+def keys_generate_ed25519(
+    out_path: Path,
+    public_out_path: Path | None,
+    key_id: str | None,
+    force: bool,
+) -> None:
+    """Generate a fresh ed25519 keypair for asymmetric receipt signing.
+
+    The private key goes to ``--out`` (chmod 0600). The matching public
+    key goes to ``<--out>.pub`` by default, or to ``--public-out`` if
+    you want them in different locations. The public key is what you
+    share with verifiers — they cannot forge receipts with it.
+
+    Requires ``pip install signet-sign[ed25519]``.
+    """
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    except ImportError as exc:
+        raise click.ClickException(
+            "ed25519 key generation requires the cryptography package. "
+            "Install with: pip install signet-sign[ed25519]"
+        ) from exc
+
+    if public_out_path is None:
+        public_out_path = out_path.with_suffix(out_path.suffix + ".pub")
+
+    for p in (out_path, public_out_path):
+        if p.exists() and not force:
+            raise click.ClickException(
+                f"refusing to overwrite existing file {p}; pass --force to override"
+            )
+
+    priv = Ed25519PrivateKey.generate()
+    priv_pem = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    pub_pem = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    out_path.write_bytes(priv_pem)
+    public_out_path.write_bytes(pub_pem)
+
+    # Best-effort 0600 on POSIX. Windows ACLs differ — operator should
+    # configure permissions through their normal IAM tooling.
+    import contextlib
+    import os
+
+    if hasattr(os, "chmod"):
+        with contextlib.suppress(OSError):
+            os.chmod(out_path, 0o600)
+
+    click.secho(f"  wrote private key:  {out_path} (chmod 0600 attempted)", fg="green")
+    click.secho(f"  wrote public key:   {public_out_path}", fg="green")
+    if key_id:
+        click.echo(f"\nkey_id (record this; verifiers need it): {key_id}")
+    click.echo("\nNext: configure signet with this key for asymmetric receipts.")
+    click.echo(
+        "  In your pipeline / app code:\n"
+        "    from signet.server.receipt import Ed25519ReceiptSigner\n"
+        f"    signer = Ed25519ReceiptSigner.from_pem(\n"
+        f'        private_pem_path="{out_path}",\n'
+        f'        key_id="{key_id or "REPLACE_ME"}",\n'
+        "    )\n"
+        "    SignetApp(config=cfg, pipeline=pipeline, receipt_signer=signer)"
+    )
+    click.echo(
+        "\n  Share the public key with verifiers. They construct a verify-only signer:\n"
+        "    Ed25519ReceiptSigner.from_pem(\n"
+        f'        public_pem_path="{public_out_path}",\n'
+        f'        key_id="{key_id or "REPLACE_ME"}",\n'
+        "    )"
+    )
+
+
 @main.command()
 @click.option(
     "--upstream",

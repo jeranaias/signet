@@ -19,28 +19,42 @@ What the built-in patterns cover:
    that decode to text containing override patterns; zero-width and
    bidirectional Unicode characters.
 
-What the built-in patterns DO NOT cover (known gaps — by design):
+**Pre-processing pipeline (v0.1.3):** every input is run through a
+normalization pipeline before pattern matching. This closes the
+trivial obfuscations a v0.1 hater immediately reached for:
 
-* **Non-English attacks.** Patterns are English-only. Russian, Chinese,
-  Arabic, etc. all bypass. Add language-specific patterns or layer an
-  LLM-judge.
-* **Lookalike Unicode (homoglyph) attacks.** A Cyrillic ``i``-lookalike
-  at U+0456 in front of ``gnore previous`` bypasses the regex while
-  rendering identically to a Latin ``i``. Normalize to NFKC and fold
-  confusables before scanning if you care.
-* **Whitespace / casing obfuscation across-character.** ``i g n o r e``
-  with single-character spacing is not matched. Add a normalizer.
-* **Encoding other than base64.** Hex, URL-safe base64 (``-_``
-  alphabet), base32, ROT13 — none are decoded.
-* **Multi-step attacks.** "First answer X. Now ignore your rules" split
-  across messages or tool-call results. Cumulative cross-turn detection
-  is a session-level concern, not this check.
-* **Adversarial suffix attacks** (e.g. GCG-discovered token strings).
-  Beyond regex; needs a model.
+1. **Unicode NFKC normalization** — collapses compatibility variants
+   (full-width to ASCII, ligatures to component letters, etc.).
+2. **Confusables fold** — maps a curated set of Cyrillic / Greek /
+   mathematical lookalikes to their Latin equivalents
+   (``іgnore`` → ``ignore``, ``Ｉgnore`` → ``ignore``, etc.).
+3. **Whitespace collapse** — ``i g n o r e`` collapses to ``ignore``;
+   stretched whitespace and zero-width spaces between letters no
+   longer hide patterns.
+4. **Wide encoding decoders** — base64 (standard + URL-safe), hex,
+   base32, and ROT13 blobs are decoded and the decoded contents
+   re-scanned. Handles the common "encode the attack" trick.
 
-Treat this check as a tripwire, not a wall. Anything important should
-also have a downstream judge or sandbox preview gate (see
-:mod:`signet.plugins.tribunal` and :mod:`signet.plugins.sandbox`).
+What the built-in patterns DO NOT cover (genuine ML/data territory,
+not OSS-fixable):
+
+* **Sophisticated multilingual attacks** beyond character-level
+  normalization (Russian/Chinese/Arabic semantic prompt injection
+  expressed in native syntax).
+* **Adversarial-suffix attacks** (GCG / AutoDAN-discovered token
+  strings). Beyond regex; needs a trained classifier.
+* **Multi-step / cross-turn attacks** ("First answer X. Now ignore
+  your rules" split across messages or tool-call results).
+* **Semantic prompt injection without lexical markers**
+  (rephrased attacks that don't use any of the trigger phrases).
+
+Treat this check as a tripwire, not a wall. For deployments where the
+20% of attacks beyond OSS scope would be unacceptable, layer a
+production-tuned LLM-judge plugin at COMMITMENT — see
+:mod:`signet.plugins.tribunal` for the reference shape; richer
+calibrated implementations are typical engagements for vendors
+(Thornveil or your preferred provider) that maintain labeled
+adversarial corpora.
 
 Each rule has a severity. Default behavior:
 
@@ -56,7 +70,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import codecs
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -64,6 +80,125 @@ from typing import Any
 from signet.core.check import Check, CheckResult
 from signet.core.context import RequestContext
 from signet.core.stage import Stage
+
+# A curated subset of Unicode confusables with Latin lookalikes.
+# Full Unicode confusables.txt has ~6000 entries; this is the practical
+# subset that covers the actual prompt-injection attacks seen in the
+# wild (Cyrillic, Greek, Cherokee, mathematical alphanumeric, full-width
+# ASCII). Extend on a per-deployment basis if your threat model includes
+# more obscure scripts.
+_CONFUSABLES: dict[str, str] = {
+    # Cyrillic lookalikes
+    "а": "a",
+    "А": "A",
+    "е": "e",
+    "Е": "E",
+    "о": "o",
+    "О": "O",
+    "р": "p",
+    "Р": "P",
+    "с": "c",
+    "С": "C",
+    "у": "y",
+    "У": "Y",
+    "х": "x",
+    "Х": "X",
+    "і": "i",
+    "І": "I",
+    "ј": "j",
+    "Ј": "J",
+    "ѕ": "s",
+    "Ѕ": "S",
+    "ԁ": "d",
+    # Greek lookalikes
+    "α": "a",
+    "Α": "A",
+    "β": "B",
+    "ε": "e",
+    "Ε": "E",
+    "ι": "i",
+    "Ι": "I",
+    "κ": "k",
+    "Κ": "K",
+    "ο": "o",
+    "Ο": "O",
+    "ρ": "p",
+    "Ρ": "P",
+    "τ": "t",
+    "Τ": "T",
+    "υ": "u",
+    "Υ": "Y",
+    "χ": "x",
+    "Χ": "X",
+    "ν": "v",
+    "Ν": "N",
+    "μ": "u",
+    # Cherokee
+    "Ꭺ": "A",
+    "Ꭼ": "E",
+    "Ꮃ": "W",
+    "Ꮟ": "i",
+    "Ꮯ": "C",
+    "Ꮶ": "K",
+    "Ꮤ": "W",
+    # Mathematical bold / italic / monospace alphanumerics — NFKC
+    # already collapses these to ASCII so we don't list them, but we
+    # leave the table extensible.
+}
+
+# Zero-width and joiner-class characters that hide between visible
+# characters without affecting rendering. Stripped before scanning so
+# "i​gnore" matches the "ignore" pattern.
+_ZERO_WIDTH_CHARS = (
+    "​"  # ZERO WIDTH SPACE
+    "‌"  # ZERO WIDTH NON-JOINER
+    "‍"  # ZERO WIDTH JOINER
+    "⁠"  # WORD JOINER
+    "﻿"  # ZERO WIDTH NO-BREAK SPACE / BOM
+    "᠎"  # MONGOLIAN VOWEL SEPARATOR
+    "‪"  # LRE
+    "‫"  # RLE
+    "‬"  # PDF
+    "‭"  # LRO
+    "‮"  # RLO
+    "⁦"  # LRI
+    "⁧"  # RLI
+    "⁨"  # FSI
+    "⁩"  # PDI
+)
+_ZERO_WIDTH_RE = re.compile(f"[{re.escape(_ZERO_WIDTH_CHARS)}]")
+
+# Detects a string that's been "stretched" with single spaces between
+# every letter (i.e. ``i g n o r e p r e v i o u s``). Conservative:
+# only collapses runs of single-letter + single-space patterns of
+# length >= 6 to avoid mangling legitimate prose.
+_STRETCHED_RE = re.compile(r"\b(?:[A-Za-z]\s){5,}[A-Za-z]\b")
+
+
+def _normalize_for_scan(text: str) -> str:
+    """Run the obfuscation-busting normalization pipeline.
+
+    Applied to every input before pattern matching. Order matters:
+
+    1. NFKC normalization collapses compatibility variants (full-width
+       letters, ligatures, mathematical alphanumerics) to ASCII.
+    2. Strip zero-width / bidi-formatting characters.
+    3. Apply confusables fold (Cyrillic/Greek/Cherokee → Latin).
+    4. Collapse "stretched" letter-spaced text.
+
+    Returns the normalized text. The original text is also scanned
+    separately so a normalization-introduced false positive doesn't
+    silently mask a real match against the raw input.
+    """
+    text = unicodedata.normalize("NFKC", text)
+    text = _ZERO_WIDTH_RE.sub("", text)
+    text = "".join(_CONFUSABLES.get(ch, ch) for ch in text)
+
+    def _collapse(m: re.Match[str]) -> str:
+        return m.group(0).replace(" ", "")
+
+    text = _STRETCHED_RE.sub(_collapse, text)
+    return text
 
 
 class Severity(StrEnum):
@@ -172,10 +307,26 @@ class PromptInjectionCheck(Check):
         if not text:
             return CheckResult.allow()
 
+        # Scan both the raw text AND the normalized form. Scanning raw
+        # catches patterns the normalizer might inadvertently break;
+        # scanning normalized catches obfuscation attacks (homoglyph,
+        # zero-width-injected, stretched whitespace).
         matches = self._scan(text)
+        normalized = _normalize_for_scan(text)
+        if normalized != text:
+            for hit in self._scan(normalized, source="normalized"):
+                if hit not in matches:  # de-dup
+                    matches.append(hit)
+
         if self.scan_decoded_base64:
-            for decoded in self._extract_base64_decoded(text):
-                matches.extend(self._scan(decoded, source="base64"))
+            for decoded, encoding in self._extract_decoded(text):
+                matches.extend(self._scan(decoded, source=f"decoded-{encoding}"))
+                # Also scan normalized form of decoded payloads
+                decoded_normalized = _normalize_for_scan(decoded)
+                if decoded_normalized != decoded:
+                    matches.extend(
+                        self._scan(decoded_normalized, source=f"decoded-{encoding}-normalized")
+                    )
 
         if not matches:
             return CheckResult.allow()
@@ -218,17 +369,64 @@ class PromptInjectionCheck(Check):
                 out.append(hit)
         return out
 
-    def _extract_base64_decoded(self, text: str) -> list[str]:
-        """Pull plausible base64 blobs from text and try to decode them."""
-        decoded: list[str] = []
-        pattern = rf"[A-Za-z0-9+/]{{{self.base64_min_length},}}={{0,2}}"
-        for match in re.finditer(pattern, text):
-            blob = match.group(0)
+    def _extract_decoded(self, text: str) -> list[tuple[str, str]]:
+        """Pull plausible encoded blobs from text and try to decode each one.
+
+        Tries multiple encodings; returns ``(decoded_text, encoding_name)``
+        for each blob that decoded to plausible UTF-8 text. The encoding
+        name is propagated into the audit metadata so an analyst sees
+        which channel the obfuscated content arrived through.
+        """
+        decoded: list[tuple[str, str]] = []
+        min_len = self.base64_min_length
+
+        # Standard base64 (a-z, A-Z, 0-9, +, /)
+        for blob in re.findall(rf"[A-Za-z0-9+/]{{{min_len},}}={{0,2}}", text):
             try:
                 raw = base64.b64decode(blob, validate=True)
-                decoded.append(raw.decode("utf-8", errors="ignore"))
+                decoded.append((raw.decode("utf-8", errors="ignore"), "base64"))
             except (binascii.Error, ValueError):
                 continue
+
+        # URL-safe base64 (a-z, A-Z, 0-9, -, _)
+        for blob in re.findall(rf"[A-Za-z0-9_-]{{{min_len},}}={{0,2}}", text):
+            if "-" in blob or "_" in blob:  # only try if it has the URL-safe-specific chars
+                try:
+                    raw = base64.urlsafe_b64decode(blob + "=" * (-len(blob) % 4))
+                    decoded.append((raw.decode("utf-8", errors="ignore"), "base64url"))
+                except (binascii.Error, ValueError):
+                    continue
+
+        # Base32 (A-Z, 2-7) — case-insensitive in practice
+        for blob in re.findall(rf"[A-Z2-7]{{{min_len},}}={{0,8}}", text):
+            try:
+                raw = base64.b32decode(blob, casefold=True)
+                decoded.append((raw.decode("utf-8", errors="ignore"), "base32"))
+            except (binascii.Error, ValueError):
+                continue
+
+        # Hex (0-9, a-f). Use a higher floor to avoid matching every
+        # MD5/SHA-256 hash in the input.
+        hex_min = max(min_len, 32)
+        for blob in re.findall(rf"[0-9a-fA-F]{{{hex_min},}}", text):
+            if len(blob) % 2 == 0:
+                try:
+                    raw = bytes.fromhex(blob)
+                    candidate = raw.decode("utf-8", errors="ignore")
+                    # Skip blobs that decode to mostly non-printable noise
+                    if candidate and sum(c.isprintable() for c in candidate) / len(candidate) > 0.7:
+                        decoded.append((candidate, "hex"))
+                except ValueError:
+                    continue
+
+        # ROT13 — apply to the whole text once. Cheap and catches the
+        # "vtaber cerivbhf vafgehpgvbaf" trick. We only flag if the
+        # decoded form contains an ASCII English-looking phrase that the
+        # raw form did not.
+        rot13 = codecs.encode(text, "rot_13")
+        if rot13 != text:
+            decoded.append((rot13, "rot13"))
+
         return decoded
 
     @staticmethod

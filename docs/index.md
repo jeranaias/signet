@@ -45,5 +45,6 @@ python client_example.py
 - [Architecture](architecture.md) — the four-stage hierarchy, continuing-consent and scope-drift patterns, trust model, and what's intentionally out of scope
 - [Checks](checks/owner_resolution.md) — per-check reference
 - [Plugin development](plugin_dev.md) — write your own checks
-- [Contributing](https://github.com/jeranaias/signet/blob/main/CONTRIBUTING.md)
-- [Security policy](https://github.com/jeranaias/signet/blob/main/SECURITY.md) — threat model, reporting, hardening recommendations
+- [Contributing](contributing.md)
+- [Security policy](security.md) — threat model, reporting, hardening recommendations
+- [Changelog](changelog.md)

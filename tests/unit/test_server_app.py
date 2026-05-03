@@ -419,14 +419,131 @@ class TestPipelineCrashAudit:
         assert "kaboom" in entries[0].reason
 
 
+class TestEmbeddingsAndCompletions:
+    """v0.1.3 — /v1/embeddings and /v1/completions are gated like chat."""
+
+    @pytest.fixture
+    def embedding_response_body(self) -> dict[str, Any]:
+        return {
+            "object": "list",
+            "data": [{"object": "embedding", "embedding": [0.1, 0.2, 0.3], "index": 0}],
+            "model": "text-embedding-3-small",
+            "usage": {"prompt_tokens": 5, "total_tokens": 5},
+        }
+
+    @pytest.fixture
+    def completion_response_body(self) -> dict[str, Any]:
+        return {
+            "id": "cmpl-fake",
+            "object": "text_completion",
+            "model": "gpt-3.5-turbo-instruct",
+            "choices": [{"text": "the answer", "index": 0, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        }
+
+    def test_embeddings_with_owner_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch, embedding_response_body: dict[str, Any]
+    ) -> None:
+        async def fake_post(_self, url, **_kwargs):
+            assert url.endswith("/embeddings"), f"wrong upstream path: {url}"
+
+            class FakeResp:
+                status_code = 200
+                content = b""
+                headers: ClassVar[dict[str, str]] = {}
+
+                @staticmethod
+                def json() -> dict[str, Any]:
+                    return embedding_response_body
+
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+        config = ServerConfig(upstream_url="http://m/v1", allow_ephemeral_key=True)
+        signet_app = SignetApp(
+            config=config,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True)]),
+        )
+        client = TestClient(signet_app.app)
+
+        r = client.post(
+            "/v1/embeddings",
+            json={"model": "text-embedding-3-small", "input": "hello"},
+            headers={"X-Commit-Owner": "human:alice"},
+        )
+        assert r.status_code == 200
+        assert r.json() == embedding_response_body
+        assert r.headers.get("X-Signet-Upstream")
+
+    def test_embeddings_without_owner_blocked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        config = ServerConfig(upstream_url="http://m/v1", allow_ephemeral_key=True)
+        signet_app = SignetApp(
+            config=config,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True)]),
+        )
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/embeddings",
+            json={"model": "text-embedding-3-small", "input": "hello"},
+        )
+        assert r.status_code == 403
+
+    def test_completions_with_owner_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch, completion_response_body: dict[str, Any]
+    ) -> None:
+        async def fake_post(_self, url, **_kwargs):
+            assert url.endswith("/completions") and not url.endswith("/chat/completions"), (
+                f"wrong upstream path: {url}"
+            )
+
+            class FakeResp:
+                status_code = 200
+                content = b""
+                headers: ClassVar[dict[str, str]] = {}
+
+                @staticmethod
+                def json() -> dict[str, Any]:
+                    return completion_response_body
+
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+        config = ServerConfig(upstream_url="http://m/v1", allow_ephemeral_key=True)
+        signet_app = SignetApp(
+            config=config,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True)]),
+        )
+        client = TestClient(signet_app.app)
+
+        r = client.post(
+            "/v1/completions",
+            json={
+                "model": "gpt-3.5-turbo-instruct",
+                "prompt": "Hello",
+                "max_tokens": 5,
+            },
+            headers={"X-Commit-Owner": "human:alice"},
+        )
+        assert r.status_code == 200
+        assert r.json() == completion_response_body
+
+
 class TestUnsupportedEndpoints:
-    def test_embeddings_returns_explicit_404(self, app_factory) -> None:
+    def test_audio_endpoint_returns_explicit_404(self, app_factory) -> None:
+        """v0.1.3 gates embeddings/completions; audio + images still 404."""
         _, client = app_factory(Pipeline(checks=[]))
-        r = client.post("/v1/embeddings", json={"input": "hi"})
+        r = client.post("/v1/audio/transcriptions", json={})
         assert r.status_code == 404
         body = r.json()
         assert "not implemented" in body["error"]
-        assert body["endpoint"] == "/v1/embeddings"
+        assert "audio" in body["note"]
+
+    def test_images_endpoint_returns_explicit_404(self, app_factory) -> None:
+        _, client = app_factory(Pipeline(checks=[]))
+        r = client.post("/v1/images/generations", json={})
+        assert r.status_code == 404
+        body = r.json()
+        assert "not implemented" in body["error"]
 
 
 class TestEmptyBody:
@@ -558,6 +675,175 @@ class TestRequestFingerprint:
         # Identical bodies → identical fingerprints (audit consumers can group)
         unique = {e.request_fingerprint for e in entries}
         assert len(unique) == 1
+
+
+class TestEd25519Signer:
+    """Asymmetric receipt signing: verifiers cannot forge."""
+
+    def _entry(self) -> Any:
+        from signet.audit.chain import HmacChain
+        from signet.audit.keyring import Key, KeyRing
+        from signet.core.audit import AuditEntry, Decision
+        from signet.core.owner import Owner
+
+        ring = KeyRing(active=Key(key_id="kAudit", secret=b"x" * 32))
+        chain = HmacChain(
+            backend=type(
+                "B",
+                (),
+                {
+                    "append": lambda self, e: None,
+                    "iter_entries": lambda self: iter([]),
+                    "last_entry": lambda self: None,
+                },
+            )(),
+            keyring=ring,
+        )
+        return chain.append(
+            AuditEntry(
+                owner=Owner.human("a"),
+                check_name="x",
+                decision=Decision.ALLOW,
+                reason="ok",
+            )
+        )
+
+    def test_sign_and_verify_roundtrip(self) -> None:
+        from signet.server.receipt import Ed25519ReceiptSigner
+
+        signer = Ed25519ReceiptSigner.generate(key_id="test-key")
+        entry = self._entry()
+        receipt = signer.sign(entry)
+
+        assert "alg=ed25519" in receipt
+        assert "key=test-key" in receipt
+        assert signer.verify(receipt, entry) is True
+
+    def test_verify_only_signer_cannot_sign(self, tmp_path) -> None:
+        """An auditor with only the public key cannot forge receipts."""
+        from signet.server.receipt import Ed25519ReceiptSigner
+
+        full = Ed25519ReceiptSigner.generate(key_id="prod-key")
+        pub_path = tmp_path / "signet.pub"
+        pub_path.write_bytes(full.public_pem())
+
+        verifier = Ed25519ReceiptSigner.from_pem(public_pem_path=str(pub_path), key_id="prod-key")
+        with pytest.raises(RuntimeError, match="verify-only"):
+            verifier.sign(self._entry())
+
+    def test_verify_with_wrong_key_id_rejected(self) -> None:
+        from signet.server.receipt import Ed25519ReceiptSigner
+
+        signer = Ed25519ReceiptSigner.generate(key_id="prod-key")
+        entry = self._entry()
+        receipt = signer.sign(entry)
+
+        # A verifier expecting a different key_id rejects the receipt
+        wrong = Ed25519ReceiptSigner(
+            private_key=None,
+            public_key=signer._public,  # type: ignore[attr-defined]
+            key_id="staging-key",
+        )
+        assert wrong.verify(receipt, entry) is False
+
+    def test_tampered_signature_rejected(self) -> None:
+        from signet.server.receipt import Ed25519ReceiptSigner
+
+        signer = Ed25519ReceiptSigner.generate(key_id="prod-key")
+        entry = self._entry()
+        receipt = signer.sign(entry)
+
+        # Flip a hex char in the signature → verification fails
+        tampered = receipt[:-2] + ("00" if receipt[-2:] != "00" else "ff")
+        assert signer.verify(tampered, entry) is False
+
+    def test_alg_downgrade_to_hmac_rejected(self) -> None:
+        """Receipt with alg=ed25519 cannot be downgraded to alg=hmac-sha256."""
+        from signet.server.receipt import Ed25519ReceiptSigner
+
+        signer = Ed25519ReceiptSigner.generate(key_id="prod-key")
+        entry = self._entry()
+        receipt = signer.sign(entry)
+        downgraded = receipt.replace("alg=ed25519", "alg=hmac-sha256")
+        assert signer.verify(downgraded, entry) is False
+
+    def test_pem_roundtrip_via_files(self, tmp_path) -> None:
+        from signet.server.receipt import Ed25519ReceiptSigner
+
+        full = Ed25519ReceiptSigner.generate(key_id="rt-key")
+
+        # Write keys
+        from cryptography.hazmat.primitives import serialization
+
+        priv_path = tmp_path / "key.pem"
+        priv_path.write_bytes(
+            full._private.private_bytes(  # type: ignore[union-attr]
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        )
+        pub_path = tmp_path / "key.pub"
+        pub_path.write_bytes(full.public_pem())
+
+        # Reload signer and verifier separately
+        signer = Ed25519ReceiptSigner.from_pem(private_pem_path=str(priv_path), key_id="rt-key")
+        verifier = Ed25519ReceiptSigner.from_pem(public_pem_path=str(pub_path), key_id="rt-key")
+
+        entry = self._entry()
+        receipt = signer.sign(entry)
+        assert verifier.verify(receipt, entry) is True
+
+
+class TestEd25519SignetAppIntegration:
+    """End-to-end: SignetApp with an Ed25519ReceiptSigner emits valid receipts."""
+
+    def test_signetapp_with_ed25519_signer(
+        self, monkeypatch: pytest.MonkeyPatch, upstream_response_body: dict[str, Any], tmp_path
+    ) -> None:
+        from signet.server.receipt import Ed25519ReceiptSigner, parse_header
+
+        async def fake_post(_self, _url, **_kwargs):
+            class FakeResp:
+                status_code = 200
+                content = b""
+                headers: ClassVar[dict[str, str]] = {}
+
+                @staticmethod
+                def json() -> dict[str, Any]:
+                    return upstream_response_body
+
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+        signer = Ed25519ReceiptSigner.generate(key_id="prod")
+        config = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        app = SignetApp(
+            config=config,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True)]),
+            receipt_signer=signer,
+        )
+        client = TestClient(app.app)
+
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Commit-Owner": "human:alice"},
+        )
+        assert r.status_code == 200
+        receipt = r.headers.get("X-Signet-Receipt") or r.headers.get("x-signet-receipt")
+        assert receipt is not None
+        parsed = parse_header(receipt)
+        assert parsed is not None
+        assert parsed["alg"] == "ed25519"
+        assert parsed["key"] == "prod"
+        # Signature is hex of an ed25519 sig (64 bytes → 128 hex chars)
+        assert len(parsed["sig"]) == 128
 
 
 class TestMultimodalRedaction:

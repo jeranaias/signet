@@ -325,6 +325,48 @@ class TestCanonicalization:
             chain.append(bad_entry)
 
 
+class TestFileLockingBackend:
+    """File-locking backend: multiple writers against one file stay linked."""
+
+    def test_locking_backend_basic_append_and_verify(self, tmp_path: Path) -> None:
+        from signet.audit.backend import FileLockingJsonlBackend
+
+        backend = FileLockingJsonlBackend(tmp_path / "audit.jsonl")
+        ring = KeyRing(active=Key.generate("k1"))
+        chain = HmacChain(backend, ring, cache_prev=False)
+        for i in range(5):
+            chain.append(_entry(f"entry-{i}"))
+        report = ChainVerifier(backend, ring).verify()
+        assert report.ok
+        assert report.total_entries == 5
+
+    def test_two_chain_instances_share_file_safely(self, tmp_path: Path) -> None:
+        """Two HmacChain instances against the same FileLockingJsonlBackend
+        path simulate two uvicorn workers. With cache_prev=False, both
+        read the chain head from disk under the lock and stay linked."""
+        from signet.audit.backend import FileLockingJsonlBackend
+
+        path = tmp_path / "audit.jsonl"
+        ring = KeyRing(active=Key.generate("k1"))
+
+        # Two separate backend + chain instances simulate two processes
+        backend_a = FileLockingJsonlBackend(path)
+        backend_b = FileLockingJsonlBackend(path)
+        chain_a = HmacChain(backend_a, ring, cache_prev=False)
+        chain_b = HmacChain(backend_b, ring, cache_prev=False)
+
+        chain_a.append(_entry("a-1"))
+        chain_b.append(_entry("b-1"))
+        chain_a.append(_entry("a-2"))
+        chain_b.append(_entry("b-2"))
+
+        # Verify with a fresh reader
+        verifier_backend = FileLockingJsonlBackend(path)
+        report = ChainVerifier(verifier_backend, ring).verify()
+        assert report.ok, f"breaks: {report.breaks}"
+        assert report.total_entries == 4
+
+
 class TestVerificationReportShape:
     def test_clean_report_attributes(
         self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing

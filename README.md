@@ -1,5 +1,12 @@
 # signet
 
+[![PyPI](https://img.shields.io/pypi/v/signet-sign.svg)](https://pypi.org/project/signet-sign/)
+[![Docs](https://img.shields.io/badge/docs-jeranaias.github.io-blue)](https://jeranaias.github.io/signet/)
+[![License](https://img.shields.io/pypi/l/signet-sign.svg)](LICENSE)
+[![Python](https://img.shields.io/pypi/pyversions/signet-sign.svg)](https://pypi.org/project/signet-sign/)
+
+**📚 Full documentation: [jeranaias.github.io/signet](https://jeranaias.github.io/signet/)**
+
 > **The model decides what to do. signet decides whether the decision is allowed to fire.**
 
 Your AI agents are issuing refunds, calling APIs, running tools, writing to databases. Each of those actions is being authorized by a non-deterministic system that can be talked into anything by a sufficiently clever prompt. **The blast radius of "the model held commit authority" is your next incident report.**
