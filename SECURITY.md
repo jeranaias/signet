@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-**Do not open a public GitHub issue.** Email jesse@thornveil.ai with:
+**Do not open a public GitHub issue.** Email jeranaias@gmail.com with:
 
 - A description of the issue.
 - Steps to reproduce or proof-of-concept.
