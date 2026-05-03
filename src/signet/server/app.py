@@ -110,12 +110,26 @@ class SignetApp:
     @asynccontextmanager
     async def _lifespan(self, _: FastAPI) -> AsyncIterator[None]:
         """Open + close the upstream HTTP client across the app lifetime."""
-        timeout = httpx.Timeout(self.config.request_timeout_s, connect=10.0)
-        self._http: httpx.AsyncClient = httpx.AsyncClient(timeout=timeout)
+        # Idempotent: if _http already exists (e.g. TestClient triggered
+        # this twice, or _ensure_http was called first), reuse it.
+        self._ensure_http()
         try:
             yield
         finally:
             await self._http.aclose()
+            del self._http
+
+    def _ensure_http(self) -> httpx.AsyncClient:
+        """Lazily create the upstream HTTP client. Used inside handlers so
+        TestClient doesn't have to drive the lifespan to get a working app
+        (FastAPI's TestClient supports lifespan but not every embedding
+        does)."""
+        existing = getattr(self, "_http", None)
+        if existing is not None:
+            return existing
+        timeout = httpx.Timeout(self.config.request_timeout_s, connect=10.0)
+        self._http = httpx.AsyncClient(timeout=timeout)
+        return self._http
 
     def _register_routes(self) -> None:
         @self.app.get("/health")
@@ -158,7 +172,7 @@ class SignetApp:
         # 2. ADMISSION pipeline
         result = await self.pipeline.pre_request(ctx)
         if not result.is_allow:
-            entry = self._record_decision(ctx, result, check_name="pipeline.admission")
+            entry = self._record_decision(ctx, result=result, check_name="pipeline.admission")
             return self._refusal(result, entry)
 
         # 3. Forward (stream-aware)
@@ -168,7 +182,8 @@ class SignetApp:
         return await self._forward_unary(ctx)
 
     async def _forward_unary(self, ctx: RequestContext) -> Response:
-        upstream_resp = await self._http.post(
+        client = self._ensure_http()
+        upstream_resp = await client.post(
             f"{self.config.upstream_url.rstrip('/')}/chat/completions",
             json=ctx.body,
             headers=self._upstream_headers(ctx),
@@ -212,7 +227,8 @@ class SignetApp:
         rctx = ResponseContext(request=ctx)
 
         async def event_stream() -> AsyncIterator[bytes]:
-            async with self._http.stream(
+            client = self._ensure_http()
+            async with client.stream(
                 "POST",
                 f"{self.config.upstream_url.rstrip('/')}/chat/completions",
                 json=ctx.body,
