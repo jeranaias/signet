@@ -8,6 +8,181 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+### Hardened — pre-release polish (round 1-4 review)
+
+Real fixes informed by an adversarial self-review pass before tagging
+v0.1.0. None are wire-format breaking; some change response semantics
+in ways that match the documented intent.
+
+#### Audit chain
+- `HmacChain.append` now holds an internal `threading.Lock`; concurrent
+  FastAPI requests can no longer fork the chain by reading the same
+  `prev_hmac` twice. Multi-process workers still need a custom backend
+  (documented).
+- `_serialize_for_signing` rejects `NaN` / `Infinity` (`allow_nan=False`)
+  and uses `ensure_ascii=False` so the canonical form is deterministic.
+- `JsonlBackend.append` calls `os.fsync` after every write by default
+  (`fsync_after_append=True`); a crash mid-handler can no longer leave
+  the chain shorter than the responses already returned.
+- `Key.__repr__` redacts the secret. Earlier the default dataclass repr
+  would print HMAC bytes into any log line that touched a `Key`.
+- Verifier docstring lists all four break kinds (`MISSING_KEY_ID` was
+  missing from the module-level summary).
+
+#### Receipts
+- Receipt format now carries `alg=hmac-sha256`. The verifier rejects
+  receipts whose `alg` does not match the configured signer, blocking
+  downgrade attacks against future ed25519.
+- `ReceiptSigner` is now a `Protocol`; concrete `HmacReceiptSigner`
+  ships as the v0.1 default. Callers can pass their own signer to
+  `SignetApp(receipt_signer=...)` for ed25519 or HSM-backed primitives.
+- Receipt symmetry caveat called out explicitly in the module docstring,
+  `SECURITY.md`, and `docs/architecture.md`.
+
+#### Proxy semantics
+- `REDACT` results from ADMISSION now actually modify the request body
+  before forwarding (multimodal vision content preserved) instead of
+  returning 403.
+- `ESCALATE` results return `202 Accepted` with an `audit_entry_id`
+  field instead of 403.
+- Audit `Decision` reflects the actual outcome (BLOCK / REDACT /
+  ESCALATE / ALLOW one-to-one). Earlier any non-allow collapsed to
+  BLOCK in the chain.
+- Inbound bodies are streamed with a configurable cap
+  (`SIGNET_MAX_REQUEST_BODY_BYTES`, default 4 MiB). Anything larger
+  gets a 413 before signet attempts JSON parsing.
+- Empty body returns explicit 400 instead of forwarding `{}` and
+  producing an opaque upstream 400.
+- Pipeline crashes at admission or forward write a synthetic audit row
+  before returning 500/502; earlier the chain was silent on the most
+  security-relevant events.
+- Streaming generator wraps in try/finally and writes a terminal audit
+  row with `finish_reason="client_disconnect"` when the caller bails
+  mid-stream.
+- `RECORD`-stage non-allow results now persist as their own audit rows
+  instead of being silently discarded.
+- Sessions are now actually loaded — `_handle_chat` calls
+  `session_store.get_or_create + touch` on every request that asserts
+  `X-Signet-Session` and stashes the `Session` on
+  `RequestContext.scratch["_session"]`. Earlier the store was wired but
+  nothing populated from it.
+- Unsupported OpenAI endpoints (`/v1/embeddings`, `/v1/completions`,
+  `/v1/audio/*`, `/v1/images/*`) return an explicit 404 with a note,
+  not FastAPI's generic body.
+- `_extract_sse_content` coalesces multi-line `data:` per the
+  WHATWG EventSource spec (consecutive `data:` lines join with `\n`,
+  blank line dispatches the event). Matters for OpenAI-compatible
+  upstreams that stream multi-line events (LiteLLM, vLLM with
+  prompt-streaming).
+
+#### Owner resolution
+- Header lookup is case-insensitive and strips whitespace.
+- Precedence is documented and deterministic: already-resolved →
+  `X-Commit-Owner` → `X-Agent-Id` → `X-Policy-Name`. Both human and
+  agent present? Human wins.
+- Empty principal after a `human:` / `agent:` prefix is rejected.
+
+#### Memory
+- `InMemorySessionStore` and `InMemoryRateLimitState` are now
+  LRU-bounded (defaults: 10k sessions, 50k owner buckets). An attacker
+  rotating session IDs / owner identities can no longer grow the
+  stores without bound.
+- `ResponseContext.accumulated_text` is bounded (default 1 MiB) via
+  `extend_text`. Long streams set `accumulated_text_truncated` and
+  stop appending instead of doing O(N²) string growth on multi-MB
+  responses.
+
+#### Audit row contents
+- `request_fingerprint` is now populated (sha256 over raw request
+  bytes, computed before any redaction). All audit rows from the
+  same request share this value, letting downstream tools group
+  entries without inventing a request_id.
+- `accumulated_text_truncated` and `chunk_count` propagate into
+  `pipeline.complete` rows so consumers can flag entries where
+  INSPECTION saw only a prefix.
+
+#### Checks
+- `ScopeDriftCheck` markers are now overrideable via constructor;
+  empty dict disables classification drift entirely. Default
+  false-positive surface documented.
+- `PromptInjectionCheck` docstring lists the bypass surface
+  explicitly: non-English, homoglyph (Cyrillic-lookalike),
+  whitespace obfuscation, alt encodings, cross-turn attacks,
+  adversarial suffixes — all known gaps.
+- `SandboxResult.is_safe()` keyword list explicitly marked as a
+  placeholder; users should pass a real `policy=` callable.
+- `TribunalCheck.inspect_tool_call` switches to
+  `gather(return_exceptions=True)` so one judge crashing no longer
+  cancels the other mid-flight (which leaked the surviving HTTP
+  connection and discarded a usable verdict). Reuses one
+  `httpx.AsyncClient` across calls.
+
+#### CLI
+- `signet init` writes a `.gitignore` (`.env`, `.env.*`, `*.jsonl`)
+  alongside the scaffold so first-time users do not commit their
+  HMAC secret or audit log on push. Existing `.gitignore` is left
+  alone.
+- `signet serve --config <path>` prints a yellow warning that the
+  flag executes arbitrary Python from the file. Function docstring
+  also names it explicitly.
+- `signet replay` help text is honest: it reads + prints the audit
+  row but does NOT re-execute the pipeline. Replay against historical
+  traffic is roadmap.
+- `signet replay <UUID>` is now case-insensitive on the entry ID.
+- `signet serve` prints the pipeline checks loaded at startup so
+  operators can verify the configuration without reading the file.
+- `_parse_hex_secret` gives a clear message when `SIGNET_HMAC_SECRET`
+  is malformed: names the env var, accepts an optional `0x` prefix
+  and surrounding whitespace, suggests `openssl rand -hex 32`,
+  refuses secrets shorter than 16 bytes loudly.
+
+#### SDK adapters
+- `wrap_openai` / `wrap_anthropic` raise `TypeError` loudly when the
+  SDK client lacks a writable `base_url`, instead of silently leaving
+  the original endpoint in place.
+
+#### Hygiene
+- `_iter_entry_points` loses the pre-3.10 fallback (project pins
+  `>=3.11`).
+
+#### Threat model and supply chain
+- `SECURITY.md` and `docs/architecture.md` call out two real limits up
+  front: owner identity is caller-asserted (not authenticated) and the
+  HMAC chain is tamper-evident (not write-once). Both have v0.2
+  roadmap notes (asymmetric receipts, anchor backends).
+- `SECURITY.md` reporting channel is now GitHub private security
+  advisory with the gmail backed up as fallback only.
+- `SECURITY.md` hardening list adds explicit `chmod 0600` guidance
+  for the audit-log file (signet creates it with the OS umask).
+- `publish.yml` generates a CycloneDX SBOM and attaches it to each
+  GitHub Release. `SECURITY.md` commits to v0.2 sigstore + SLSA.
+- README softens NIST 800-53 claim from "compatible" to "aligned with"
+  and is honest about endpoint coverage (only `/v1/chat/completions`
+  in v0.1).
+
+#### New tests
+- 25-thread concurrent append confirms chain stays linked.
+- NaN-in-metadata confirms loud rejection.
+- Custom-marker `ScopeDriftCheck` confirms override path.
+- Receipt downgrade-attack confirms `alg` mismatch is rejected.
+- Body too large returns 413; empty body returns 400.
+- Pipeline exception writes a synthetic audit row.
+- ESCALATE returns 202 with `audit_entry_id`.
+- REDACT preserves vision-style image parts.
+- Audit rows from the same request share `request_fingerprint`.
+- `accumulated_text` truncates and flags at the cap.
+- LRU eviction caps `RateLimitCheck` memory.
+- Lowercase / mixed-case headers, human-wins-over-agent precedence,
+  whitespace-stripped values, empty-principal blocked.
+- Multi-line SSE coalescing and `[DONE]` handling.
+- `_parse_hex_secret` rejects bad hex with a useful message; accepts
+  whitespace + 0x prefix.
+- Session loaded into `ctx.scratch["_session"]` on every request.
+- `signet init` writes `.gitignore` and does not overwrite existing
+  one.
+
+Test count: 219 unit + adversarial green. mypy clean. ruff clean.
+
 ## [0.1.0] — 2026-05-03
 
 First public release. Apache-2.0 OSS prior art for the gate-pattern thesis.

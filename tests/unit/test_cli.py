@@ -248,6 +248,30 @@ class TestReplay:
         assert appended.entry_id in result.output
         assert "alice" in result.output
 
+    def test_replay_case_insensitive_uuid(self, tmp_path: Path) -> None:
+        """UUIDs are case-insensitive per RFC 4122; operators paste from
+        logs that may render them as upper or mixed case. Compare must
+        normalize both sides."""
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        appended = chain.append(
+            AuditEntry(
+                owner=Owner.human("alice"),
+                check_name="x",
+                decision=Decision.ALLOW,
+                reason="ok",
+            )
+        )
+        # Try the upper-cased form; should still find it.
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["replay", appended.entry_id.upper(), "--audit-log", str(log_path)],
+        )
+        assert result.exit_code == 0, result.output
+
     def test_replay_missing_entry_exits_1(self, tmp_path: Path) -> None:
         log_path = tmp_path / "audit.jsonl"
         log_path.touch()

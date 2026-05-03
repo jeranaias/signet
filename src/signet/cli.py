@@ -134,6 +134,15 @@ def serve(
 
     app = SignetApp(config=cfg, pipeline=pipeline).app
     click.echo(f"signet {__version__} → {upstream_url}  (listening on {host}:{port})")
+
+    # Print loaded checks so operators can verify the configuration
+    # without re-reading the file. Quiet on the empty-pipeline path
+    # since the warning above is already loud about it.
+    if pipeline.checks:
+        click.echo(f"pipeline ({len(pipeline.checks)} checks):")
+        for c in pipeline.checks:
+            click.echo(f"  [{c.stage.value}] {c.name}")
+
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
@@ -216,9 +225,13 @@ def replay(entry_id: str, audit_log_path: Path) -> None:
     """
     from signet.audit.backend import JsonlBackend
 
+    # UUIDs are case-insensitive per RFC 4122; operators paste from
+    # logs with whatever case the source rendered them in. Normalize
+    # both sides to lowercase for the compare.
+    target = entry_id.strip().lower()
     backend = JsonlBackend(audit_log_path)
     for entry in backend.iter_entries():
-        if entry.entry_id == entry_id:
+        if entry.entry_id.lower() == target:
             click.echo(json.dumps(entry.to_dict(), indent=2, sort_keys=True))
             return
     click.secho(f"no entry with id {entry_id!r} found in {audit_log_path}", fg="red")
