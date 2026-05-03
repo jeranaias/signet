@@ -1,0 +1,10 @@
+signet
+Copyright 2026 Jesse Morgan
+
+This product includes software developed by Jesse Morgan, in tandem with
+Thornveil. Thornveil makes no IP claim on this open-source release; it is
+contributed under the Apache License, Version 2.0 for community use.
+
+The proprietary Pyros engine and Mycelium proof-of-inference layer are
+separate works of Thornveil and are not included in this distribution.
+signet is the publishable subset of the architectural pattern they implement.
