@@ -240,7 +240,7 @@ def init(target_dir: Path) -> None:
     click.echo("    --audit-log audit.jsonl --allow-ephemeral-key")
 
 
-def _load_pipeline_from_path(path: Path) -> "Pipeline":
+def _load_pipeline_from_path(path: Path) -> Pipeline:
     """Import a Python file and return its ``pipeline`` attribute."""
     import importlib.util
 
