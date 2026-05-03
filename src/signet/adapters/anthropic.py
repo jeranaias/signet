@@ -75,13 +75,13 @@ def wrap_anthropic(
         headers["X-Signet-Session"] = session_id
 
     # Anthropic SDK exposes base_url and default_headers on the client.
-    client.base_url = signet_url
+    client.base_url = signet_url  # type: ignore[attr-defined]
     if hasattr(client, "default_headers"):
-        existing = dict(client.default_headers or {})
+        existing = dict(client.default_headers or {})  # type: ignore[attr-defined]
         existing.update(headers)
-        client.default_headers = existing
+        client.default_headers = existing  # type: ignore[attr-defined]
     else:
-        client._signet_headers = headers
+        client._signet_headers = headers  # type: ignore[attr-defined]
     return client
 
 

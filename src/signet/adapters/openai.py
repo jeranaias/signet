@@ -90,15 +90,15 @@ def wrap_openai(
     # The OpenAI SDK exposes both base_url and default_headers as mutable
     # attributes on the client instance. We don't import the SDK to avoid
     # a hard dependency; runtime duck-typing is enough.
-    client.base_url = signet_url
+    client.base_url = signet_url  # type: ignore[attr-defined]
     if hasattr(client, "default_headers"):
-        existing = dict(client.default_headers or {})
+        existing = dict(client.default_headers or {})  # type: ignore[attr-defined]
         existing.update(headers)
-        client.default_headers = existing
+        client.default_headers = existing  # type: ignore[attr-defined]
     else:
         # Older SDK versions: stash on a custom attribute the user can
         # supply manually. Document this in the migration notes.
-        client._signet_headers = headers
+        client._signet_headers = headers  # type: ignore[attr-defined]
     return client
 
 
