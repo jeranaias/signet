@@ -13,13 +13,58 @@ crypto.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, Protocol
 
 from signet.core.audit import AuditEntry
+
+
+# Module-level platform-specific lock implementations. Selected at
+# import time so mypy's sys.platform narrowing keeps the per-platform
+# branch type-checked AND reachable on its own platform.
+class _LockImpl(Protocol):
+    """Cross-process file-lock primitives. Implementations are platform-
+    specific and selected at module import time."""
+
+    def acquire(self, fileno: int) -> None: ...
+    def release(self, fileno: int) -> None: ...
+
+
+if sys.platform == "win32":
+    import msvcrt
+
+    class _MsvcrtLock:
+        """Windows byte-range lock. Some file modes don't permit byte-range
+        locks on append-mode files — single-process safety still holds via
+        threading.Lock in HmacChain. Failures are suppressed."""
+
+        def acquire(self, fileno: int) -> None:
+            with contextlib.suppress(OSError):
+                msvcrt.locking(fileno, msvcrt.LK_LOCK, 1)
+
+        def release(self, fileno: int) -> None:
+            with contextlib.suppress(OSError):
+                msvcrt.locking(fileno, msvcrt.LK_UNLCK, 1)
+
+    _LOCK_IMPL: _LockImpl = _MsvcrtLock()
+else:
+    import fcntl
+
+    class _FcntlLock:
+        """POSIX advisory file lock via fcntl.flock."""
+
+        def acquire(self, fileno: int) -> None:
+            fcntl.flock(fileno, fcntl.LOCK_EX)
+
+        def release(self, fileno: int) -> None:
+            fcntl.flock(fileno, fcntl.LOCK_UN)
+
+    _LOCK_IMPL = _FcntlLock()
 
 
 class AuditBackend(Protocol):
@@ -157,22 +202,6 @@ class FileLockingJsonlBackend(JsonlBackend):
     backend with native concurrency support instead.
     """
 
-    def __init__(self, path: Path | str, *, fsync_after_append: bool = True) -> None:
-        super().__init__(path, fsync_after_append=fsync_after_append)
-        # Lazy import: only one of these resolves, depending on platform.
-        # neither fcntl (POSIX) nor msvcrt (Windows) is universally
-        # importable; the runtime branch picks the right one.
-        if os.name == "nt":
-            import msvcrt
-
-            self._lock_impl: str = "msvcrt"
-            self._msvcrt = msvcrt
-        else:
-            import fcntl
-
-            self._lock_impl = "fcntl"
-            self._fcntl = fcntl
-
     def append_locked(self, entry: AuditEntry, on_locked: Any = None) -> None:
         """Append under an exclusive cross-process lock.
 
@@ -183,7 +212,7 @@ class FileLockingJsonlBackend(JsonlBackend):
         critical section.
         """
         with self._path.open("a", encoding="utf-8") as f:
-            self._acquire(f)
+            _LOCK_IMPL.acquire(f.fileno())
             try:
                 if on_locked is not None:
                     on_locked()
@@ -199,7 +228,7 @@ class FileLockingJsonlBackend(JsonlBackend):
                     f.flush()
                     os.fsync(f.fileno())
             finally:
-                self._release(f)
+                _LOCK_IMPL.release(f.fileno())
 
     def append(self, entry: AuditEntry) -> None:
         """Single-writer append under cross-process lock.
@@ -209,27 +238,3 @@ class FileLockingJsonlBackend(JsonlBackend):
         the lock, use :meth:`append_locked`.
         """
         self.append_locked(entry)
-
-    def _acquire(self, f: Any) -> None:
-        import contextlib
-
-        if self._lock_impl == "fcntl":
-            # mypy on Windows can't see fcntl attributes
-            self._fcntl.flock(f.fileno(), self._fcntl.LOCK_EX)  # type: ignore[attr-defined]
-        else:
-            # Windows: lock 1 byte at offset 0. msvcrt blocks until
-            # acquired (LK_LOCK), retrying ~10 times with 1-second
-            # sleeps before raising. Some file modes don't permit
-            # byte-range locks on append-mode files — single-process
-            # safety still holds via threading.Lock in HmacChain.
-            with contextlib.suppress(OSError):
-                self._msvcrt.locking(f.fileno(), self._msvcrt.LK_LOCK, 1)
-
-    def _release(self, f: Any) -> None:
-        import contextlib
-
-        if self._lock_impl == "fcntl":
-            self._fcntl.flock(f.fileno(), self._fcntl.LOCK_UN)  # type: ignore[attr-defined]
-        else:
-            with contextlib.suppress(OSError):
-                self._msvcrt.locking(f.fileno(), self._msvcrt.LK_UNLCK, 1)
