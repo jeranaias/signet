@@ -62,21 +62,43 @@ def _r(name: str, regex: str, severity: Severity, *, flags: int = re.IGNORECASE)
 
 _DEFAULT_RULES: tuple[_Rule, ...] = (
     # Override patterns
-    _r("ignore_previous", r"\bignore\s+(?:the\s+)?(?:previous|prior|all|above)\s+"
-                          r"(?:instructions?|prompts?|rules?|messages?)\b", Severity.HIGH),
+    _r(
+        "ignore_previous",
+        r"\bignore\s+(?:the\s+)?(?:previous|prior|all|above)\s+"
+        r"(?:instructions?|prompts?|rules?|messages?)\b",
+        Severity.HIGH,
+    ),
     _r("disregard", r"\bdisregard\s+(?:the\s+)?(?:above|previous|prior|all)\b", Severity.HIGH),
-    _r("forget_prompt", r"\bforget\s+(?:everything|your\s+(?:prompt|instructions|training))\b",
-       Severity.HIGH),
+    _r(
+        "forget_prompt",
+        r"\bforget\s+(?:everything|your\s+(?:prompt|instructions|training))\b",
+        Severity.HIGH,
+    ),
     # Role spoofing inside user content
     _r("inline_system_role", r"<\|(?:im_start|system|im_sep)\|>", Severity.HIGH),
-    _r("inline_role_marker", r"^\s*(?:system|assistant)\s*:\s*", Severity.MEDIUM, flags=re.MULTILINE | re.IGNORECASE),
+    _r(
+        "inline_role_marker",
+        r"^\s*(?:system|assistant)\s*:\s*",
+        Severity.MEDIUM,
+        flags=re.MULTILINE | re.IGNORECASE,
+    ),
     # Persona attacks
-    _r("dan_jailbreak", r"\b(?:DAN|do\s+anything\s+now|jailbroken|jailbreak\s+mode)\b",
-       Severity.HIGH),
-    _r("developer_mode", r"\b(?:developer|god|admin|root)\s+mode\s+(?:enabled|on|activated)\b",
-       Severity.HIGH),
-    _r("no_restrictions", r"\b(?:act|behave|respond)\s+as\s+if\s+you\s+have\s+no\s+"
-                          r"(?:restrictions|limits|filters|rules)\b", Severity.HIGH),
+    _r(
+        "dan_jailbreak",
+        r"\b(?:DAN|do\s+anything\s+now|jailbroken|jailbreak\s+mode)\b",
+        Severity.HIGH,
+    ),
+    _r(
+        "developer_mode",
+        r"\b(?:developer|god|admin|root)\s+mode\s+(?:enabled|on|activated)\b",
+        Severity.HIGH,
+    ),
+    _r(
+        "no_restrictions",
+        r"\b(?:act|behave|respond)\s+as\s+if\s+you\s+have\s+no\s+"
+        r"(?:restrictions|limits|filters|rules)\b",
+        Severity.HIGH,
+    ),
     # Unicode tricks
     _r("zero_width", r"[​-‏‪-‮⁠-⁤﻿]", Severity.MEDIUM),
     _r("bidi_override", r"[‪-‮⁦-⁩]", Severity.HIGH),
@@ -174,7 +196,8 @@ class PromptInjectionCheck(Check):
     def _extract_base64_decoded(self, text: str) -> list[str]:
         """Pull plausible base64 blobs from text and try to decode them."""
         decoded: list[str] = []
-        for match in re.finditer(r"[A-Za-z0-9+/]{%d,}={0,2}" % self.base64_min_length, text):
+        pattern = rf"[A-Za-z0-9+/]{{{self.base64_min_length},}}={{0,2}}"
+        for match in re.finditer(pattern, text):
             blob = match.group(0)
             try:
                 raw = base64.b64decode(blob, validate=True)

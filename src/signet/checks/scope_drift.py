@@ -18,7 +18,7 @@ Three drift dimensions are checked out of the box:
 1. **Token-count drift**: output tokens exceed
    ``max_tokens * (1 + tolerance)``.
 2. **Length drift** (character-level): output character count exceeds
-   ``hard_char_cap`` (default 4× the per-token-2-char rule of thumb on
+   ``hard_char_cap`` (default 4x the per-token-2-char rule of thumb on
    ``max_tokens``).
 3. **Content drift via classification re-scan**: output contains marker
    strings (e.g. ``"SECRET//NOFORN"``) above the request's declared
@@ -101,7 +101,7 @@ class ScopeDriftCheck(Check):
                 return CheckResult.block(
                     f"output character count {len(ctx.accumulated_text)} "
                     f"exceeds scope-drift cap {char_cap} "
-                    f"(max_tokens={max_tokens} × {self.char_per_token_estimate} × "
+                    f"(max_tokens={max_tokens} * {self.char_per_token_estimate} * "
                     f"(1+{self.token_tolerance}))",
                     drift_kind="token_count",
                     accumulated_chars=len(ctx.accumulated_text),
@@ -130,15 +130,24 @@ class ScopeDriftCheck(Check):
     @staticmethod
     def _declared_classification(ctx: ResponseContext) -> int:
         """Map the request's X-Classification header to a numeric level."""
-        v = (ctx.request.headers.get("X-Classification")
-             or ctx.request.headers.get("x-classification"))
+        v = ctx.request.headers.get("X-Classification") or ctx.request.headers.get(
+            "x-classification"
+        )
         if not v:
             return 0  # UNCLASS default
         norm = v.strip().upper()
         return {
-            "UNCLASS": 0, "UNCLASSIFIED": 0, "U": 0,
-            "CUI": 1, "FOUO": 1,
-            "SECRET": 2, "S": 2,
-            "TS": 3, "TOP SECRET": 3,
-            "TS/SCI": 4, "TS-SCI": 4, "TS_SCI": 4, "SCI": 4,
+            "UNCLASS": 0,
+            "UNCLASSIFIED": 0,
+            "U": 0,
+            "CUI": 1,
+            "FOUO": 1,
+            "SECRET": 2,
+            "S": 2,
+            "TS": 3,
+            "TOP SECRET": 3,
+            "TS/SCI": 4,
+            "TS-SCI": 4,
+            "TS_SCI": 4,
+            "SCI": 4,
         }.get(norm, 0)

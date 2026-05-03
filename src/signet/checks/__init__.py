@@ -47,9 +47,9 @@ from signet.checks.token_budget import TokenBudgetCheck, WindowSize
 from signet.checks.tool_call_inspector import RiskTier, ToolCallInspectorCheck, ToolSpec
 
 __all__ = [
-    # ADMISSION
     "ClassificationGateCheck",
     "ClassificationLevel",
+    "ContinuingConsentCheck",
     "InMemoryRateLimitState",
     "LoopbackTrustCheck",
     "OwnerResolutionCheck",
@@ -58,16 +58,13 @@ __all__ = [
     "RateLimitCheck",
     "RateLimitState",
     "RegexContentCheck",
-    "Severity",
-    "TokenBudgetCheck",
-    "WindowSize",
-    # INSPECTION
-    "ContinuingConsentCheck",
     "RegexOutputCheck",
     "RevalidateFn",
-    "ScopeDriftCheck",
-    # COMMITMENT
     "RiskTier",
+    "ScopeDriftCheck",
+    "Severity",
+    "TokenBudgetCheck",
     "ToolCallInspectorCheck",
     "ToolSpec",
+    "WindowSize",
 ]
