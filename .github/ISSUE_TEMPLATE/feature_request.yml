@@ -1,0 +1,57 @@
+name: Feature request
+description: Suggest a new check, a new endpoint, or a change to existing behavior.
+title: "[feature] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file this.
+
+        Before opening, a quick sanity check: is this something that fits in
+        signet's scope (the architectural gate pattern), or is it a separate
+        plugin? If it's plugin-shaped, the
+        [plugin development guide](https://jeranaias.github.io/signet/plugin_dev/)
+        is the better starting point.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: |
+        What's the use case you can't currently address with signet? A concrete
+        scenario lands harder than an abstract description.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: |
+        Roughly what would the fix look like? New check? New config flag? New
+        endpoint? CLI command? You don't need to write the code, but a sketch
+        of the API helps.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you considered instead
+      description: |
+        Workarounds you tried, plugins you looked for, why a different approach
+        wouldn't work. Helps us understand the constraint, not just the ask.
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Where should this live?
+      options:
+        - Inside signet core
+        - As a built-in check
+        - As a plugin (signet.plugins.*)
+        - As an external plugin (your own package)
+        - Not sure yet
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else

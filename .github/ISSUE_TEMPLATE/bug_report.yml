@@ -1,0 +1,72 @@
+name: Bug report
+description: signet did something wrong, crashed, or behaved differently than the docs say.
+title: "[bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file this. The more concrete you can be, the
+        faster we can fix it.
+
+        For security vulnerabilities, please do NOT open a public issue. See
+        [SECURITY.md](https://github.com/jeranaias/signet/blob/main/SECURITY.md)
+        for the private reporting channel.
+  - type: input
+    id: version
+    attributes:
+      label: signet version
+      description: Output of `signet --version`
+      placeholder: "signet, version 0.1.4"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "Python 3.12.4"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other (please describe in the reproduction)
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did signet do that surprised you?
+      placeholder: |
+        I expected X. Instead, signet did Y.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: |
+        The smallest signet-serve invocation, request payload, and pipeline
+        config that triggers the bug. We can iterate from there.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output (if any)
+      description: Output from signet (stderr) and any related upstream logs.
+      render: shell
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: |
+        If you have an audit row from the failed request, attach it. If the bug
+        only reproduces with a specific upstream LLM provider, mention that.

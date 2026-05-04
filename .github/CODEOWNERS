@@ -1,0 +1,5 @@
+# Default reviewer for everything.
+# When third-party contributors send PRs, GitHub auto-requests review from
+# the listed owner. Until co-maintainers exist, this is the single owner.
+
+* @jeranaias
