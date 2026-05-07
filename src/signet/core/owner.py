@@ -39,6 +39,30 @@ class OwnerType(enum.StrEnum):
     when ``require_owner`` is set on the pipeline."""
 
 
+def _coerce_owner_type(value: OwnerType | str) -> OwnerType:
+    """Coerce ``value`` to an :class:`OwnerType`.
+
+    Accepts the enum directly. Accepts a string and looks it up
+    case-insensitively against the enum's values (``"human"``, ``"agent"``,
+    ``"policy"``, ``"unresolved"``). Raises :class:`ValueError` on any
+    unknown string so the bug surface is "wrong type at the call site"
+    rather than "weird state much later".
+    """
+    if isinstance(value, OwnerType):
+        return value
+    if isinstance(value, str):
+        try:
+            return OwnerType(value.lower())
+        except ValueError as e:
+            valid = sorted(t.value for t in OwnerType)
+            raise ValueError(
+                f"unknown OwnerType {value!r}; expected one of {valid}"
+            ) from e
+    raise ValueError(
+        f"OwnerType must be an OwnerType or str, got {type(value).__name__}"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Owner:
     """Immutable record of who is accountable for a request.
@@ -51,6 +75,12 @@ class Owner:
             most-recent last. Each entry is a free-form string conventionally
             shaped as ``"<type>:<id>"`` (e.g. ``"human:alice@example.com"``,
             ``"policy:internal-tailnet:100.90.15.26"``).
+
+            COMMITMENT-stage escalation surfaces this chain in the audit row
+            metadata as ``requires_approval_from`` (the full ordered chain as
+            a list) and ``current_approver`` (the first link, or ``None`` if
+            the chain is empty). Downstream approval workflows read those two
+            fields to drive routing. See :doc:`/escalation` (``docs/escalation.md``).
 
     Constructor ergonomics: positional args still take ``owner_type, owner_id``
     for backwards compatibility, but ``Owner(type=..., id=...)`` is also
@@ -94,6 +124,7 @@ class Owner:
         oid = owner_id if owner_id is not None else id
         if ot is None:
             raise TypeError("Owner.create requires type= or owner_type=")
+        ot = _coerce_owner_type(ot)
         return cls(
             owner_type=ot,
             owner_id=oid or "",

@@ -89,7 +89,7 @@ class KeyRing:
         self,
         active: Key | None = None,
         *,
-        keys: list[Key] | dict[str, Key] | None = None,
+        keys: list[Key] | dict[str, Key] | dict[str, bytes] | None = None,
         active_id: str | None = None,
     ) -> None:
         if active is not None:
@@ -116,7 +116,16 @@ class KeyRing:
                     raise ValueError(f"duplicate key_id {k.key_id!r} in keys= list")
                 keys_by_id[k.key_id] = k
         else:
-            keys_by_id = dict(keys)
+            # keys is a dict[str, Key | bytes]. If values are bytes, wrap
+            # them into Key objects using the dict key as the key_id. This
+            # keeps `KeyRing(keys={"k1": b"x" * 32}, active_id="k1")` working
+            # the way callers reasonably expect.
+            keys_by_id = {}
+            for kid, v in keys.items():
+                if isinstance(v, bytes):
+                    keys_by_id[kid] = Key(key_id=kid, secret=v)
+                else:
+                    keys_by_id[kid] = v
 
         if active_id not in keys_by_id:
             raise ValueError(

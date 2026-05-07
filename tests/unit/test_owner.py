@@ -30,6 +30,22 @@ class TestOwnerConstructors:
         with pytest.raises(TypeError):
             Owner.create(id="alice")
 
+    @pytest.mark.parametrize(
+        "type_input",
+        [OwnerType.HUMAN, "human", "HUMAN", "Human"],
+    )
+    def test_owner_create_coerces_type(self, type_input: object) -> None:
+        # v0.1.6 B1 regression: Owner.create(type="human", ...) had been
+        # storing the raw string instead of OwnerType.HUMAN, breaking
+        # `owner.owner_type is OwnerType.HUMAN` and str(o).
+        o = Owner.create(type=type_input, id="x")  # type: ignore[arg-type]
+        assert o.owner_type is OwnerType.HUMAN
+        assert str(o) == "human:x"
+
+    def test_create_invalid_type_string_raises(self) -> None:
+        with pytest.raises(ValueError, match="unknown OwnerType"):
+            Owner.create(type="alien", id="x")
+
     def test_human_constructor_sets_type_id_and_chain(self) -> None:
         o = Owner.human("alice@example.com")
         assert o.owner_type is OwnerType.HUMAN

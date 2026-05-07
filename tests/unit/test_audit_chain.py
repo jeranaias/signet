@@ -311,6 +311,25 @@ class TestKeyRingValidation:
         with pytest.raises(ValueError, match="not both"):
             KeyRing(active=k, keys=[k], active_id="k1")
 
+    def test_keyring_dict_form_wraps_bytes(self) -> None:
+        # v0.1.6 B2 regression: dict-form keys=... with raw bytes values
+        # had been stored unwrapped, so kr.active.key_id raised
+        # AttributeError on a bytes object.
+        kr = KeyRing(keys={"k1": b"x" * 32}, active_id="k1")
+        assert isinstance(kr.active, Key)
+        assert kr.active.key_id == "k1"
+        assert kr.active.secret == b"x" * 32
+
+    def test_keyring_dict_form_with_key_objects(self) -> None:
+        k = Key(key_id="k1", secret=b"y" * 32)
+        kr = KeyRing(keys={"k1": k}, active_id="k1")
+        assert kr.active is k
+
+    def test_keyring_legacy_active_form_still_works(self) -> None:
+        k = Key(key_id="k1", secret=b"x" * 32)
+        kr = KeyRing(active=k)
+        assert kr.active is k
+
 
 class TestConcurrentAppend:
     def test_concurrent_appends_do_not_fork_chain(
