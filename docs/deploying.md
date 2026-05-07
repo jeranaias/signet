@@ -110,6 +110,32 @@ If you forget either piece, the verifier catches it post-hoc — but
 the failure mode is "we cannot prove the audit chain wasn't tampered
 with after the fact", which defeats half the point of running signet.
 
+### Rate limiting under multi-process uvicorn
+
+`RateLimitCheck` uses an in-process `OrderedDict` bucket store by default.
+Under `uvicorn --workers N>1`, each worker has its own independent bucket
+per owner — meaning the **effective per-owner rate limit is N × the
+configured rate**.
+
+If you run multi-worker AND care about strict rate limiting, swap the
+in-process backend for the bundled Redis adapter:
+
+```python
+from signet.checks.rate_limit import RateLimitCheck
+from signet.checks.redis_rate_limit_state import RedisRateLimitState
+
+state = RedisRateLimitState(url="redis://localhost:6379/0")
+check = RateLimitCheck(capacity=60, refill_per_second=1.0, state=state)
+```
+
+Or, more generally, implement the `RateLimitState` protocol against your
+state store of choice. The protocol is documented in
+`signet.checks.rate_limit`.
+
+If you only need approximate rate limiting (e.g., burst protection rather
+than strict quotas), the default in-process backend is fine and the N×
+caveat is acceptable noise.
+
 ## Anchor-backend selection
 
 The audit chain's HMAC is tamper-evident *if* you trust the secret.
