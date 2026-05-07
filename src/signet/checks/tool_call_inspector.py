@@ -8,7 +8,11 @@ inspected before the tool actually runs. Decisions:
 * **Block**: tool is not on the allowlist, OR risk tier exceeds ceiling.
 * **Escalate**: risk tier is at or above ``escalate_at_tier`` AND the
   tool is irreversible. The proxy suspends the call pending out-of-band
-  human approval.
+  human approval. Escalation metadata surfaces the owner's
+  ``approval_chain`` as ``requires_approval_from`` (full ordered chain)
+  and ``current_approver`` (first link, or ``None`` if the chain is
+  empty) so downstream approval workflows can route without
+  re-deriving them. See ``docs/escalation.md``.
 
 Tool metadata comes from a registry passed at construction time. Each
 entry minimally has:
@@ -168,12 +172,24 @@ class ToolCallInspectorCheck(Check):
             )
 
         if spec.irreversible and spec.risk_tier >= self.escalate_at_tier:
+            # Surface the owner's approval chain in the audit row so
+            # downstream consumers (the future `signet escalation`
+            # subcommand, webhook handlers, ad-hoc approval workflows)
+            # can drive routing without re-deriving it. See
+            # docs/escalation.md.
+            approval_chain = list(ctx.request.owner.approval_chain)
+            current_approver = approval_chain[0] if approval_chain else None
             return CheckResult.escalate(
                 f"tool {ctx.tool_name!r} is irreversible and tier "
                 f"{spec.risk_tier.name} >= escalate-at {self.escalate_at_tier.name}",
                 tool=ctx.tool_name,
+                tool_name=ctx.tool_name,
                 tier=spec.risk_tier.name,
+                risk_tier=spec.risk_tier.name,
+                irreversible=spec.irreversible,
                 dryrun_supported=spec.dryrun_supported,
+                requires_approval_from=approval_chain,
+                current_approver=current_approver,
             )
 
         return CheckResult.allow(

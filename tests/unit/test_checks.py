@@ -143,6 +143,67 @@ class TestOwnerResolution:
         result = await check.pre_request(ctx)
         assert result.is_block
 
+    @pytest.mark.parametrize(
+        "header_name",
+        [
+            "X-Commit-Owner",
+            "x-commit-owner",
+            "X-COMMIT-OWNER",
+            "x-Commit-Owner",
+        ],
+    )
+    async def test_commit_owner_header_case_variants(self, header_name: str) -> None:
+        check = OwnerResolutionCheck()
+        ctx = _request(headers={header_name: "human:alice@example.com"})
+        result = await check.pre_request(ctx)
+        assert result.is_allow
+        assert ctx.owner.owner_type is OwnerType.HUMAN
+        assert ctx.owner.owner_id == "alice@example.com"
+
+    @pytest.mark.parametrize(
+        "header_name",
+        [
+            "X-Agent-Id",
+            "x-agent-id",
+            "X-AGENT-ID",
+            "x-Agent-Id",
+        ],
+    )
+    async def test_agent_id_header_case_variants(self, header_name: str) -> None:
+        check = OwnerResolutionCheck()
+        ctx = _request(headers={header_name: "agent:nightly-syncer"})
+        result = await check.pre_request(ctx)
+        assert result.is_allow
+        assert ctx.owner.owner_type is OwnerType.AGENT
+        assert ctx.owner.owner_id == "nightly-syncer"
+
+    @pytest.mark.parametrize(
+        "policy_name_header",
+        [
+            "X-Policy-Name",
+            "x-policy-name",
+            "X-POLICY-NAME",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "policy_version_header",
+        [
+            "X-Policy-Version",
+            "x-policy-version",
+            "X-POLICY-VERSION",
+        ],
+    )
+    async def test_policy_name_header_case_variants(
+        self, policy_name_header: str, policy_version_header: str
+    ) -> None:
+        check = OwnerResolutionCheck()
+        ctx = _request(
+            headers={policy_name_header: "acme", policy_version_header: "v3"}
+        )
+        result = await check.pre_request(ctx)
+        assert result.is_allow
+        assert ctx.owner.owner_id == "acme@v3"
+
 
 class TestLoopbackTrust:
     async def test_loopback_resolves_to_internal_loopback(self) -> None:
@@ -316,6 +377,36 @@ class TestClassificationGate:
         )
         result = await check.pre_request(ctx)
         assert result.is_allow is expected_allow
+
+    @pytest.mark.parametrize(
+        "classification_header",
+        [
+            "X-Classification",
+            "x-classification",
+            "X-CLASSIFICATION",
+            "x-Classification",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "clearance_header",
+        [
+            "X-Caller-Clearance",
+            "x-caller-clearance",
+            "X-CALLER-CLEARANCE",
+        ],
+    )
+    async def test_classification_gate_accepts_header_case_variants(
+        self, classification_header: str, clearance_header: str
+    ) -> None:
+        """Header lookup must be case-insensitive end-to-end. Real proxies
+        and ASGI servers normalize headers differently — uvicorn lowercases,
+        nginx may preserve case — and prod traffic will hit any of these."""
+        check = ClassificationGateCheck()
+        ctx = _request(
+            headers={classification_header: "SECRET", clearance_header: "TS"}
+        )
+        result = await check.pre_request(ctx)
+        assert result.is_allow
 
     async def test_unrecognized_classification_blocks(self) -> None:
         check = ClassificationGateCheck()
@@ -610,3 +701,66 @@ class TestToolCallInspector:
         )
         result = await check.inspect_tool_call(self._ctx("shell"))
         assert result.is_block
+
+    async def test_escalation_surfaces_approval_chain(self) -> None:
+        """COMMITMENT escalation surfaces owner.approval_chain in metadata."""
+        owner_with_chain = Owner(
+            owner_type=OwnerType.HUMAN,
+            owner_id="jesse@thornveil",
+            approval_chain=("manager@thornveil", "ceo@thornveil"),
+        )
+        check = ToolCallInspectorCheck(
+            registry={
+                "send_email": ToolSpec(
+                    risk_tier=RiskTier.HIGH,
+                    irreversible=True,
+                ),
+            },
+            max_allowed_tier=RiskTier.HIGH,
+            escalate_at_tier=RiskTier.HIGH,
+        )
+        req = _request(owner=owner_with_chain)
+        rctx = _response(req)
+        ctx = ToolCallContext(
+            request=req,
+            response=rctx,
+            tool_name="send_email",
+            arguments={"to": "x@y.com"},
+        )
+        result = await check.inspect_tool_call(ctx)
+        assert result.is_escalate
+        assert result.metadata["requires_approval_from"] == [
+            "manager@thornveil",
+            "ceo@thornveil",
+        ]
+        assert result.metadata["current_approver"] == "manager@thornveil"
+
+    async def test_escalation_with_empty_approval_chain(self) -> None:
+        """Empty chain: current_approver is None, requires_approval_from is []."""
+        owner_no_chain = Owner(
+            owner_type=OwnerType.HUMAN,
+            owner_id="jesse",
+            approval_chain=(),
+        )
+        check = ToolCallInspectorCheck(
+            registry={
+                "send_email": ToolSpec(
+                    risk_tier=RiskTier.HIGH,
+                    irreversible=True,
+                ),
+            },
+            max_allowed_tier=RiskTier.HIGH,
+            escalate_at_tier=RiskTier.HIGH,
+        )
+        req = _request(owner=owner_no_chain)
+        rctx = _response(req)
+        ctx = ToolCallContext(
+            request=req,
+            response=rctx,
+            tool_name="send_email",
+            arguments={"to": "x@y.com"},
+        )
+        result = await check.inspect_tool_call(ctx)
+        assert result.is_escalate
+        assert result.metadata["requires_approval_from"] == []
+        assert result.metadata["current_approver"] is None
