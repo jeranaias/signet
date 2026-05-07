@@ -212,7 +212,36 @@ class TestRateLimit:
         with pytest.raises(ValueError):
             RateLimitCheck(capacity=0, refill_per_second=1.0)
         with pytest.raises(ValueError):
-            RateLimitCheck(capacity=1, refill_per_second=0)
+            RateLimitCheck(capacity=1, refill_per_second=-1.0)
+
+    async def test_hard_quota_no_refill(self) -> None:
+        # refill_per_second=0 = hard-quota mode: bucket drains and never
+        # replenishes for the lifetime of the process.
+        check = RateLimitCheck(capacity=2, refill_per_second=0)
+        ctx = _request(owner=Owner.human("alice"))
+        assert (await check.pre_request(ctx)).is_allow
+        assert (await check.pre_request(ctx)).is_allow
+        # No amount of waiting will recover a hard-quota bucket.
+        time.sleep(0.05)
+        result = await check.pre_request(ctx)
+        assert result.is_block
+        assert result.metadata["hard_quota"] is True
+        assert result.metadata["retry_after_seconds"] is None
+
+    async def test_priority_runs_late_in_stage(self) -> None:
+        # RateLimitCheck.priority=100 places it after default-priority
+        # ADMISSION checks. Verifies the dependency contract: cheap
+        # content checks should refuse before a token is consumed.
+        from signet.core.pipeline import Pipeline
+
+        pipeline = Pipeline(
+            checks=[
+                RateLimitCheck(capacity=10, refill_per_second=1.0),
+                OwnerResolutionCheck(require_owner=True),
+            ]
+        )
+        names = [c.name for c in pipeline.checks]
+        assert names.index("owner_resolution") < names.index("rate_limit")
 
     async def test_lru_eviction_caps_memory(self) -> None:
         from signet.checks.rate_limit import InMemoryRateLimitState

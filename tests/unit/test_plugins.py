@@ -197,3 +197,35 @@ class TestSandboxDispatch:
         result = await check.inspect_tool_call(_tool_ctx())
         assert result.is_block
         assert "RuntimeError" in result.reason
+
+    async def test_registry_is_canonical_source_for_dryrun(self, safe_runner) -> None:
+        # v0.1.5 #10: when a registry is supplied, sandbox reads
+        # dryrun_supported from there rather than the parallel
+        # ToolCallContext.tool_metadata dict. ctx.tool_metadata says
+        # False; the registry says True; the registry wins.
+        from signet.checks.tool_call_inspector import RiskTier, ToolSpec
+
+        registry = {"send_email": ToolSpec(risk_tier=RiskTier.HIGH, dryrun_supported=True)}
+        check = SandboxPreviewCheck(
+            runner=safe_runner,
+            require_dryrun_supported=True,
+            registry=registry,
+        )
+        # ctx.tool_metadata is empty (default) — without the registry,
+        # this would escalate.
+        ctx = _tool_ctx("send_email")
+        result = await check.inspect_tool_call(ctx)
+        assert result.is_allow
+
+    def test_toolspec_as_metadata_round_trip(self) -> None:
+        # ToolSpec.as_metadata produces the canonical dict shape that
+        # ToolCallContext.tool_metadata expects.
+        from signet.checks.tool_call_inspector import RiskTier, ToolSpec
+
+        spec = ToolSpec(risk_tier=RiskTier.HIGH, irreversible=True, dryrun_supported=True)
+        meta = spec.as_metadata()
+        assert meta == {
+            "risk_tier": "high",
+            "irreversible": True,
+            "dryrun_supported": True,
+        }

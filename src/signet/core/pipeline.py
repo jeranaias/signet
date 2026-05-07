@@ -53,9 +53,14 @@ class Pipeline:
     """
 
     def __init__(self, checks: Iterable[Check]) -> None:
-        # Sort by stage ordinal then preserve insertion order within stage
-        # via Python's stable sort.
-        self._checks: list[Check] = sorted(checks, key=lambda c: c.stage.ordinal)
+        # Sort by stage ordinal first, then by check.priority within a
+        # stage. Python's stable sort preserves registration order on
+        # priority ties, so the historical "registration order is
+        # respected" contract still holds for any check that doesn't
+        # set its own priority.
+        self._checks: list[Check] = sorted(
+            checks, key=lambda c: (c.stage.ordinal, getattr(c, "priority", 0))
+        )
 
     @property
     def checks(self) -> tuple[Check, ...]:

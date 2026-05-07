@@ -8,6 +8,28 @@ from signet.core.owner import Owner, OwnerType
 
 
 class TestOwnerConstructors:
+    def test_create_accepts_short_kwargs(self) -> None:
+        # v0.1.5 #7 ergonomic alias: Owner.create(type=, id=) maps to
+        # Owner(owner_type=, owner_id=).
+        o = Owner.create(type=OwnerType.HUMAN, id="alice@example.com")
+        assert o.owner_type is OwnerType.HUMAN
+        assert o.owner_id == "alice@example.com"
+
+    def test_create_accepts_long_kwargs(self) -> None:
+        o = Owner.create(owner_type=OwnerType.AGENT, owner_id="rolling-memory")
+        assert o.owner_type is OwnerType.AGENT
+        assert o.owner_id == "rolling-memory"
+
+    def test_create_rejects_mixed_kwargs(self) -> None:
+        with pytest.raises(ValueError):
+            Owner.create(type=OwnerType.HUMAN, owner_type=OwnerType.AGENT, id="x")
+        with pytest.raises(ValueError):
+            Owner.create(type=OwnerType.HUMAN, id="a", owner_id="b")
+
+    def test_create_requires_a_type(self) -> None:
+        with pytest.raises(TypeError):
+            Owner.create(id="alice")
+
     def test_human_constructor_sets_type_id_and_chain(self) -> None:
         o = Owner.human("alice@example.com")
         assert o.owner_type is OwnerType.HUMAN

@@ -81,6 +81,7 @@ nav:
     - Continuing Consent: checks/continuing_consent.md
     - Tool Call Inspector: checks/tool_call_inspector.md
   - Plugin development: plugin_dev.md
+  - Production deployment: deploying.md
   - Integrations:
     - Authentication (mTLS / JWT / OIDC): integrations/auth.md
   - Contributing: contributing.md

@@ -36,6 +36,10 @@ class RequestContext:
         body: Parsed request body. Typically an OpenAI-shaped chat
             completion request, but the pipeline is agnostic.
         path: The request path (e.g. ``/v1/chat/completions``).
+        method: HTTP method of the inbound request. Defaults to
+            ``"POST"`` (every gated endpoint in v0.1 is POST). Surfaced
+            so checks that gate by verb (e.g. an embeddings/completions-
+            specific rule) don't need to inspect raw headers.
         client_ip: Source IP, used by the loopback-trust check and other
             network-aware policies.
         session_id: Stable session identifier for cross-request state.
@@ -49,6 +53,7 @@ class RequestContext:
     headers: dict[str, str] = field(default_factory=dict)
     body: dict[str, Any] = field(default_factory=dict)
     path: str = ""
+    method: str = "POST"
     client_ip: str | None = None
     session_id: str | None = None
     scratch: dict[str, Any] = field(default_factory=dict)
@@ -140,6 +145,15 @@ class ToolCallContext:
         tool_metadata: Caller-supplied metadata about this tool. Common
             keys: ``"risk_tier"`` (low|medium|high|critical),
             ``"irreversible"`` (bool), ``"dryrun_supported"`` (bool).
+            **Canonical source**: when you also use
+            :class:`signet.checks.tool_call_inspector.ToolCallInspectorCheck`,
+            its ``ToolSpec`` registry is the source of truth. Either
+            populate this dict from the matching
+            :meth:`ToolSpec.as_metadata`, or hand the same registry
+            object to
+            :class:`signet.plugins.sandbox.SandboxPreviewCheck` and let
+            it read the flag directly. Don't keep two copies in sync by
+            hand.
         scratch: Free-form dict for state.
     """
 

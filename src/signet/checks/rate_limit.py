@@ -13,6 +13,19 @@ Token-bucket vs sliding-window:
   time window matters more than burst tolerance. Implement as a plugin
   if you need it.
 
+Hard-quota mode: pass ``refill_per_second=0`` for a never-refilling cap.
+The bucket starts at ``capacity``, drains as requests arrive, and never
+replenishes for the lifetime of the process (or until the LRU evicts the
+entry). Use for daily/monthly hard ceilings where you reset the state
+out-of-band (e.g. by restarting the proxy at quota-window rollover, or
+by clearing the Redis key behind a custom :class:`RateLimitState`).
+
+Where this check sits in ADMISSION: ``priority=100`` schedules it last
+within the stage so cheaper content checks (regex, prompt-injection,
+classification) get to refuse a bad request before its token gets
+consumed. Without this, a misbehaving caller drains its own quota on
+requests that were always going to be blocked downstream.
+
 State is in-process by default. For multi-replica deployments, supply a
 ``state_backend`` that persists buckets across replicas (Redis, memcached,
 etc.) — the protocol is documented on :class:`RateLimitState`.
@@ -93,13 +106,19 @@ class RateLimitCheck(Check):
     Args:
         capacity: Maximum tokens a bucket can hold (the burst allowance).
         refill_per_second: Steady-state allowed request rate. The bucket
-            refills at this rate, capped at ``capacity``.
+            refills at this rate, capped at ``capacity``. Pass ``0`` for
+            hard-quota mode (no refill, just cap) — the bucket drains
+            once and never replenishes until external state reset.
         state: Bucket-state backend. Defaults to
             :class:`InMemoryRateLimitState`.
     """
 
     name = "rate_limit"
     stage = Stage.ADMISSION
+    # Schedule late within ADMISSION so cheaper content checks
+    # (regex, prompt-injection, classification) refuse bad requests
+    # before this check consumes a token from the owner's bucket.
+    priority = 100
 
     def __init__(
         self,
@@ -110,8 +129,12 @@ class RateLimitCheck(Check):
     ) -> None:
         if capacity < 1:
             raise ValueError(f"capacity must be >= 1, got {capacity}")
-        if refill_per_second <= 0:
-            raise ValueError(f"refill_per_second must be > 0, got {refill_per_second}")
+        if refill_per_second < 0:
+            raise ValueError(
+                f"refill_per_second must be >= 0, got {refill_per_second}. "
+                "Pass 0 for hard-quota mode (no refill, never replenishes); "
+                "pass a positive float for the steady-state request rate."
+            )
 
         self.capacity = capacity
         self.refill_per_second = refill_per_second
@@ -129,7 +152,9 @@ class RateLimitCheck(Check):
         if bucket is None:
             bucket = _Bucket(tokens=float(self.capacity), last_refill_ts=now)
 
-        # Refill since last check
+        # Refill since last check. With refill_per_second=0 (hard-quota
+        # mode), this is a no-op — elapsed * 0 is 0, so the bucket only
+        # ever drains.
         elapsed = max(0.0, now - bucket.last_refill_ts)
         bucket.tokens = min(
             float(self.capacity),
@@ -138,13 +163,20 @@ class RateLimitCheck(Check):
         bucket.last_refill_ts = now
 
         if bucket.tokens < 1.0:
-            wait = (1.0 - bucket.tokens) / self.refill_per_second
+            # Hard-quota mode never recovers within this process; signal
+            # that to callers so they don't poll uselessly. Keep the
+            # field in the response so the shape stays stable.
+            if self.refill_per_second == 0:
+                wait_meta: float | None = None
+            else:
+                wait_meta = round((1.0 - bucket.tokens) / self.refill_per_second, 3)
             self._state.set(key, bucket)
             return CheckResult.block(
                 "rate limit exceeded",
-                retry_after_seconds=round(wait, 3),
+                retry_after_seconds=wait_meta,
                 capacity=self.capacity,
                 refill_per_second=self.refill_per_second,
+                hard_quota=self.refill_per_second == 0,
             )
 
         bucket.tokens -= 1.0

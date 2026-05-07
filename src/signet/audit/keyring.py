@@ -74,14 +74,56 @@ class KeyRing:
     Construct with the active key. Add older keys via :meth:`add_legacy`
     when bringing an existing chain online. Rotate to a new active key
     via :meth:`rotate`.
+
+    Constructor ergonomics: ``KeyRing(active=Key(...))`` is the
+    historical signature. ``KeyRing(keys=[...], active_id="k1")`` and
+    ``KeyRing(keys={"k1": Key(...), "k2": Key(...)}, active_id="k1")``
+    are accepted shorthands for callers that already have a list / dict
+    of keys.
     """
 
     _active: Key
     _legacy: dict[str, Key] = field(default_factory=dict)
 
-    def __init__(self, active: Key) -> None:
-        self._active = active
-        self._legacy = {}
+    def __init__(
+        self,
+        active: Key | None = None,
+        *,
+        keys: list[Key] | dict[str, Key] | None = None,
+        active_id: str | None = None,
+    ) -> None:
+        if active is not None:
+            if keys is not None or active_id is not None:
+                raise ValueError("pass either active= or (keys=, active_id=), not both")
+            self._active = active
+            self._legacy = {}
+            return
+
+        if keys is None:
+            raise TypeError(
+                "KeyRing requires active= or (keys=, active_id=) to identify the signing key"
+            )
+        if active_id is None:
+            raise TypeError(
+                "KeyRing(keys=...) requires active_id= so the signing key is unambiguous"
+            )
+
+        # Normalize list[Key] → dict[str, Key].
+        if isinstance(keys, list):
+            keys_by_id: dict[str, Key] = {}
+            for k in keys:
+                if k.key_id in keys_by_id:
+                    raise ValueError(f"duplicate key_id {k.key_id!r} in keys= list")
+                keys_by_id[k.key_id] = k
+        else:
+            keys_by_id = dict(keys)
+
+        if active_id not in keys_by_id:
+            raise ValueError(
+                f"active_id {active_id!r} not present in keys= (known ids: {sorted(keys_by_id)!r})"
+            )
+        self._active = keys_by_id.pop(active_id)
+        self._legacy = keys_by_id
 
     @property
     def active(self) -> Key:

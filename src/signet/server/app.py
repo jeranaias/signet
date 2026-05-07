@@ -1,8 +1,14 @@
 """SignetApp — the FastAPI application that ties everything together.
 
-The proxy serves three endpoints:
+The proxy serves these endpoints:
 
-* ``GET /health`` — liveness probe.
+* ``GET /health`` (alias ``/healthz``) — liveness probe with operational
+  metadata: signet version, uptime, audit-chain head HMAC tail,
+  configured pipeline check count.
+* ``GET /readyz`` — readiness probe; HEADs the configured upstream with
+  a 1-second timeout. 503 when upstream is unreachable so k8s sheds
+  traffic. Distinct from ``/health`` so liveness restarts don't fire on
+  an upstream blip.
 * ``GET /version`` — build identifier.
 * ``POST /v1/chat/completions`` — the protected forwarding endpoint.
 
@@ -87,6 +93,14 @@ class SignetApp:
             self._receipt_signer: ReceiptSigner | None = None
         else:
             self._receipt_signer = receipt_signer or HmacReceiptSigner(self._keyring)
+
+        # Wall-clock start time, used by /health to report uptime. Set
+        # at construction so the value is meaningful even when the app
+        # is mounted into a parent FastAPI without going through our
+        # lifespan handler.
+        import time as _time
+
+        self._started_at = _time.time()
 
         self.app = FastAPI(
             title="signet",
@@ -197,9 +211,85 @@ class SignetApp:
         return client
 
     def _register_routes(self) -> None:
+        async def _health_payload() -> dict[str, Any]:
+            """Build the /health body. Lightweight, no I/O."""
+            import time as _time
+
+            uptime = max(0.0, _time.time() - self._started_at)
+            payload: dict[str, Any] = {
+                "status": "ok",
+                "service": "signet",
+                "version": __version__,
+                "uptime_seconds": round(uptime, 3),
+                "pipeline_check_count": len(self.pipeline.checks),
+            }
+            # Audit-chain head: last 8 hex of the most recent entry's
+            # HMAC, so monitoring can detect "alive but not writing"
+            # without dumping the secret. Empty string when the chain
+            # is unconfigured or empty.
+            if self._chain is not None:
+                head = self._chain._read_prev_hmac()
+                payload["audit_chain_head_hmac"] = head[-8:] if head else ""
+            else:
+                payload["audit_chain_head_hmac"] = None
+            return payload
+
         @self.app.get("/health")
-        async def health() -> dict[str, str]:
-            return {"status": "ok"}
+        async def health() -> dict[str, Any]:
+            """Liveness + lightweight operational metadata.
+
+            See module docstring for the full payload shape. Always
+            returns 200; kubernetes will restart the pod if this stops
+            answering at all.
+            """
+            return await _health_payload()
+
+        @self.app.get("/healthz")
+        async def healthz() -> dict[str, Any]:
+            """Alias of ``/health`` matching the k8s/cloud-native idiom."""
+            return await _health_payload()
+
+        @self.app.get("/readyz")
+        async def readyz() -> Response:
+            """Readiness probe: probes the configured upstream.
+
+            Returns 200 when the upstream answers within 1s, 503 with a
+            structured body otherwise. k8s should wire this to the
+            readiness probe so traffic is shed when the upstream is
+            unreachable but the pod itself is healthy. Distinct from
+            ``/health`` so a flaky upstream doesn't trigger a liveness
+            restart loop.
+            """
+            client = self._ensure_http()
+            url = self.config.upstream_url.rstrip("/") + "/models"
+            try:
+                resp = await client.get(url, timeout=1.0)
+            except httpx.HTTPError as exc:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "status": "not_ready",
+                        "reason": f"upstream unreachable: {type(exc).__name__}",
+                        "upstream": self.config.upstream_label or self.config.upstream_url,
+                    },
+                )
+            if resp.status_code >= 500:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "status": "not_ready",
+                        "reason": f"upstream returned {resp.status_code}",
+                        "upstream": self.config.upstream_label or self.config.upstream_url,
+                        "upstream_status": resp.status_code,
+                    },
+                )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "ready",
+                    "upstream_status": resp.status_code,
+                },
+            )
 
         @self.app.get("/version")
         async def version() -> dict[str, str]:
@@ -301,6 +391,7 @@ class SignetApp:
             headers=headers,
             body=body,
             path=path,
+            method=request.method,
             client_ip=client_ip,
             session_id=session_id,
         )
@@ -716,19 +807,42 @@ class SignetApp:
         return out
 
     def _refusal(self, result: Any, entry: AuditEntry | None) -> Response:
-        """Translate a BLOCK CheckResult into the appropriate HTTP error."""
-        body = {
-            "error": "signet refused this request",
-            "reason": result.reason,
-            "check": result.metadata.get("_check_name"),
-            "stage": result.metadata.get("_stage"),
-        }
-        if "retry_after_seconds" in result.metadata:
-            body["retry_after_seconds"] = result.metadata["retry_after_seconds"]
+        """Translate a BLOCK CheckResult into the appropriate HTTP error.
 
+        Body shape depends on :attr:`ServerConfig.strict_error_redaction`:
+
+        * **Strict (default)**: ``{"error": "refused",
+          "correlation_id": "<entry_id>"}``. The check name, reason,
+          stage, and rule are intentionally absent — full detail lives
+          in the audit chain. Incident response uses the correlation
+          ID to look up the row.
+        * **Verbose** (``--no-strict-error-redaction`` / ``--dev``):
+          full detail, the historical v0.1.4 shape — useful when
+          integrating with signet for the first time.
+        """
         status = 403
         if "rate limit" in result.reason.lower():
             status = 429
+
+        if self.config.strict_error_redaction:
+            body: dict[str, Any] = {
+                "error": "refused",
+                "correlation_id": entry.entry_id if entry is not None else None,
+            }
+            # Retry-After is operational, not security-relevant — keep
+            # it in the strict body so well-behaved clients can back off.
+            if "retry_after_seconds" in result.metadata:
+                body["retry_after_seconds"] = result.metadata["retry_after_seconds"]
+        else:
+            body = {
+                "error": "signet refused this request",
+                "reason": result.reason,
+                "check": result.metadata.get("_check_name"),
+                "stage": result.metadata.get("_stage"),
+                "correlation_id": entry.entry_id if entry is not None else None,
+            }
+            if "retry_after_seconds" in result.metadata:
+                body["retry_after_seconds"] = result.metadata["retry_after_seconds"]
 
         # Refusals never reach the upstream, so X-Signet-Upstream-Status
         # is omitted; X-Signet-Upstream still fires so consumers can
@@ -745,14 +859,24 @@ class SignetApp:
         forward it, and is awaiting an out-of-band approval that signet
         does not orchestrate. The caller (or a higher-level system) is
         responsible for the approval workflow and resubmitting.
+
+        Body shape obeys :attr:`ServerConfig.strict_error_redaction`,
+        same as :meth:`_refusal`.
         """
-        body = {
-            "status": "escalated",
-            "reason": result.reason,
-            "check": result.metadata.get("_check_name"),
-            "stage": result.metadata.get("_stage"),
-            "audit_entry_id": entry.entry_id if entry is not None else None,
-        }
+        if self.config.strict_error_redaction:
+            body: dict[str, Any] = {
+                "status": "escalated",
+                "correlation_id": entry.entry_id if entry is not None else None,
+            }
+        else:
+            body = {
+                "status": "escalated",
+                "reason": result.reason,
+                "check": result.metadata.get("_check_name"),
+                "stage": result.metadata.get("_stage"),
+                "audit_entry_id": entry.entry_id if entry is not None else None,
+                "correlation_id": entry.entry_id if entry is not None else None,
+            }
         headers = self._upstream_attribution_headers(None)
         if entry is not None and self._receipt_signer is not None:
             headers[self.config.receipt_header_name] = self._receipt_signer.sign(entry)

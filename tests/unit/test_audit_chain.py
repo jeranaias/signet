@@ -276,6 +276,41 @@ class TestKeyRingValidation:
         with pytest.raises(ValueError, match="already registered"):
             ring.add_legacy(Key.generate("k0"))
 
+    def test_keys_list_constructor(self) -> None:
+        # v0.1.5 #7 ergonomic alias.
+        k1 = Key.generate("k1")
+        k0 = Key.generate("k0")
+        ring = KeyRing(keys=[k0, k1], active_id="k1")
+        assert ring.active.key_id == "k1"
+        assert ring.get("k0") is k0
+        assert ring.all_known_ids() == ("k1", "k0")
+
+    def test_keys_dict_constructor(self) -> None:
+        k1 = Key.generate("k1")
+        k0 = Key.generate("k0")
+        ring = KeyRing(keys={"k1": k1, "k0": k0}, active_id="k0")
+        assert ring.active.key_id == "k0"
+        assert ring.get("k1") is k1
+
+    def test_active_id_must_match_a_key(self) -> None:
+        with pytest.raises(ValueError, match="not present"):
+            KeyRing(keys=[Key.generate("k1")], active_id="missing")
+
+    def test_keys_with_duplicates_rejected(self) -> None:
+        # The list-shape constructor should refuse two Key objects
+        # sharing the same key_id rather than silently last-wins.
+        k1a = Key.generate("k1")
+        k1b = Key.generate("k1")
+        with pytest.raises(ValueError, match="duplicate key_id"):
+            KeyRing(keys=[k1a, k1b], active_id="k1")
+
+    def test_constructor_rejects_active_with_keys(self) -> None:
+        # Mixing the historical and new shapes should fail loudly
+        # rather than silently let one win.
+        k = Key.generate("k1")
+        with pytest.raises(ValueError, match="not both"):
+            KeyRing(active=k, keys=[k], active_id="k1")
+
 
 class TestConcurrentAppend:
     def test_concurrent_appends_do_not_fork_chain(

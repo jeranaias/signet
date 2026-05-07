@@ -6,6 +6,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/signet-sign.svg)](https://pypi.org/project/signet-sign/)
 
 **📚 Full documentation: [jeranaias.github.io/signet](https://jeranaias.github.io/signet/)**
+**📖 Launch writeup: [How an AI agent deleted a company's database in 9 seconds, and the pattern that stops it](https://jeranaias.substack.com/p/how-a-claude-powered-ai-agent-deleted)**
 
 > **The model decides what to do. signet decides whether the decision is allowed to fire.**
 
@@ -165,6 +166,17 @@ Greek / Cherokee confusables fold, zero-width-character stripping,
 "stretched" letter-spacing collapse, and decoders for base64
 (standard + URL-safe), base32, hex, and ROT13. The trivial obfuscations
 (`іgnore previous`, `i g n o r e`, ROT13-encoded attacks) all hit.
+
+When the decoder finds a match in decoded content, the audit row
+records `match_source: "decoded-base64"` (or `decoded-base32`,
+`decoded-hex`, `decoded-rot13`, `decoded-url-safe-base64`). That
+field is your evidence that the obfuscation pipeline ran end-to-end
+and caught the payload. Pivot incident-response queries on it:
+
+```
+signet audit tail audit.jsonl --filter check=prompt_injection \
+    | jq 'select(.metadata.match_source | startswith("decoded-"))'
+```
 
 What it still doesn't catch: semantic prompt injection in non-English
 syntax, adversarial-suffix attacks (GCG/AutoDAN-discovered token

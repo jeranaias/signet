@@ -8,6 +8,107 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-05-06
+
+### Operator-day-one polish — 13 items from the v0.1.4 evaluation pass
+
+A targeted round of fixes and ergonomic upgrades aimed at the
+friction operators hit on first integration. No new check shipped;
+no public-API renames; existing `pipeline.py` files continue to work
+unchanged.
+
+### Added
+
+- **`signet lint pipeline.py`** subcommand. Static analysis on a
+  configured pipeline. Catches the four most common
+  misconfigurations: missing `OwnerResolutionCheck` (SIG002),
+  rate-limit ordered before content checks (SIG001),
+  `ToolCallInspectorCheck(allow_unregistered=True)` (SIG003),
+  `ClassificationGateCheck` without a paired INSPECTION-stage
+  `ScopeDriftCheck` (SIG004). `--strict` promotes warnings to a
+  non-zero exit for CI invocations.
+- **`/healthz` and `/readyz` endpoints**. `/healthz` is an alias of
+  `/health` matching k8s convention. `/readyz` actively probes the
+  configured upstream with a 1-second timeout and returns 503 when
+  it is unreachable, so kubernetes can shed traffic without
+  triggering a liveness restart.
+- **`/health` body upgrade**. Now includes `version`,
+  `uptime_seconds`, `pipeline_check_count`, and the last 8 hex of
+  the audit-chain head HMAC (`audit_chain_head_hmac`) — enough for
+  monitoring to distinguish "alive" from "alive and writing the
+  expected configuration".
+- **`Check.priority`** attribute. Sub-orders execution within a
+  single `Stage`. Lower runs earlier; defaults to `0`. Use to enforce
+  ordering dependencies between checks. Registration order remains
+  authoritative on priority ties.
+- **`RateLimitCheck.priority = 100`**. Schedules the rate-limit check
+  late within ADMISSION so cheaper content-scanning checks
+  (`RegexContent`, `PromptInjection`, classification) refuse a bad
+  request *before* a token is consumed from the owner's bucket.
+  Closes the "refused requests still cost quota" footgun.
+- **`RateLimitCheck` hard-quota mode**. Pass `refill_per_second=0`
+  for a never-refilling cap. The bucket drains once and never
+  replenishes within the process — useful for daily / monthly
+  quotas reset out-of-band. The error response carries
+  `hard_quota=True` and `retry_after_seconds=None` so callers can
+  distinguish a recoverable rate-limit from a hard cap.
+- **`ServerConfig.strict_error_redaction`** (default `True`). 4xx
+  refusal bodies are coarsened to
+  `{"error": "refused", "correlation_id": "<entry_id>"}` so the
+  public response no longer names the firing check, its rule, or
+  the severity. Full detail still lands in the audit chain.
+  `--strict-error-redaction` / `--no-strict-error-redaction` CLI
+  flags; `signet serve --dev` flips the default to `False` for
+  integration ergonomics.
+- **`signet doctor` auto-detection**. When invoked inside a
+  `signet init` workspace, `doctor` reads `SIGNET_UPSTREAM_URL`
+  from `.env` / `.env.example` and defaults `--self` to
+  `http://127.0.0.1:8443`. Mirrors the convenience that
+  `serve --dev` already had.
+- **`Owner.create(type=, id=)`** factory and
+  **`KeyRing(keys=[...], active_id=...)`** / **`KeyRing(keys={...},
+  active_id=...)`** constructor shapes. Backwards-compatible
+  ergonomic aliases for the longer historical kwargs. The
+  `Owner.human / Owner.agent / Owner.policy` classmethods remain the
+  recommended path for typical use; `create` is the one-stop entry
+  point for callers who want a single constructor.
+- **`RequestContext.method`** field (default `"POST"`). Surfaced so
+  checks that gate on HTTP verb don't have to read raw headers.
+  Populated by the proxy from `request.method`.
+- **`ToolSpec.as_metadata()`** helper. Projects a
+  `ToolCallInspectorCheck` registry entry into the dict shape
+  expected by `ToolCallContext.tool_metadata`, so consumers don't
+  have to maintain two parallel registries.
+- **`SandboxPreviewCheck(registry=...)`** parameter. When supplied,
+  the sandbox plugin reads `dryrun_supported` directly from the
+  shared `ToolSpec` registry rather than expecting
+  `ToolCallContext.tool_metadata` to be populated by hand. The
+  inspector's registry becomes the single source of truth.
+- **Production deployment guide** at `docs/deploying.md`. mTLS /
+  CSRF posture, multi-process worker rules, anchor-backend
+  selection, HSM/KMS integration notes, probe wiring.
+
+### Changed
+
+- `RateLimitCheck` no longer rejects `refill_per_second=0`. The
+  validator now requires `refill_per_second >= 0` and tells the
+  caller about hard-quota mode in the error message.
+- README's prompt-injection section calls out the
+  `match_source: "decoded-base64"` audit field as the evidence
+  surface for end-to-end obfuscation handling.
+- `OwnerResolutionCheck` module docstring documents the
+  `require_owner=True` ↔ `OwnerType.UNRESOLVED` flow with a
+  4-line example, including the strict-redaction body shape.
+- `LangchainSignetCallbackHandler` recognizes both the new strict
+  refusal body (`error == "refused"`) and the legacy verbose body
+  (`error.startswith("signet refused")`).
+
+### Internal
+
+- `Pipeline.__init__` sort key is now `(stage.ordinal, priority)`,
+  not just `stage.ordinal`. Stable sort on registration order is
+  preserved for any check that doesn't override `priority`.
+
 ## [0.1.4] — 2026-05-03
 
 ### Documentation accuracy pass

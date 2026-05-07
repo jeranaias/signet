@@ -240,6 +240,74 @@ class TestKeysGenerateEd25519:
         assert b"-----BEGIN PRIVATE KEY-----" in priv_path.read_bytes()
 
 
+class TestLint:
+    """v0.1.5 #9: static analysis on a pipeline.py."""
+
+    _GOOD_PIPELINE = """
+from signet.checks import (OwnerResolutionCheck, RateLimitCheck,
+    ClassificationGateCheck, ScopeDriftCheck)
+from signet.core.pipeline import Pipeline
+pipeline = Pipeline(checks=[
+    OwnerResolutionCheck(require_owner=True),
+    ClassificationGateCheck(),
+    RateLimitCheck(capacity=60, refill_per_second=1.0),
+    ScopeDriftCheck(),
+])
+"""
+
+    _BAD_PIPELINE = """
+from signet.checks import (RateLimitCheck, ClassificationGateCheck,
+    ToolCallInspectorCheck)
+from signet.core.pipeline import Pipeline
+pipeline = Pipeline(checks=[
+    RateLimitCheck(capacity=60, refill_per_second=1.0),
+    ClassificationGateCheck(),
+    ToolCallInspectorCheck(allow_unregistered=True),
+])
+"""
+
+    def test_lint_clean_pipeline_passes(self, tmp_path: Path) -> None:
+        path = tmp_path / "pipeline.py"
+        path.write_text(self._GOOD_PIPELINE, encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(main, ["lint", str(path)])
+        assert result.exit_code == 0, result.output
+        assert "OK" in result.output
+
+    def test_lint_flags_missing_owner_resolution(self, tmp_path: Path) -> None:
+        path = tmp_path / "pipeline.py"
+        path.write_text(self._BAD_PIPELINE, encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(main, ["lint", str(path)])
+        # SIG002 is severity=error → exit 1 even without --strict.
+        assert result.exit_code == 1
+        assert "SIG002" in result.output  # missing OwnerResolution
+        assert "SIG003" in result.output  # allow_unregistered=True
+        assert "SIG004" in result.output  # ClassGate w/o ScopeDrift
+
+    def test_strict_promotes_warnings_to_failure(self, tmp_path: Path) -> None:
+        # Warnings only: ClassificationGate without ScopeDrift (SIG004),
+        # but include OwnerResolution so SIG002 doesn't fire.
+        path = tmp_path / "pipeline.py"
+        path.write_text(
+            "\nfrom signet.checks import OwnerResolutionCheck, "
+            "ClassificationGateCheck\n"
+            "from signet.core.pipeline import Pipeline\n"
+            "pipeline = Pipeline(checks=[\n"
+            "    OwnerResolutionCheck(),\n"
+            "    ClassificationGateCheck(),\n"
+            "])\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result_default = runner.invoke(main, ["lint", str(path)])
+        assert result_default.exit_code == 0  # warnings only
+        assert "SIG004" in result_default.output
+
+        result_strict = runner.invoke(main, ["lint", str(path), "--strict"])
+        assert result_strict.exit_code == 1
+
+
 class TestDoctor:
     def test_doctor_with_no_flags_prints_versions(self) -> None:
         runner = CliRunner()

@@ -111,6 +111,16 @@ class ServerConfig:
     typical chat-completion bodies (a few-thousand-message conversation
     fits easily) and refuses obvious DoS payloads. Raise if you have
     legitimate use of long contexts as raw text in the request body."""
+    strict_error_redaction: bool = True
+    """When True (default), 4xx refusal bodies are coarsened to
+    ``{"error": "refused", "correlation_id": "<entry_id>"}`` so the
+    public response does not name the firing check, its reason, or the
+    rule that tripped. The full detail still lands in the audit chain
+    and the ``X-Signet-Receipt`` header — incident response correlates
+    via the entry ID. Turn off (``--no-strict-error-redaction`` or set
+    ``False``) only for development, debugging integration issues, or
+    deployments behind a fully-trusted client. ``signet serve --dev``
+    flips this off automatically."""
 
     # Forwarded fields the user can tune via env-var: see _ENV_KEYS below.
     extra_forward_headers: tuple[str, ...] = field(
@@ -169,5 +179,7 @@ class ServerConfig:
             cfg.max_request_body_bytes = int(v)
         if v := e.get("SIGNET_UPSTREAM_LABEL"):
             cfg.upstream_label = v
+        if v := e.get("SIGNET_STRICT_ERROR_REDACTION"):
+            cfg.strict_error_redaction = v.lower() == "true"
 
         return cfg

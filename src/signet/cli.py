@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -110,9 +111,21 @@ def main() -> None:
     "dev",
     is_flag=True,
     help="Bundle the dev defaults in one flag: --allow-ephemeral-key, "
-    "--audit-log audit.jsonl, --config pipeline.py. Each is only set "
-    "if not otherwise specified. Equivalent to typing all three; "
-    "intended for local development only.",
+    "--audit-log audit.jsonl, --config pipeline.py, "
+    "--no-strict-error-redaction (so 4xx bodies surface check names + "
+    "reasons during integration). Each is only set if not otherwise "
+    "specified. Intended for local development only.",
+)
+@click.option(
+    "--strict-error-redaction/--no-strict-error-redaction",
+    "strict_error_redaction",
+    default=None,
+    envvar="SIGNET_STRICT_ERROR_REDACTION",
+    help="Coarsen 4xx refusal bodies so they expose only "
+    "{error, correlation_id} (default in production). Full detail "
+    "remains in the audit chain — incident response correlates via the "
+    "ID. Disable to surface check name + reason in the response body, "
+    "useful while integrating. --dev disables automatically.",
 )
 @click.option(
     "--log-format",
@@ -135,6 +148,7 @@ def serve(
     config_path: Path | None,
     upstream_label: str | None,
     dev: bool,
+    strict_error_redaction: bool | None,
     log_format: str,
 ) -> None:
     """Run the signet proxy."""
@@ -147,7 +161,7 @@ def serve(
     from signet.server.app import SignetApp
     from signet.server.config import ServerConfig
 
-    # --dev shorthand: fill in the three obvious dev defaults if the
+    # --dev shorthand: fill in the four obvious dev defaults if the
     # user did not pass them explicitly. This keeps the most common
     # local invocation down to `signet serve --upstream <url> --dev`.
     if dev:
@@ -157,6 +171,11 @@ def serve(
             audit_log_path = Path("audit.jsonl")
         if config_path is None and Path("pipeline.py").exists():
             config_path = Path("pipeline.py")
+        if strict_error_redaction is None:
+            # Surface full refusal detail during integration so the
+            # operator can see *which* check fired without tailing audit
+            # logs. Production should use the strict default.
+            strict_error_redaction = False
 
     # Load pipeline from config file or use empty one.
     if config_path:
@@ -185,6 +204,10 @@ def serve(
         allow_ephemeral_key=allow_ephemeral_key,
         upstream_label=upstream_label,
     )
+    # CLI flag wins over the dataclass default (True), and over
+    # SIGNET_STRICT_ERROR_REDACTION's env-driven value if both are set.
+    if strict_error_redaction is not None:
+        cfg.strict_error_redaction = strict_error_redaction
 
     signet_app = SignetApp(config=cfg, pipeline=pipeline)
     app = signet_app.app
@@ -356,6 +379,13 @@ def doctor(upstream_url: str | None, signet_url: str | None) -> None:
     that should come back 403 (proving the gate is enforcing). Neither
     flag is required; pass what you have.
 
+    Auto-detection: when ``pipeline.py`` is present in the current
+    directory (the layout produced by ``signet init``), doctor will
+    pick up ``SIGNET_UPSTREAM_URL`` from a sibling ``.env`` /
+    ``.env.example`` if ``--upstream`` was not supplied, and default
+    ``--self`` to ``http://127.0.0.1:8443`` if that flag was also
+    omitted. Mirrors the convenience that ``serve --dev`` already has.
+
     Exit code is 0 on success, 1 if any probe failed.
     """
     import platform
@@ -363,6 +393,8 @@ def doctor(upstream_url: str | None, signet_url: str | None) -> None:
     import httpx
 
     failed = False
+
+    upstream_url, signet_url = _doctor_autodetect(upstream_url, signet_url)
 
     click.echo(f"signet         {__version__}")
     click.echo(f"python         {platform.python_version()} ({platform.system()})")
@@ -684,6 +716,64 @@ def audit_show(entry_id: str, audit_log_path: Path) -> None:
     _show_entry(entry_id, audit_log_path)
 
 
+@main.command()
+@click.argument(
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=Path("pipeline.py"),
+)
+@click.option(
+    "--strict/--no-strict",
+    default=False,
+    help="Treat warnings as errors. CI invocation pattern: "
+    "`signet lint --strict` exits non-zero on any finding.",
+)
+def lint(config_path: Path, strict: bool) -> None:
+    """Static analysis on a pipeline file. Catches the four most common
+    misconfigurations operators ship with:
+
+    \b
+    1. RateLimitCheck registered before content checks (RegexContent,
+       PromptInjection): a refused request still drains the bucket.
+       Fixed in v0.1.5 by RateLimitCheck.priority=100, but
+       user-defined Check subclasses can still get this wrong.
+    2. No OwnerResolutionCheck registered: every audit row will record
+       Owner.unresolved(), which makes attribution-based incident
+       response impossible.
+    3. ToolCallInspectorCheck(allow_unregistered=True): registered
+       tools are gated by risk tier, but anything outside the registry
+       is silently allowed. Almost always a mistake outside dev.
+    4. ClassificationGateCheck without a matching ScopeDriftCheck at
+       INSPECTION: ADMISSION-stage classification ladders only check
+       what was *requested*; they do not see what the model actually
+       generated. Pair them.
+
+    Exits 0 with no findings, 0 with warnings (without ``--strict``),
+    or 1 with findings (with ``--strict``).
+
+    \b
+    SECURITY NOTE: ``signet lint`` imports the pipeline file the same
+    way ``signet serve --config`` does — arbitrary Python execution.
+    Run only against files you control.
+    """
+    findings = _lint_pipeline(config_path)
+
+    if not findings:
+        click.secho("OK: pipeline passes the v0.1.5 lint checks.", fg="green")
+        sys.exit(0)
+
+    for f in findings:
+        color = "red" if f.severity == "error" else "yellow"
+        click.secho(f"  [{f.severity.upper()}] {f.code}: {f.message}", fg=color)
+        if f.hint:
+            click.echo(f"      hint: {f.hint}")
+
+    has_errors = any(f.severity == "error" for f in findings)
+    if has_errors or strict:
+        sys.exit(1)
+    sys.exit(0)
+
+
 @main.command(hidden=True)
 @click.argument("entry_id")
 @click.option(
@@ -824,6 +914,217 @@ def _configure_structlog_json() -> None:
         wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
+
+
+@dataclass(frozen=True)
+class _LintFinding:
+    code: str
+    severity: str  # "error" | "warning"
+    message: str
+    hint: str = ""
+
+
+def _lint_pipeline(config_path: Path) -> list[_LintFinding]:
+    """Static-ish analysis on a configured pipeline.
+
+    Imports the file (arbitrary code execution — caller already warned)
+    and walks the loaded ``pipeline._checks`` list. Returns a list of
+    findings in declaration order.
+    """
+    pipeline = _load_pipeline_from_path(config_path)
+    findings: list[_LintFinding] = []
+
+    # Import the check classes lazily to avoid circular imports at
+    # module top level. We compare by class identity (not name) where
+    # possible so renames or re-exports don't fool us.
+    from signet.checks.classification_gate import ClassificationGateCheck
+    from signet.checks.owner_resolution import OwnerResolutionCheck
+    from signet.checks.prompt_injection import PromptInjectionCheck
+    from signet.checks.rate_limit import RateLimitCheck
+    from signet.checks.regex_content import RegexContentCheck
+    from signet.checks.scope_drift import ScopeDriftCheck
+    from signet.checks.tool_call_inspector import ToolCallInspectorCheck
+    from signet.core.stage import Stage
+
+    checks_by_index: list[Any] = list(pipeline.checks)
+    by_class: dict[type, list[int]] = {}
+    for i, c in enumerate(checks_by_index):
+        by_class.setdefault(type(c), []).append(i)
+
+    # Rule 2: missing OwnerResolutionCheck (or a subclass).
+    has_owner_resolver = any(isinstance(c, OwnerResolutionCheck) for c in checks_by_index)
+    if not has_owner_resolver:
+        findings.append(
+            _LintFinding(
+                code="SIG002",
+                severity="error",
+                message=(
+                    "no OwnerResolutionCheck registered; every audit row will "
+                    "record Owner.unresolved() and attribution-based incident "
+                    "response will not work."
+                ),
+                hint=(
+                    "Add OwnerResolutionCheck(require_owner=True) to your "
+                    "ADMISSION-stage checks. See "
+                    "docs/checks/owner_resolution.md."
+                ),
+            )
+        )
+
+    # Rule 1: RateLimit ordered before content-scanning ADMISSION checks.
+    # By v0.1.5, RateLimitCheck.priority=100 self-orders late, so this
+    # only fires when a custom subclass overrides priority back to <=
+    # the default of a content check.
+    content_check_classes = (RegexContentCheck, PromptInjectionCheck)
+    rl_indexes = [i for i, c in enumerate(checks_by_index) if isinstance(c, RateLimitCheck)]
+    content_indexes = [
+        i for i, c in enumerate(checks_by_index) if isinstance(c, content_check_classes)
+    ]
+    for rl_i in rl_indexes:
+        misordered = [ci for ci in content_indexes if ci > rl_i]
+        if misordered:
+            findings.append(
+                _LintFinding(
+                    code="SIG001",
+                    severity="warning",
+                    message=(
+                        "RateLimitCheck runs before content-scanning checks "
+                        f"(positions: rate_limit at {rl_i}, content at "
+                        f"{misordered}). Refused requests still drain the "
+                        "owner's token bucket."
+                    ),
+                    hint=(
+                        "Either accept the default RateLimitCheck.priority=100 "
+                        "(don't subclass to override), or set the content "
+                        "check's priority lower than rate_limit's."
+                    ),
+                )
+            )
+
+    # Rule 3: ToolCallInspectorCheck(allow_unregistered=True).
+    for c in checks_by_index:
+        if isinstance(c, ToolCallInspectorCheck) and getattr(c, "allow_unregistered", False):
+            findings.append(
+                _LintFinding(
+                    code="SIG003",
+                    severity="warning",
+                    message=(
+                        "ToolCallInspectorCheck(allow_unregistered=True): "
+                        "tools outside the registry are silently allowed."
+                    ),
+                    hint=(
+                        "Set allow_unregistered=False (the default) and "
+                        "register every tool you intend to permit."
+                    ),
+                )
+            )
+
+    # Rule 4: ClassificationGate without a matching ScopeDriftCheck.
+    has_class_gate = any(isinstance(c, ClassificationGateCheck) for c in checks_by_index)
+    has_scope_drift_at_inspection = any(
+        isinstance(c, ScopeDriftCheck) and c.stage is Stage.INSPECTION for c in checks_by_index
+    )
+    if has_class_gate and not has_scope_drift_at_inspection:
+        findings.append(
+            _LintFinding(
+                code="SIG004",
+                severity="warning",
+                message=(
+                    "ClassificationGateCheck registered without a matching "
+                    "ScopeDriftCheck at INSPECTION. ADMISSION classification "
+                    "only validates what was requested; INSPECTION drift is "
+                    "what catches the model generating outside its lane "
+                    "after the request was admitted."
+                ),
+                hint="Add ScopeDriftCheck() to your INSPECTION-stage checks.",
+            )
+        )
+
+    return findings
+
+
+def _doctor_autodetect(
+    upstream_url: str | None, signet_url: str | None
+) -> tuple[str | None, str | None]:
+    """Fill in ``--upstream`` and ``--self`` when invoked inside a
+    ``signet init`` workspace and the user did not pass them.
+
+    Looks for ``pipeline.py`` in the cwd as the marker for "this is
+    a scaffold". When found:
+
+    * ``--upstream`` is filled from ``SIGNET_UPSTREAM_URL`` in
+      ``.env`` (preferred) or ``.env.example``, parsed with a tiny
+      key=value reader to avoid pulling in python-dotenv as a hard
+      dep.
+    * ``--self`` defaults to ``http://127.0.0.1:8443`` (the
+      ``serve`` defaults), so doctor probes the proxy that
+      ``signet serve --dev`` would start.
+
+    Both arguments are passed through unchanged when no scaffold is
+    detected or when the user supplied a value explicitly.
+    """
+    if upstream_url and signet_url:
+        return upstream_url, signet_url
+
+    pipeline_marker = Path("pipeline.py")
+    if not pipeline_marker.exists():
+        return upstream_url, signet_url
+
+    if upstream_url is None:
+        for candidate in (Path(".env"), Path(".env.example")):
+            if not candidate.exists():
+                continue
+            value = _read_env_var(candidate, "SIGNET_UPSTREAM_URL")
+            if value:
+                upstream_url = value
+                click.echo(
+                    f"(doctor: auto-detected --upstream={value} from {candidate})",
+                    err=True,
+                )
+                break
+
+    if signet_url is None:
+        signet_url = "http://127.0.0.1:8443"
+        click.echo(
+            f"(doctor: auto-detected --self={signet_url} from local pipeline.py scaffold)",
+            err=True,
+        )
+
+    return upstream_url, signet_url
+
+
+def _read_env_var(path: Path, key: str) -> str | None:
+    """Best-effort KEY=value reader for .env-style files.
+
+    Strips matching surrounding quotes and inline ``#`` comments.
+    Skips comment lines and lines without ``=``. Does not handle the
+    full python-dotenv grammar (no escapes, no multi-line) — those are
+    not what ``signet init`` writes.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        # Allow `export FOO=bar` (sh-compatible env files).
+        if line.startswith("export "):
+            line = line[len("export ") :]
+        k, _, v = line.partition("=")
+        if k.strip() != key:
+            continue
+        v = v.strip()
+        # Strip surrounding quotes if matched.
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        # Strip inline comments only when not inside quotes (we already
+        # stripped quotes); a literal `#` after whitespace ends the value.
+        if " #" in v:
+            v = v.split(" #", 1)[0].rstrip()
+        return v or None
+    return None
 
 
 def _parse_hex_secret(value: str, source: str) -> bytes:

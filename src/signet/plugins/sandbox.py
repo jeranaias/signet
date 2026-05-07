@@ -106,6 +106,16 @@ class SandboxPreviewCheck(Check):
             *escalated* immediately rather than previewed. Prevents
             silently skipping the preview for tools that can't actually
             be previewed.
+        registry: Optional shared
+            ``dict[str, signet.checks.tool_call_inspector.ToolSpec]``.
+            When provided, this check reads ``dryrun_supported`` (and
+            other tool fields) from the registry, treating it as the
+            canonical source rather than relying on
+            ``ToolCallContext.tool_metadata`` being populated separately.
+            Pass the **same** dict you handed to
+            :class:`signet.checks.tool_call_inspector.ToolCallInspectorCheck`
+            so the two checks agree. When not provided, falls back to
+            ``ctx.tool_metadata`` (the v0.1.4 behavior).
     """
 
     name = "sandbox_preview"
@@ -115,6 +125,7 @@ class SandboxPreviewCheck(Check):
     policy: SandboxPolicy = _default_policy
     only_for_tools: frozenset[str] = field(default_factory=frozenset)
     require_dryrun_supported: bool = True
+    registry: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.runner is None:
@@ -127,7 +138,7 @@ class SandboxPreviewCheck(Check):
             )
 
         if self.require_dryrun_supported:
-            dryrun_ok = ctx.tool_metadata.get("dryrun_supported", False)
+            dryrun_ok = self._lookup_dryrun_supported(ctx)
             if not dryrun_ok:
                 return CheckResult.escalate(
                     f"tool {ctx.tool_name!r} cannot be sandbox-previewed; escalating",
@@ -160,6 +171,20 @@ class SandboxPreviewCheck(Check):
             preview_ok=result.ok,
             details=result.details,
         )
+
+    def _lookup_dryrun_supported(self, ctx: ToolCallContext) -> bool:
+        """Resolve the dryrun_supported flag from the canonical source.
+
+        When :attr:`registry` is set, the matching :class:`ToolSpec`
+        wins (the single-source-of-truth path). Otherwise fall back to
+        ``ctx.tool_metadata["dryrun_supported"]`` (the v0.1.4 path, kept
+        for backwards compatibility with callers that hand-populate
+        tool metadata).
+        """
+        if self.registry is not None and ctx.tool_name in self.registry:
+            spec = self.registry[ctx.tool_name]
+            return bool(getattr(spec, "dryrun_supported", False))
+        return bool(ctx.tool_metadata.get("dryrun_supported", False))
 
 
 __all__ = ["SandboxPolicy", "SandboxPreviewCheck", "SandboxResult", "SandboxRunner"]

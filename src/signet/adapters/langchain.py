@@ -79,7 +79,14 @@ class SignetCallbackHandler:
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        """Capture signet refusal payloads when present in the error."""
+        """Capture signet refusal payloads when present in the error.
+
+        Recognizes both the strict-redaction body shape
+        (``{"error": "refused", "correlation_id": ...}``, the v0.1.5
+        default) and the verbose body shape
+        (``{"error": "signet refused this request", "reason": ...}``,
+        the historical / ``--no-strict-error-redaction`` shape).
+        """
         # Try to pull JSON body off common HTTP-error shapes
         body = getattr(error, "body", None) or getattr(error, "response", None)
         if body is not None and hasattr(body, "json"):
@@ -87,8 +94,12 @@ class SignetCallbackHandler:
                 payload = body.json()
             except Exception:
                 payload = None
-            if isinstance(payload, dict) and payload.get("error", "").startswith("signet refused"):
-                self.last_refusal = payload
+            if isinstance(payload, dict):
+                err = payload.get("error", "")
+                # "refused" is the strict-mode marker; "signet refused..."
+                # is the legacy verbose marker.
+                if err == "refused" or err.startswith("signet refused"):
+                    self.last_refusal = payload
 
     @staticmethod
     def _extract_receipt(response: Any, extras: dict[str, Any]) -> str | None:

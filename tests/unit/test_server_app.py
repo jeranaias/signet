@@ -74,6 +74,11 @@ def app_factory(monkeypatch: pytest.MonkeyPatch, upstream_response_body: dict[st
         config = ServerConfig(
             upstream_url="http://upstream-mock/v1",
             allow_ephemeral_key=True,
+            # Most existing tests assert against the verbose refusal
+            # body shape (reason / check / stage). Default the fixture
+            # to verbose so those assertions keep working; tests that
+            # need the strict shape construct their own config.
+            strict_error_redaction=False,
         )
         signet_app = SignetApp(config=config, pipeline=pipeline)
         return signet_app, TestClient(signet_app.app)
@@ -86,7 +91,30 @@ class TestSmoke:
         _, client = app_factory(Pipeline(checks=[]))
         r = client.get("/health")
         assert r.status_code == 200
-        assert r.json() == {"status": "ok"}
+        body = r.json()
+        assert body["status"] == "ok"
+        assert body["service"] == "signet"
+        assert "version" in body
+        assert body["pipeline_check_count"] == 0
+        assert body["uptime_seconds"] >= 0
+        # audit_chain_head_hmac is None when no audit log is configured
+        assert "audit_chain_head_hmac" in body
+
+    def test_healthz_alias(self, app_factory) -> None:
+        _, client = app_factory(Pipeline(checks=[]))
+        r = client.get("/healthz")
+        assert r.status_code == 200
+        assert r.json()["service"] == "signet"
+
+    def test_readyz_when_upstream_unreachable(self, app_factory) -> None:
+        # The fixture's upstream URL is http://upstream-mock/v1 which
+        # does not resolve. /readyz should return 503.
+        _, client = app_factory(Pipeline(checks=[]))
+        r = client.get("/readyz")
+        assert r.status_code == 503
+        body = r.json()
+        assert body["status"] == "not_ready"
+        assert "upstream" in body
 
     def test_version(self, app_factory) -> None:
         _, client = app_factory(Pipeline(checks=[]))
@@ -272,6 +300,72 @@ class TestRegexOutputBlocksRequest:
         assert "matched" in r.json()["reason"].lower()
 
 
+class TestStrictErrorRedaction:
+    """v0.1.5 #3: refusal/escalation bodies hide check identity by default.
+
+    The verbose shape is preserved as an opt-out so integration testing
+    (and the historical contract) still works for callers that want to
+    see *which* check fired in the response.
+    """
+
+    def test_strict_refusal_redacts_check_identity(self) -> None:
+        config = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            strict_error_redaction=True,
+        )
+        pipeline = Pipeline(checks=[OwnerResolutionCheck(require_owner=True)])
+        signet_app = SignetApp(config=config, pipeline=pipeline)
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "x", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r.status_code == 403
+        body = r.json()
+        # Strict body exposes only error + correlation_id (and
+        # retry_after_seconds when applicable).
+        assert body["error"] == "refused"
+        assert "correlation_id" in body
+        # No leaks: the firing check name and reason MUST NOT appear.
+        assert "reason" not in body
+        assert "check" not in body
+        assert "stage" not in body
+        assert "owner" not in body
+        assert "no commit owner" not in str(body).lower()
+
+    def test_strict_rate_limit_keeps_retry_after(self) -> None:
+        config = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            strict_error_redaction=True,
+        )
+        pipeline = Pipeline(
+            checks=[
+                OwnerResolutionCheck(require_owner=True),
+                RateLimitCheck(capacity=1, refill_per_second=0.001),
+            ]
+        )
+        signet_app = SignetApp(config=config, pipeline=pipeline)
+        client = TestClient(signet_app.app)
+        body = {"model": "test", "messages": [{"role": "user", "content": "hi"}]}
+        headers = {"X-Commit-Owner": "human:alice"}
+        # Drain the bucket; need an upstream mock for the first 200 path.
+        # Easier: just hit the rate-limit twice with no upstream wired —
+        # the second call should 429 before forwarding.
+        # First request: pipeline allows, forwarding will fail upstream;
+        # we don't care about its status. Second hits the rate-limit.
+        client.post("/v1/chat/completions", json=body, headers=headers)
+        r = client.post("/v1/chat/completions", json=body, headers=headers)
+        assert r.status_code == 429
+        rb = r.json()
+        assert rb["error"] == "refused"
+        # retry_after_seconds is operational and survives strict mode.
+        assert "retry_after_seconds" in rb
+        # No leaks of the firing check identity.
+        assert "check" not in rb
+
+
 class TestBodySizeLimit:
     def test_oversize_body_returns_413(self, monkeypatch: pytest.MonkeyPatch) -> None:
         config = ServerConfig(
@@ -379,7 +473,9 @@ class TestRedactAndEscalate:
         assert r.status_code == 202
         body = r.json()
         assert body["status"] == "escalated"
-        assert body["audit_entry_id"]
+        # Default config is strict_error_redaction=True, which exposes
+        # correlation_id (the audit entry ID) but no other fields.
+        assert body["correlation_id"]
 
 
 class TestPipelineCrashAudit:

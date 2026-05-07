@@ -137,6 +137,16 @@ class Check:
     (LLM-judge calls, sandbox runners) so a stuck dependency cannot
     halt the proxy."""
 
+    priority: int = 0
+    """Sub-ordering within a stage. Lower runs earlier, ties preserve
+    registration order. Defaults to ``0``. The pipeline still groups by
+    :class:`Stage` first; ``priority`` only matters between two checks
+    that share a stage. Use to enforce dependencies — e.g.
+    :class:`signet.checks.rate_limit.RateLimitCheck` declares
+    ``priority=100`` so it runs after content-scanning ADMISSION checks
+    and a refused request never costs a token. Set ``priority < 0`` to
+    force a check earlier than the default cohort."""
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         if not getattr(cls, "name", None):

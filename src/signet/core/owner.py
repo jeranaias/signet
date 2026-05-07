@@ -51,6 +51,13 @@ class Owner:
             most-recent last. Each entry is a free-form string conventionally
             shaped as ``"<type>:<id>"`` (e.g. ``"human:alice@example.com"``,
             ``"policy:internal-tailnet:100.90.15.26"``).
+
+    Constructor ergonomics: positional args still take ``owner_type, owner_id``
+    for backwards compatibility, but ``Owner(type=..., id=...)`` is also
+    accepted for symmetry with most other libraries' conventions. The
+    classmethods :meth:`human`, :meth:`agent`, :meth:`policy`, and
+    :meth:`unresolved` remain the recommended path — they handle the
+    ``approval_chain`` for you.
     """
 
     owner_type: OwnerType
@@ -62,6 +69,36 @@ class Owner:
             return
         if not self.owner_id:
             raise ValueError(f"Owner of type {self.owner_type!r} requires a non-empty owner_id")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        type: OwnerType | None = None,
+        id: str | None = None,
+        owner_type: OwnerType | None = None,
+        owner_id: str | None = None,
+        approval_chain: tuple[str, ...] = (),
+    ) -> Owner:
+        """Construct an Owner with either ``type=/id=`` or ``owner_type=/owner_id=``.
+
+        Convenience factory for callers that prefer the shorter kwargs.
+        Mixing the two pairs raises :class:`ValueError` so the call site
+        is unambiguous.
+        """
+        if type is not None and owner_type is not None:
+            raise ValueError("specify either type= or owner_type=, not both")
+        if id is not None and owner_id is not None:
+            raise ValueError("specify either id= or owner_id=, not both")
+        ot = owner_type if owner_type is not None else type
+        oid = owner_id if owner_id is not None else id
+        if ot is None:
+            raise TypeError("Owner.create requires type= or owner_type=")
+        return cls(
+            owner_type=ot,
+            owner_id=oid or "",
+            approval_chain=approval_chain,
+        )
 
     @classmethod
     def unresolved(cls) -> Owner:

@@ -36,6 +36,20 @@ Strict mode is the default and recommended setting. Permissive mode
 ``policy:unattributed`` — useful only for non-production observability
 shakedowns where you want to see traffic patterns before turning
 enforcement on.
+
+The ``require_owner=True`` ↔ :attr:`OwnerType.UNRESOLVED` flow,
+end-to-end::
+
+    # 1. Proxy receives a POST with no commit-owner headers.
+    # 2. Pipeline builds a RequestContext with owner=Owner.unresolved().
+    # 3. OwnerResolutionCheck.pre_request runs first in ADMISSION:
+    #      - ctx.owner.is_resolved is False
+    #      - no header matches the resolution precedence
+    #      - require_owner=True → returns CheckResult.block(...)
+    # 4. Proxy turns the BLOCK into HTTP 403 with body
+    #    {"error": "refused", "correlation_id": "<entry>"}    (strict)
+    #    or {"error": "...", "reason": "no commit owner...", ...}  (--dev)
+    # 5. The audit row pins owner=unresolved with the firing check name.
 """
 
 from __future__ import annotations

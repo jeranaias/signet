@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
+from typing import Any
 
 from signet.core.check import Check, CheckResult
 from signet.core.context import ToolCallContext
@@ -63,6 +64,13 @@ def _coerce_tier(value: str | int | RiskTier) -> RiskTier:
 class ToolSpec:
     """Registry entry for one tool.
 
+    :class:`ToolSpec` is the **canonical source** for tool metadata.
+    Other components (e.g. :class:`signet.plugins.sandbox.SandboxPreviewCheck`)
+    that need the same fields read them from here via
+    :meth:`as_metadata` rather than expecting a parallel
+    :attr:`signet.core.context.ToolCallContext.tool_metadata` dict to be
+    populated by hand.
+
     Attributes:
         risk_tier: One of LOW / MEDIUM / HIGH / CRITICAL. Accepts the
             enum, an integer ordinal, or a lowercase string for
@@ -83,6 +91,22 @@ class ToolSpec:
         # Accept string / int input but normalize to RiskTier enum
         if not isinstance(self.risk_tier, RiskTier):
             object.__setattr__(self, "risk_tier", _coerce_tier(self.risk_tier))
+
+    def as_metadata(self) -> dict[str, Any]:
+        """Project this spec into the ``tool_metadata`` dict shape.
+
+        :class:`signet.core.context.ToolCallContext.tool_metadata`
+        accepts free-form data; the conventional keys
+        (``risk_tier``, ``irreversible``, ``dryrun_supported``) come
+        from here so consumers like the sandbox plugin do not need a
+        second registry. Use this when populating
+        ``ToolCallContext.tool_metadata`` from a registered spec.
+        """
+        return {
+            "risk_tier": self.risk_tier.name.lower(),
+            "irreversible": self.irreversible,
+            "dryrun_supported": self.dryrun_supported,
+        }
 
 
 @dataclass
