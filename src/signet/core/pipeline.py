@@ -22,11 +22,28 @@ oracle) cannot halt the proxy.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Iterable
+from typing import Protocol
 
 from signet.core.check import Check, CheckResult
 from signet.core.context import RequestContext, ResponseContext, ToolCallContext
 from signet.core.stage import Stage
+
+
+class _HistogramObserver(Protocol):
+    """Structural type for the metrics dependency the pipeline needs.
+
+    Matches :meth:`signet.server.metrics.Metrics.observe_histogram`.
+    Defined as a Protocol (rather than importing ``Metrics`` directly)
+    so ``signet.core`` keeps no hard dependency on ``signet.server`` —
+    the pipeline must be usable in CLI tools, tests, and embedded apps
+    without dragging the whole HTTP stack in.
+    """
+
+    def observe_histogram(
+        self, name: str, value: float, labels: dict[str, str] | None = None
+    ) -> None: ...
 
 
 class Pipeline:
@@ -52,7 +69,12 @@ class Pipeline:
             return refuse(result.reason)
     """
 
-    def __init__(self, checks: Iterable[Check]) -> None:
+    def __init__(
+        self,
+        checks: Iterable[Check],
+        *,
+        metrics: _HistogramObserver | None = None,
+    ) -> None:
         # Sort by stage ordinal first, then by check.priority within a
         # stage. Python's stable sort preserves registration order on
         # priority ties, so the historical "registration order is
@@ -61,6 +83,12 @@ class Pipeline:
         self._checks: list[Check] = sorted(
             checks, key=lambda c: (c.stage.ordinal, getattr(c, "priority", 0))
         )
+        # ``metrics`` is optional so Pipeline stays usable in tests,
+        # CLI tools, and embedded contexts that don't run the HTTP
+        # server. When unset, the per-check duration histogram simply
+        # isn't emitted — observers see nothing rather than a partial
+        # signal that could mislead alerting.
+        self._metrics: _HistogramObserver | None = metrics
 
     @property
     def checks(self) -> tuple[Check, ...]:
@@ -78,7 +106,7 @@ class Pipeline:
         ``CheckResult.allow("admission cleared")`` if all checks pass.
         """
         for check in self.checks_for_stage(Stage.ADMISSION):
-            result = await _run_with_timeout(check, "pre_request", check.pre_request(ctx))
+            result = await self._dispatch(check, "pre_request", check.pre_request(ctx))
             if not result.is_allow:
                 return _annotate(result, check)
         return CheckResult.allow("admission cleared")
@@ -91,7 +119,7 @@ class Pipeline:
         upstream stream on a non-allow result here.
         """
         for check in self.checks_for_stage(Stage.INSPECTION):
-            result = await _run_with_timeout(
+            result = await self._dispatch(
                 check, "inspect_response_chunk", check.inspect_response_chunk(ctx, chunk)
             )
             if not result.is_allow:
@@ -105,9 +133,7 @@ class Pipeline:
         ``CheckResult.allow("tool call approved")`` if all checks pass.
         """
         for check in self.checks_for_stage(Stage.COMMITMENT):
-            result = await _run_with_timeout(
-                check, "inspect_tool_call", check.inspect_tool_call(ctx)
-            )
+            result = await self._dispatch(check, "inspect_tool_call", check.inspect_tool_call(ctx))
             if not result.is_allow:
                 return _annotate(result, check)
         return CheckResult.allow("tool call approved")
@@ -122,9 +148,36 @@ class Pipeline:
         """
         results: list[CheckResult] = []
         for check in self.checks_for_stage(Stage.RECORD):
-            result = await _run_with_timeout(check, "post_complete", check.post_complete(ctx))
+            result = await self._dispatch(check, "post_complete", check.post_complete(ctx))
             results.append(_annotate(result, check))
         return results
+
+    async def _dispatch(
+        self, check: Check, hook_name: str, coro: Awaitable[CheckResult]
+    ) -> CheckResult:
+        """Run a single check hook, honoring its timeout and emitting timing.
+
+        Single point of dispatch for every hook so the per-check latency
+        histogram is observed exactly once per invocation, regardless of
+        which hook fired or whether the call timed out. Timeouts map to
+        ``decision="block"`` (fail-closed) so the histogram surfaces
+        slow checks even when they exceed their budget.
+        """
+        start = time.perf_counter()
+        result = await _run_with_timeout(check, hook_name, coro)
+        if self._metrics is not None:
+            elapsed = time.perf_counter() - start
+            decision_label = _decision_label(result)
+            self._metrics.observe_histogram(
+                "signet_check_duration_seconds",
+                elapsed,
+                {
+                    "check": check.name,
+                    "stage": check.stage.value,
+                    "decision": decision_label,
+                },
+            )
+        return result
 
 
 async def _run_with_timeout(
@@ -148,6 +201,26 @@ async def _run_with_timeout(
             hook=hook_name,
             timeout_seconds=timeout,
         )
+
+
+def _decision_label(result: CheckResult) -> str:
+    """Map a CheckResult to a stable string label for metrics.
+
+    Mirrors the four-way Decision split used elsewhere (allow / block /
+    redact / escalate). Anything unrecognized is mapped to ``block`` so
+    a future Decision variant doesn't quietly disappear from the
+    histogram — fail-closed labelling, same posture as
+    :func:`signet.server.app._result_to_decision`.
+    """
+    if result.is_allow:
+        return "allow"
+    if result.is_block:
+        return "block"
+    if result.is_redact:
+        return "redact"
+    if result.is_escalate:
+        return "escalate"
+    return "block"
 
 
 def _annotate(result: CheckResult, check: Check) -> CheckResult:

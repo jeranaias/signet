@@ -97,8 +97,9 @@ class TestSmoke:
         assert "version" in body
         assert body["pipeline_check_count"] == 0
         assert body["uptime_seconds"] >= 0
-        # audit_chain_head_hmac is None when no audit log is configured
-        assert "audit_chain_head_hmac" in body
+        # v0.1.6: three-state field. The fixture builds a SignetApp
+        # with no audit_log_path, so the chain is unconfigured.
+        assert body["audit_chain_head_hmac"] == "disabled"
 
     def test_healthz_alias(self, app_factory) -> None:
         _, client = app_factory(Pipeline(checks=[]))
@@ -940,6 +941,83 @@ class TestEd25519SignetAppIntegration:
         assert parsed["key"] == "prod"
         # Signature is hex of an ed25519 sig (64 bytes → 128 hex chars)
         assert len(parsed["sig"]) == 128
+
+
+class TestHealthAuditChainStates:
+    """v0.1.6 F4: ``/health.audit_chain_head_hmac`` has three states.
+
+    Operators need to disambiguate "no chain configured" from "chain
+    configured but currently empty". Earlier versions returned the same
+    sentinel for both.
+    """
+
+    def test_chain_disabled_when_no_audit_log_path(self, app_factory) -> None:
+        # Fixture's ServerConfig has audit_log_path=None.
+        _, client = app_factory(Pipeline(checks=[]))
+        r = client.get("/health")
+        assert r.status_code == 200
+        assert r.json()["audit_chain_head_hmac"] == "disabled"
+
+    def test_chain_configured_but_empty_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        config = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        signet_app = SignetApp(config=config, pipeline=Pipeline(checks=[]))
+        client = TestClient(signet_app.app)
+        r = client.get("/health")
+        assert r.status_code == 200
+        # Chain is configured but no entries written yet → JSON null.
+        assert r.json()["audit_chain_head_hmac"] is None
+
+    def test_chain_with_entries_returns_8_hex_tail(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+        upstream_response_body: dict[str, Any],
+    ) -> None:
+        async def fake_post(_self, _url, **_kwargs):
+            class FakeResp:
+                status_code = 200
+                content = b""
+                headers: ClassVar[dict[str, str]] = {}
+
+                @staticmethod
+                def json() -> dict[str, Any]:
+                    return upstream_response_body
+
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+        config = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        signet_app = SignetApp(
+            config=config,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True)]),
+        )
+        client = TestClient(signet_app.app)
+        # Drive a single request through so the chain gains an entry.
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Commit-Owner": "human:alice"},
+        )
+        assert r.status_code == 200
+
+        h = client.get("/health")
+        assert h.status_code == 200
+        head = h.json()["audit_chain_head_hmac"]
+        assert isinstance(head, str)
+        assert head not in ("disabled", "")
+        assert len(head) == 8
+        # Must be valid lowercase hex
+        int(head, 16)
 
 
 class TestMultimodalRedaction:

@@ -34,7 +34,7 @@ import enum
 from dataclasses import dataclass
 
 from signet.core.check import Check, CheckResult
-from signet.core.context import RequestContext
+from signet.core.context import RequestContext, get_header_ci
 from signet.core.stage import Stage
 
 
@@ -101,9 +101,10 @@ class ClassificationGateCheck(Check):
 
     async def pre_request(self, ctx: RequestContext) -> CheckResult:
         h = ctx.headers
-        # Case-insensitive header lookup
-        cls_value = self._header_get(h, self.classification_header)
-        clr_value = self._header_get(h, self.clearance_header)
+        # Case-insensitive header lookup. get_header_ci returns "" when
+        # absent; _parse_level treats falsy values as "use the default".
+        cls_value = get_header_ci(h, self.classification_header)
+        clr_value = get_header_ci(h, self.clearance_header)
 
         cls_level = _parse_level(cls_value, self.default_classification)
         clr_level = _parse_level(clr_value, self.default_clearance)
@@ -132,14 +133,3 @@ class ClassificationGateCheck(Check):
             classification=cls_level.name,
             clearance=clr_level.name,
         )
-
-    @staticmethod
-    def _header_get(headers: dict[str, str], name: str) -> str | None:
-        """Case-insensitive header lookup."""
-        if name in headers:
-            return headers[name]
-        lowered = name.lower()
-        for k, v in headers.items():
-            if k.lower() == lowered:
-                return v
-        return None

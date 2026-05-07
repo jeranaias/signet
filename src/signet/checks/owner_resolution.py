@@ -37,6 +37,11 @@ Strict mode is the default and recommended setting. Permissive mode
 shakedowns where you want to see traffic patterns before turning
 enforcement on.
 
+The resolved :class:`Owner`'s ``approval_chain`` flows through the
+pipeline and is surfaced by the COMMITMENT-stage tool-call inspector
+as ``requires_approval_from`` / ``current_approver`` in escalation
+audit metadata — see ``docs/escalation.md`` for the routing contract.
+
 The ``require_owner=True`` ↔ :attr:`OwnerType.UNRESOLVED` flow,
 end-to-end::
 
@@ -55,33 +60,15 @@ end-to-end::
 from __future__ import annotations
 
 from signet.core.check import Check, CheckResult
-from signet.core.context import RequestContext
+from signet.core.context import RequestContext, get_header_ci
 from signet.core.owner import Owner
 from signet.core.stage import Stage
 
-# Canonical header names. Lookup is case-insensitive — see _get_header.
+# Canonical header names. Lookup is case-insensitive — see get_header_ci.
 _HEADER_COMMIT_OWNER = "X-Commit-Owner"
 _HEADER_AGENT_ID = "X-Agent-Id"
 _HEADER_POLICY_NAME = "X-Policy-Name"
 _HEADER_POLICY_VERSION = "X-Policy-Version"
-
-
-def _get_header(headers: dict[str, str], name: str) -> str:
-    """Case-insensitive single-header lookup; returns ``""`` when absent.
-
-    HTTP headers are case-insensitive but Python dicts are not. Some
-    ASGI servers normalize to lowercase, others preserve the case the
-    client sent. We try the canonical case first (cheapest), then walk
-    the dict with a case-fold compare.
-    """
-    v = headers.get(name)
-    if v:
-        return v.strip()
-    target = name.lower()
-    for k, val in headers.items():
-        if k.lower() == target and val:
-            return val.strip()
-    return ""
 
 
 class OwnerResolutionCheck(Check):
@@ -143,13 +130,13 @@ class OwnerResolutionCheck(Check):
         # Precedence: human > agent > policy. If two are sent the human
         # claim wins and the others are silently dropped — documented in
         # the module docstring.
-        co = _get_header(headers, _HEADER_COMMIT_OWNER)
+        co = get_header_ci(headers, _HEADER_COMMIT_OWNER)
         if co.startswith("human:"):
             principal = co[len("human:") :]
             if principal:
                 return Owner.human(principal)
 
-        ai = _get_header(headers, _HEADER_AGENT_ID)
+        ai = get_header_ci(headers, _HEADER_AGENT_ID)
         if ai.startswith("agent:"):
             agent_id = ai[len("agent:") :]
             if agent_id:
@@ -159,9 +146,9 @@ class OwnerResolutionCheck(Check):
         # and so an attacker can't bypass owner resolution by sending an
         # arbitrary string in X-Agent-Id.
 
-        pn = _get_header(headers, _HEADER_POLICY_NAME)
+        pn = get_header_ci(headers, _HEADER_POLICY_NAME)
         if pn:
-            pv = _get_header(headers, _HEADER_POLICY_VERSION)
+            pv = get_header_ci(headers, _HEADER_POLICY_VERSION)
             # Policy name + version are joined with a literal '@'. If
             # your policy name contains '@', supply the joined form
             # yourself in X-Policy-Name and leave X-Policy-Version unset.

@@ -41,7 +41,7 @@ import re
 from dataclasses import dataclass, field
 
 from signet.core.check import Check, CheckResult
-from signet.core.context import ResponseContext
+from signet.core.context import ResponseContext, get_header_ci
 from signet.core.stage import Stage
 
 # Markers we look for in output that imply a classification level. Same
@@ -149,12 +149,10 @@ class ScopeDriftCheck(Check):
     @staticmethod
     def _declared_classification(ctx: ResponseContext) -> int:
         """Map the request's X-Classification header to a numeric level."""
-        v = ctx.request.headers.get("X-Classification") or ctx.request.headers.get(
-            "x-classification"
-        )
+        v = get_header_ci(ctx.request.headers, "X-Classification")
         if not v:
             return 0  # UNCLASS default
-        norm = v.strip().upper()
+        norm = v.upper()
         return {
             "UNCLASS": 0,
             "UNCLASSIFIED": 0,

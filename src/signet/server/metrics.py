@@ -26,6 +26,8 @@ Counters surfaced:
   audit chain
 * ``signet_audit_anchor_failures_total{backend}`` — anchor backend
   failures (when external anchoring is configured)
+* ``signet_check_duration_seconds{check, stage, decision}`` —
+  histogram of per-check hook latency in seconds (v0.1.6)
 * ``signet_uptime_seconds`` — gauge: seconds since the process started
 
 Counters reset on process restart. For persistent metrics across
@@ -38,6 +40,24 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+
+#: Default histogram buckets (seconds). Tuned for sub-second checks —
+#: most signet checks run in single-digit-millisecond budgets, with
+#: outliers (LLM judges, sandboxed tools) potentially bleeding into
+#: the seconds range. Buckets follow the Prometheus convention: each
+#: bucket counts observations whose value is ``<=`` the upper bound;
+#: a ``+Inf`` bucket is appended at render time so every observation
+#: lands somewhere.
+_DEFAULT_DURATION_BUCKETS: tuple[float, ...] = (
+    0.001,
+    0.005,
+    0.01,
+    0.05,
+    0.1,
+    0.5,
+    1.0,
+    5.0,
+)
 
 #: Process start time. Used by the uptime gauge.
 _PROCESS_STARTED_AT = time.time()
@@ -70,6 +90,72 @@ class _Counter:
         return out
 
 
+@dataclass
+class _Histogram:
+    """A single labeled histogram with cumulative buckets.
+
+    Each label combination owns its own per-bucket counter array, sum,
+    and total count — the standard Prometheus histogram shape. Buckets
+    are cumulative (each bucket counts observations ``<=`` its upper
+    bound); a synthetic ``+Inf`` bucket equal to the total count is
+    appended at render time so the histogram is always well-formed.
+    """
+
+    name: str
+    help_text: str
+    buckets: tuple[float, ...]
+    # {label_tuple: ([count_per_bucket...], sum, total_count)}
+    values: dict[tuple[tuple[str, str], ...], list[float]] = field(default_factory=dict)
+
+    def observe(self, labels: dict[str, str], value: float) -> None:
+        key = tuple(sorted(labels.items()))
+        # Per-bucket counts + running sum + total count appended at the end
+        # of the bucket array. Layout: [b0, b1, ..., bN-1, sum, count].
+        slot = self.values.get(key)
+        if slot is None:
+            slot = [0.0] * (len(self.buckets) + 2)
+            self.values[key] = slot
+        for i, upper in enumerate(self.buckets):
+            if value <= upper:
+                slot[i] += 1.0
+        slot[-2] += value  # sum
+        slot[-1] += 1.0  # count
+
+    def render(self) -> list[str]:
+        out = [
+            f"# HELP {self.name} {self.help_text}",
+            f"# TYPE {self.name} histogram",
+        ]
+        for label_tuple, slot in sorted(self.values.items()):
+            base_labels = list(label_tuple)
+            for i, upper in enumerate(self.buckets):
+                bucket_labels = [*base_labels, ("le", _format_bucket(upper))]
+                labels_str = (
+                    "{" + ",".join(f'{k}="{_escape(v)}"' for k, v in bucket_labels) + "}"
+                )
+                out.append(f"{self.name}_bucket{labels_str} {slot[i]}")
+            inf_labels = [*base_labels, ("le", "+Inf")]
+            inf_labels_str = "{" + ",".join(f'{k}="{_escape(v)}"' for k, v in inf_labels) + "}"
+            total_count = slot[-1]
+            out.append(f"{self.name}_bucket{inf_labels_str} {total_count}")
+            base_labels_str = (
+                "{" + ",".join(f'{k}="{_escape(v)}"' for k, v in base_labels) + "}"
+                if base_labels
+                else ""
+            )
+            out.append(f"{self.name}_sum{base_labels_str} {slot[-2]}")
+            out.append(f"{self.name}_count{base_labels_str} {total_count}")
+        return out
+
+
+def _format_bucket(upper: float) -> str:
+    """Render a bucket upper bound. Integers and small decimals stay
+    compact; this only affects the Prometheus exposition string."""
+    if upper == int(upper):
+        return f"{int(upper)}"
+    return f"{upper:g}"
+
+
 class Metrics:
     """Thread-safe in-process counter registry.
 
@@ -99,6 +185,13 @@ class Metrics:
                 "External anchor backend failures (recorded but not raised).",
             ),
         }
+        self._histograms: dict[str, _Histogram] = {
+            "signet_check_duration_seconds": _Histogram(
+                "signet_check_duration_seconds",
+                "Per-check hook latency in seconds, labeled by check / stage / decision.",
+                _DEFAULT_DURATION_BUCKETS,
+            ),
+        }
 
     def inc(self, name: str, labels: dict[str, str] | None = None, by: float = 1.0) -> None:
         """Bump the counter with the given labels.
@@ -111,12 +204,27 @@ class Metrics:
             if counter is not None:
                 counter.inc(labels or {}, by=by)
 
+    def observe_histogram(
+        self, name: str, value: float, labels: dict[str, str] | None = None
+    ) -> None:
+        """Record an observation against a labeled histogram.
+
+        Mirrors :meth:`inc` for histograms. Unknown histogram names are
+        silently ignored so the request path cannot crash on a typo.
+        """
+        with self._lock:
+            histogram = self._histograms.get(name)
+            if histogram is not None:
+                histogram.observe(labels or {}, value)
+
     def render_prometheus(self) -> str:
         """Render the registry in Prometheus text-exposition format."""
         with self._lock:
             lines: list[str] = []
             for counter in self._counters.values():
                 lines.extend(counter.render())
+            for histogram in self._histograms.values():
+                lines.extend(histogram.render())
             # Uptime gauge
             uptime = time.time() - _PROCESS_STARTED_AT
             lines.append("# HELP signet_uptime_seconds Seconds since process start.")

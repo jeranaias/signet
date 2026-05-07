@@ -14,6 +14,14 @@ The context split mirrors the four hook timings:
 These are deliberately simple: dataclasses, mutable, single-request-scoped.
 A check that needs richer state should attach it to ``scratch`` or use
 :class:`signet.server.session.Session` for cross-request continuity.
+
+Also exposes :func:`get_header_ci`, the single canonical helper for
+case-insensitive HTTP header lookup. HTTP header names are case-insensitive
+on the wire but Python dicts are not; ASGI servers and reverse proxies
+normalize differently (uvicorn lowercases, nginx may preserve case). Every
+header lookup performed by built-in checks goes through this helper so
+``X-Classification``, ``x-classification``, and ``X-CLASSIFICATION`` all
+resolve identically.
 """
 
 from __future__ import annotations
@@ -23,6 +31,24 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from signet.core.owner import Owner
+
+
+def get_header_ci(headers: dict[str, str], name: str) -> str:
+    """Case-insensitive single-header lookup; returns ``""`` when absent.
+
+    HTTP headers are case-insensitive but Python dicts are not. Some
+    ASGI servers normalize to lowercase, others preserve the case the
+    client sent. We try the canonical case first (cheapest), then walk
+    the dict with a case-fold compare.
+    """
+    v = headers.get(name)
+    if v:
+        return v.strip()
+    target = name.lower()
+    for k, val in headers.items():
+        if k.lower() == target and val:
+            return val.strip()
+    return ""
 
 
 @dataclass

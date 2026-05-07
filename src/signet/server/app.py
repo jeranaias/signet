@@ -48,7 +48,7 @@ from signet.audit.backend import JsonlBackend
 from signet.audit.chain import HmacChain
 from signet.audit.keyring import Key, KeyRing
 from signet.core.audit import AuditEntry, Decision
-from signet.core.context import RequestContext, ResponseContext
+from signet.core.context import RequestContext, ResponseContext, get_header_ci
 from signet.core.owner import Owner
 from signet.core.pipeline import Pipeline
 from signet.server.config import ServerConfig
@@ -83,6 +83,14 @@ class SignetApp:
         self.pipeline = pipeline
         self.session_store: SessionStore = session_store or InMemorySessionStore()
         self.metrics: Metrics = metrics or Metrics()
+        # Wire the per-check duration histogram in. The Pipeline keeps
+        # ``metrics`` optional so it stays usable in CLI / test contexts
+        # without an HTTP server; here we attach the SignetApp's
+        # registry so /metrics exposes the same observations the proxy
+        # is making. Only override an unset observer so callers who
+        # passed in their own remain in control.
+        if getattr(self.pipeline, "_metrics", None) is None:
+            self.pipeline._metrics = self.metrics
 
         self._keyring = self._build_keyring(config)
         self._chain = self._build_chain(config, self._keyring)
@@ -225,13 +233,24 @@ class SignetApp:
             }
             # Audit-chain head: last 8 hex of the most recent entry's
             # HMAC, so monitoring can detect "alive but not writing"
-            # without dumping the secret. Empty string when the chain
-            # is unconfigured or empty.
-            if self._chain is not None:
-                head = self._chain._read_prev_hmac()
-                payload["audit_chain_head_hmac"] = head[-8:] if head else ""
+            # without dumping the secret. The field has three distinct
+            # states so monitors can disambiguate operator intent from
+            # transient runtime state:
+            #
+            # * ``"disabled"`` — no chain configured (``audit_log_path``
+            #   was not set). Operator chose to run without an audit
+            #   chain; not an alert condition.
+            # * ``None`` — chain is configured but currently empty. May
+            #   be a startup race (no requests yet) or a failed write;
+            #   monitors can flag prolonged ``None`` as suspect.
+            # * ``"<8-hex-tail>"`` — chain has at least one entry. Tail
+            #   advances as the chain grows; a stalled tail under load
+            #   means the chain stopped writing.
+            if self._chain is None:
+                payload["audit_chain_head_hmac"] = "disabled"
             else:
-                payload["audit_chain_head_hmac"] = None
+                head = self._chain._read_prev_hmac()
+                payload["audit_chain_head_hmac"] = head[-8:] if head else None
             return payload
 
         @self.app.get("/health")
@@ -383,7 +402,9 @@ class SignetApp:
 
         headers = dict(request.headers.items())
         client_ip = request.client.host if request.client else None
-        session_id = headers.get(SESSION_HEADER) or headers.get(SESSION_HEADER.lower())
+        # Starlette typically lowercases header names but proxies may not;
+        # use get_header_ci so any case variant resolves.
+        session_id = get_header_ci(headers, SESSION_HEADER) or None
         request_fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest() if raw else ""
 
         ctx = RequestContext(
