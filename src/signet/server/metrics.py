@@ -28,6 +28,15 @@ Counters surfaced:
   failures (when external anchoring is configured)
 * ``signet_check_duration_seconds{check, stage, decision}`` —
   histogram of per-check hook latency in seconds (v0.1.6)
+* ``signet_shadow_would_have_blocked_total{check, stage, decision}`` —
+  counter of non-allow decisions neutralized by shadow mode (v0.1.6).
+  Mirrors the ``signet_pipeline_decisions_total`` label set so dashboards
+  can join the two on (check, stage, decision).
+* ``signet_response_text_truncated_total{cap_bytes}`` — counter of
+  responses whose ``ResponseContext.accumulated_text`` saturated the
+  per-response cap (v0.1.6 N2). Fires once per affected response.
+  ``cap_bytes`` is the configured cap so dashboards can attribute spikes
+  to a specific cap-policy setting.
 * ``signet_uptime_seconds`` — gauge: seconds since the process started
 
 Counters reset on process restart. For persistent metrics across
@@ -184,7 +193,33 @@ class Metrics:
                 "signet_audit_anchor_failures_total",
                 "External anchor backend failures (recorded but not raised).",
             ),
+            "signet_shadow_would_have_blocked_total": _Counter(
+                "signet_shadow_would_have_blocked_total",
+                (
+                    "Non-allow decisions neutralized by shadow mode "
+                    "(audit chain still records the original)."
+                ),
+            ),
+            "signet_response_text_truncated_total": _Counter(
+                "signet_response_text_truncated_total",
+                (
+                    "Responses whose accumulated_text hit the per-response "
+                    "byte cap (one increment per affected response)."
+                ),
+            ),
         }
+        # Self-install as the truncation observer so any ResponseContext
+        # whose extend_text() trips the cap funnels into this registry.
+        # Idempotent: a second Metrics() instance overwrites the previous
+        # observer; tests that need silence call
+        # ``signet.core.context.set_truncation_observer(None)``. We import
+        # locally to avoid a circular dependency at module-import time
+        # (server/__init__ → core/context is fine; the reverse would
+        # break since ``core`` must not depend on ``server``).
+        from signet.core.context import set_truncation_observer
+
+        set_truncation_observer(self._observe_truncation)
+
         self._histograms: dict[str, _Histogram] = {
             "signet_check_duration_seconds": _Histogram(
                 "signet_check_duration_seconds",
@@ -192,6 +227,19 @@ class Metrics:
                 _DEFAULT_DURATION_BUCKETS,
             ),
         }
+
+    def _observe_truncation(self, cap_bytes: int) -> None:
+        """Bridge ``ResponseContext`` truncation events into the registry.
+
+        Installed as the module-level observer in
+        :mod:`signet.core.context` from :meth:`__init__`. Receives the
+        configured cap so dashboards can correlate truncation rates with
+        the cap-policy setting that produced them.
+        """
+        self.inc(
+            "signet_response_text_truncated_total",
+            {"cap_bytes": str(cap_bytes)},
+        )
 
     def inc(self, name: str, labels: dict[str, str] | None = None, by: float = 1.0) -> None:
         """Bump the counter with the given labels.

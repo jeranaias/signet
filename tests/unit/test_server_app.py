@@ -123,6 +123,28 @@ class TestSmoke:
         assert r.status_code == 200
         assert r.json()["service"] == "signet"
 
+    def test_health_includes_shadow_flag(self) -> None:
+        # Default (shadow=False): /health body has shadow=False so the
+        # field is always present and operators can tail it.
+        cfg_off = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+        )
+        client_off = TestClient(SignetApp(config=cfg_off, pipeline=Pipeline(checks=[])).app)
+        body_off = client_off.get("/health").json()
+        assert body_off["shadow"] is False
+
+        # shadow=True: /health body has shadow=True so dashboards can
+        # alert on "production gate is in pilot mode".
+        cfg_on = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            shadow=True,
+        )
+        client_on = TestClient(SignetApp(config=cfg_on, pipeline=Pipeline(checks=[])).app)
+        body_on = client_on.get("/health").json()
+        assert body_on["shadow"] is True
+
 
 class TestAdmissionBlock:
     def test_missing_owner_returns_403(self, app_factory) -> None:
@@ -1018,6 +1040,221 @@ class TestHealthAuditChainStates:
         assert len(head) == 8
         # Must be valid lowercase hex
         int(head, 16)
+
+
+class TestShadowMode:
+    """v0.1.6 F1: shadow mode neutralizes block/escalate/redact at the
+    response layer. Audit chain still records the original decision with
+    metadata.shadow=True; the response carries X-Signet-Shadow-* headers
+    and a correlation ID; the signet_shadow_would_have_blocked_total
+    counter increments. Operators pilot signet in shadow mode against
+    production traffic before flipping enforcement on.
+    """
+
+    @staticmethod
+    def _patch_upstream(
+        monkeypatch: pytest.MonkeyPatch, body: dict[str, Any] | None = None
+    ) -> None:
+        body = body or {
+            "id": "x",
+            "object": "chat.completion",
+            "model": "m",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hi"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+        async def fake_post(_self, _url, **_kwargs):
+            class FakeResp:
+                status_code = 200
+                content = b""
+                headers: ClassVar[dict[str, str]] = {}
+
+                @staticmethod
+                def json() -> dict[str, Any]:
+                    return body
+
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    def test_admission_block_becomes_200_in_shadow_mode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        from signet.audit.backend import JsonlBackend
+
+        self._patch_upstream(monkeypatch)
+        log = tmp_path / "audit.jsonl"
+        cfg = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=log,
+            shadow=True,
+            strict_error_redaction=False,
+        )
+        signet_app = SignetApp(
+            config=cfg,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True)]),
+        )
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        # Non-shadow would 403; shadow neutralizes to 200.
+        assert r.status_code == 200
+        assert r.headers.get("X-Signet-Shadow-Decision") == "block"
+        assert r.headers.get("X-Signet-Shadow-Stage") == "admission"
+        assert r.headers.get("X-Signet-Correlation-Id")
+        # Audit row has shadow=True metadata; original decision survives.
+        entries = list(JsonlBackend(log).iter_entries())
+        shadowed = [e for e in entries if e.metadata.get("shadow") is True]
+        assert len(shadowed) >= 1
+        assert shadowed[0].decision.value == "block"
+
+    def test_rate_limit_block_becomes_200_in_shadow_mode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        self._patch_upstream(monkeypatch)
+        cfg = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=tmp_path / "audit.jsonl",
+            shadow=True,
+            strict_error_redaction=False,
+        )
+        signet_app = SignetApp(
+            config=cfg,
+            pipeline=Pipeline(
+                checks=[
+                    OwnerResolutionCheck(require_owner=True),
+                    RateLimitCheck(capacity=1, refill_per_second=0.001),
+                ]
+            ),
+        )
+        client = TestClient(signet_app.app)
+        body = {"model": "test", "messages": [{"role": "user", "content": "hi"}]}
+        headers = {"X-Commit-Owner": "human:alice"}
+        # First request consumes the bucket but is allowed.
+        r1 = client.post("/v1/chat/completions", json=body, headers=headers)
+        assert r1.status_code == 200
+        # Second request would 429; shadow neutralizes to 200 with
+        # X-Signet-Shadow-Decision: block (rate limit blocks; shadow
+        # does NOT promote it to escalate).
+        r2 = client.post("/v1/chat/completions", json=body, headers=headers)
+        assert r2.status_code == 200
+        assert r2.headers.get("X-Signet-Shadow-Decision") == "block"
+
+    def test_escalation_becomes_200_in_shadow_mode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        from signet.core.check import Check, CheckResult
+        from signet.core.context import RequestContext
+        from signet.core.stage import Stage
+
+        class _AlwaysEscalate(Check):
+            name = "always_escalate"
+            stage = Stage.ADMISSION
+
+            async def pre_request(self, _ctx: RequestContext) -> CheckResult:
+                return CheckResult.escalate("needs human review", risk="high")
+
+        self._patch_upstream(monkeypatch)
+        cfg = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=tmp_path / "audit.jsonl",
+            shadow=True,
+            strict_error_redaction=False,
+        )
+        signet_app = SignetApp(
+            config=cfg,
+            pipeline=Pipeline(
+                checks=[OwnerResolutionCheck(require_owner=True), _AlwaysEscalate()]
+            ),
+        )
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Commit-Owner": "human:alice"},
+        )
+        # Without shadow this would be 202; shadow neutralizes to 200.
+        assert r.status_code == 200
+        assert r.headers.get("X-Signet-Shadow-Decision") == "escalate"
+
+    def test_shadow_counter_increments(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        self._patch_upstream(monkeypatch)
+        cfg = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=tmp_path / "audit.jsonl",
+            shadow=True,
+        )
+        signet_app = SignetApp(
+            config=cfg,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True)]),
+        )
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r.status_code == 200
+        m = client.get("/metrics")
+        assert m.status_code == 200
+        text = m.text
+        # Counter must be present and non-zero for the would-have-blocked
+        # admission decision. Labels mirror signet_pipeline_decisions_total
+        # so dashboards can join the two.
+        assert "signet_shadow_would_have_blocked_total" in text
+        # Find the counter line and confirm it is at least 1.0 (handle
+        # any label ordering deterministically).
+        hit = False
+        for line in text.splitlines():
+            if line.startswith("signet_shadow_would_have_blocked_total{") and 'decision="block"' in line:
+                value = float(line.rsplit(" ", 1)[-1])
+                assert value >= 1.0
+                hit = True
+        assert hit, "expected a signet_shadow_would_have_blocked_total{decision=\"block\"} sample"
+
+    def test_shadow_correlation_id_matches_audit_entry(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        from signet.audit.backend import JsonlBackend
+
+        self._patch_upstream(monkeypatch)
+        log = tmp_path / "audit.jsonl"
+        cfg = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=log,
+            shadow=True,
+        )
+        signet_app = SignetApp(
+            config=cfg,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True)]),
+        )
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        corr_id = r.headers.get("X-Signet-Correlation-Id")
+        assert corr_id
+        entries = list(JsonlBackend(log).iter_entries())
+        # The shadowed admission row must carry the same entry_id as the
+        # X-Signet-Correlation-Id header — that is the contract that lets
+        # operators pivot from response → audit chain.
+        shadowed = [e for e in entries if e.metadata.get("shadow") is True]
+        assert any(e.entry_id == corr_id for e in shadowed)
 
 
 class TestMultimodalRedaction:

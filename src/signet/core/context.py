@@ -26,11 +26,34 @@ resolve identically.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from signet.core.owner import Owner
+
+
+# Module-level optional callback. Set by :class:`signet.server.metrics.Metrics`
+# at construction to wire truncation events into the metrics registry without
+# forcing :mod:`signet.core.context` to import :mod:`signet.server.metrics`
+# (that would create a circular dependency, since ``server`` already depends
+# on ``core``). The signature receives the cap size in bytes so dashboards can
+# correlate cap-policy changes with truncation rates.
+_truncation_observer: Callable[[int], None] | None = None
+
+
+def set_truncation_observer(callback: Callable[[int], None] | None) -> None:
+    """Install (or clear) the response-text truncation observer.
+
+    :class:`signet.server.metrics.Metrics` calls this with a counter-
+    incrementing function at construction; tests that don't want metrics
+    emission pass ``None``. The observer fires once per
+    :class:`ResponseContext` the *first* time its cap is hit — repeated
+    extensions on a saturated context don't double-count.
+    """
+    global _truncation_observer
+    _truncation_observer = callback
 
 
 def get_header_ci(headers: dict[str, str], name: str) -> str:
@@ -140,18 +163,32 @@ class ResponseContext:
         is dropped and the truncated flag is set; subsequent calls
         become no-ops on the text but still flip the flag for any new
         content received.
+
+        The first time the cap is hit on this context, the module-level
+        :data:`_truncation_observer` is fired (if installed) so metrics
+        backends can count truncation events. Subsequent extensions on
+        the same saturated context do *not* re-fire the observer — one
+        emission per response, regardless of how many overflow chunks
+        arrive.
         """
         if not more:
             return
         budget = self.accumulated_text_cap - len(self.accumulated_text)
         if budget <= 0:
-            self.accumulated_text_truncated = True
+            self._mark_truncated()
             return
         if len(more) > budget:
             self.accumulated_text += more[:budget]
-            self.accumulated_text_truncated = True
+            self._mark_truncated()
         else:
             self.accumulated_text += more
+
+    def _mark_truncated(self) -> None:
+        """Flip the truncated flag and fire the observer once per response."""
+        if not self.accumulated_text_truncated:
+            self.accumulated_text_truncated = True
+            if _truncation_observer is not None:
+                _truncation_observer(self.accumulated_text_cap)
 
 
 @dataclass

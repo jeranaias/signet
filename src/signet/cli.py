@@ -128,6 +128,17 @@ def main() -> None:
     "useful while integrating. --dev disables automatically.",
 )
 @click.option(
+    "--shadow/--no-shadow",
+    "shadow",
+    default=None,
+    envvar="SIGNET_SHADOW",
+    help="Run in shadow mode: pipeline runs but block/escalate "
+    "decisions become allow at the response layer. Audit chain "
+    "and metrics still record the original decision; the response "
+    "carries X-Signet-Shadow-* headers describing the would-be "
+    "refusal and a correlation ID. Use to pilot enforcement.",
+)
+@click.option(
     "--log-format",
     type=click.Choice(["text", "json"]),
     default="text",
@@ -149,6 +160,7 @@ def serve(
     upstream_label: str | None,
     dev: bool,
     strict_error_redaction: bool | None,
+    shadow: bool | None,
     log_format: str,
 ) -> None:
     """Run the signet proxy."""
@@ -208,6 +220,8 @@ def serve(
     # SIGNET_STRICT_ERROR_REDACTION's env-driven value if both are set.
     if strict_error_redaction is not None:
         cfg.strict_error_redaction = strict_error_redaction
+    if shadow is not None:
+        cfg.shadow = shadow
 
     signet_app = SignetApp(config=cfg, pipeline=pipeline)
     app = signet_app.app

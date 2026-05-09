@@ -230,6 +230,12 @@ class SignetApp:
                 "version": __version__,
                 "uptime_seconds": round(uptime, 3),
                 "pipeline_check_count": len(self.pipeline.checks),
+                # Shadow flag is always emitted (True or False) so
+                # operators tail /health and confirm at-a-glance whether
+                # the gate is enforcing or piloting. Three-state
+                # disambiguation isn't needed here: shadow is a boolean
+                # config knob, not a runtime-derived value.
+                "shadow": bool(self.config.shadow),
             }
             # Audit-chain head: last 8 hex of the most recent entry's
             # HMAC, so monitoring can detect "alive but not writing"
@@ -374,6 +380,20 @@ class SignetApp:
         Returns either a Response (caller should return immediately
         because admission refused/escalated/errored) or the populated
         RequestContext to proceed with forwarding.
+
+        Shadow-mode boundary: when ``self.config.shadow`` is True, a
+        non-allow ADMISSION result does NOT short-circuit to
+        ``_refusal``/``_escalation``. Instead the audit row is still
+        written (with ``metadata.shadow=True``), the
+        ``signet_shadow_would_have_blocked_total`` counter increments,
+        a set of ``X-Signet-Shadow-*`` headers is stashed on
+        ``ctx.scratch["_shadow_headers"]``, and the request continues
+        to the upstream as if it had been allowed. The forward path
+        merges those headers into the eventual response. The audit
+        chain remains the source of truth for what the gate would
+        have done; shadow mode only neutralizes the response layer.
+        Use this to pilot signet against production traffic before
+        flipping enforcement on.
         """
         try:
             raw = await self._read_capped_body(request)
@@ -439,12 +459,30 @@ class SignetApp:
 
         if result.is_block:
             entry = self._record_decision(ctx, result=result, check_name="pipeline.admission")
+            if self.config.shadow:
+                self._stash_shadow_headers(ctx, result, entry, decision="block")
+                return ctx
             return self._refusal(result, entry)
         if result.is_escalate:
             entry = self._record_decision(ctx, result=result, check_name="pipeline.admission")
+            if self.config.shadow:
+                self._stash_shadow_headers(ctx, result, entry, decision="escalate")
+                return ctx
             return self._escalation(result, entry)
         if result.is_redact:
-            ctx.body = self._apply_redaction(ctx.body, result.replacement_content)
+            if self.config.shadow:
+                # Shadow neutralizes redact too: body passes through
+                # unmodified so behavior is genuinely unchanged. The
+                # audit row already recorded what *would* have been
+                # redacted (the pipeline annotates result.metadata).
+                # Surface the would-be redaction via headers and the
+                # shadow counter so dashboards see the volume.
+                entry = self._record_decision(
+                    ctx, result=result, check_name="pipeline.admission"
+                )
+                self._stash_shadow_headers(ctx, result, entry, decision="redact")
+            else:
+                ctx.body = self._apply_redaction(ctx.body, result.replacement_content)
 
         return ctx
 
@@ -680,6 +718,13 @@ class SignetApp:
         headers = self._upstream_attribution_headers(upstream_resp.status_code)
         if entry is not None and self._receipt_signer is not None:
             headers[self.config.receipt_header_name] = self._receipt_signer.sign(entry)
+        # Merge any X-Signet-Shadow-* headers stashed by _admit (or by
+        # a RECORD-stage shadow neutralization above). They describe the
+        # would-be refusal so callers can see what shadow caught even
+        # though the response body is the upstream's.
+        shadow_headers = ctx.scratch.get("_shadow_headers")
+        if shadow_headers:
+            headers.update(shadow_headers)
         return JSONResponse(content=data, status_code=upstream_resp.status_code, headers=headers)
 
     async def _forward_stream(
@@ -716,6 +761,34 @@ class SignetApp:
 
                         inspection = await self.pipeline.inspect_response_chunk(rctx, chunk_text)
                         if not inspection.is_allow:
+                            if self.config.shadow:
+                                # Shadow mode: do NOT abort. Record the
+                                # would-have-blocked decision in the
+                                # audit chain (with shadow=True) and let
+                                # the chunk pass through. Streaming
+                                # responses cannot retroactively add
+                                # response headers (they were sent at
+                                # handshake), so the per-block
+                                # X-Signet-Shadow-* headers cannot reach
+                                # the caller for INSPECTION-stage
+                                # decisions; the audit chain remains the
+                                # source of truth and operators correlate
+                                # via the timestamps + request
+                                # fingerprint. The handshake-time header
+                                # ``X-Signet-Shadow-Inspection-Active:
+                                # 1`` tells callers shadow inspection is
+                                # running so they should consult the
+                                # chain for any neutralized decisions.
+                                self._record_decision(
+                                    ctx,
+                                    result=inspection,
+                                    check_name="pipeline.inspection",
+                                )
+                                ctx.scratch["_shadow_inspection_count"] = (
+                                    ctx.scratch.get("_shadow_inspection_count", 0) + 1
+                                )
+                                yield raw_chunk
+                                continue
                             # Abort the stream with a trailer event.
                             yield (
                                 b"data: "
@@ -789,14 +862,29 @@ class SignetApp:
                 # normally, were aborted, or the caller disconnected.
                 self._in_flight_streams = max(0, self._in_flight_streams - 1)
 
+        # Receipt and per-row chain entries can't be set on a streaming
+        # response (no entry exists yet), but the upstream attribution
+        # headers + any X-Signet-Shadow-* headers stashed by _admit fire
+        # at handshake time so callers see them before they parse a
+        # single chunk.
+        #
+        # Limitation: INSPECTION-stage shadow decisions detected during
+        # the stream cannot retroactively add response headers (HTTP
+        # response headers ship before the stream body). For streaming
+        # callers, the audit chain is the source of truth on neutralized
+        # mid-stream decisions. The handshake-time header
+        # ``X-Signet-Shadow-Inspection-Active: 1`` advertises that shadow
+        # is running so callers know to consult the chain.
+        stream_headers = self._upstream_attribution_headers(None)
+        shadow_headers = ctx.scratch.get("_shadow_headers")
+        if shadow_headers:
+            stream_headers.update(shadow_headers)
+        if self.config.shadow:
+            stream_headers["X-Signet-Shadow-Inspection-Active"] = "1"
         return StreamingResponse(
             event_stream(),
             media_type="text/event-stream",
-            # Receipt and per-row chain entries can't be set on a
-            # streaming response (no entry exists yet), but the upstream
-            # attribution headers can fire at handshake time so callers
-            # see them before they parse a single chunk.
-            headers=self._upstream_attribution_headers(None),
+            headers=stream_headers,
         )
 
     def _upstream_headers(self, ctx: RequestContext) -> dict[str, str]:
@@ -903,6 +991,52 @@ class SignetApp:
             headers[self.config.receipt_header_name] = self._receipt_signer.sign(entry)
         return JSONResponse(status_code=202, content=body, headers=headers)
 
+    def _stash_shadow_headers(
+        self,
+        ctx: RequestContext,
+        result: Any,
+        entry: AuditEntry | None,
+        *,
+        decision: str,
+    ) -> None:
+        """Build the ``X-Signet-Shadow-*`` header set and stash it on ctx.
+
+        Called from the admit + inspection paths whenever a non-allow
+        decision is neutralized by shadow mode. The forward path
+        (:meth:`_forward_unary` / :meth:`_forward_stream`) merges the
+        stashed headers into the eventual response.
+
+        Headers emitted:
+
+        * ``X-Signet-Shadow-Decision`` — block / escalate / redact.
+        * ``X-Signet-Shadow-Reason`` — coarsened to ``"refused"`` when
+          ``strict_error_redaction`` is on (matches the redaction rule
+          that ``_refusal``/``_escalation`` apply to body content); the
+          full reason otherwise.
+        * ``X-Signet-Shadow-Stage`` — admission / inspection /
+          commitment / record (read from the result metadata).
+        * ``X-Signet-Shadow-Check`` — the firing check name
+          (``_check_name`` from the result metadata, omitted in strict
+          mode for the same reason ``_refusal`` redacts it from the
+          body).
+        * ``X-Signet-Correlation-Id`` — the audit entry ID. Operators
+          pivot from response → audit row via this ID.
+        """
+        headers: dict[str, str] = ctx.scratch.setdefault("_shadow_headers", {})
+        headers["X-Signet-Shadow-Decision"] = decision
+        if self.config.strict_error_redaction:
+            headers["X-Signet-Shadow-Reason"] = "refused"
+        else:
+            headers["X-Signet-Shadow-Reason"] = result.reason
+            check_name = result.metadata.get("_check_name")
+            if check_name:
+                headers["X-Signet-Shadow-Check"] = str(check_name)
+        stage = result.metadata.get("_stage")
+        if stage:
+            headers["X-Signet-Shadow-Stage"] = str(stage)
+        if entry is not None:
+            headers["X-Signet-Correlation-Id"] = entry.entry_id
+
     def _record_decision(
         self,
         ctx: RequestContext,
@@ -916,6 +1050,16 @@ class SignetApp:
         Maps the four CheckResult outcomes to the four Decision values
         one-to-one — earlier versions collapsed REDACT/ESCALATE into
         BLOCK, which lost information needed for incident review.
+
+        Shadow mode: when ``self.config.shadow`` is True and
+        ``result`` is a non-allow CheckResult, ``meta["shadow"] = True``
+        is stamped on the audit row and the
+        ``signet_shadow_would_have_blocked_total`` counter increments
+        with the same {check, stage, decision} label set as
+        ``signet_pipeline_decisions_total`` so dashboards can join the
+        two. The decision recorded in the chain remains the original
+        (block / escalate / redact) — shadow only changes what the
+        response layer does, never what the chain says.
         """
         decision = _result_to_decision(result)
         # Always tally pipeline decisions, even when no audit chain
@@ -924,12 +1068,33 @@ class SignetApp:
             "signet_pipeline_decisions_total",
             {"check": check_name, "decision": decision.value},
         )
+        is_shadowed = (
+            self.config.shadow
+            and result is not None
+            and not result.is_allow
+        )
+        if is_shadowed:
+            stage = ""
+            try:
+                stage = str(result.metadata.get("_stage", ""))
+            except AttributeError:  # pragma: no cover — defensive
+                stage = ""
+            self.metrics.inc(
+                "signet_shadow_would_have_blocked_total",
+                {
+                    "check": check_name,
+                    "stage": stage,
+                    "decision": decision.value,
+                },
+            )
         if self._chain is None:
             return None
         reason = result.reason if result is not None else "request completed"
         meta = dict(metadata or {})
         if result is not None:
             meta.update(result.metadata)
+        if is_shadowed:
+            meta["shadow"] = True
         entry = AuditEntry(
             owner=ctx.owner,
             check_name=check_name,

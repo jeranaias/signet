@@ -121,6 +121,15 @@ class ServerConfig:
     ``False``) only for development, debugging integration issues, or
     deployments behind a fully-trusted client. ``signet serve --dev``
     flips this off automatically."""
+    shadow: bool = False
+    """When True, ADMISSION + INSPECTION + COMMITMENT block and escalate
+    decisions are converted to allow at the response layer; the audit
+    chain still records the original decision (with metadata.shadow=True),
+    the response carries X-Signet-Shadow-* headers describing the
+    would-be refusal, and the signet_shadow_would_have_blocked_total
+    counter increments. Operators pilot signet in shadow mode against
+    production traffic to see what would be blocked before flipping
+    enforcement on."""
 
     # Forwarded fields the user can tune via env-var: see _ENV_KEYS below.
     extra_forward_headers: tuple[str, ...] = field(
@@ -181,5 +190,7 @@ class ServerConfig:
             cfg.upstream_label = v
         if v := e.get("SIGNET_STRICT_ERROR_REDACTION"):
             cfg.strict_error_redaction = v.lower() == "true"
+        if v := e.get("SIGNET_SHADOW"):
+            cfg.shadow = v.lower() == "true"
 
         return cfg
