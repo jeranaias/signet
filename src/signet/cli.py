@@ -8,13 +8,35 @@ Subcommands:
   three usual local-development flags into one.
 * ``signet doctor`` — preflight check: prints versions, probes
   ``--upstream`` reachability, probes a running ``--self`` for
-  /health, /version, and a no-owner refusal round-trip.
+  /health, /version, and a no-owner refusal round-trip. With
+  ``--probe-injection`` (v0.1.6+), runs the static obfuscated-
+  injection corpus against ``--self`` and asserts every probe
+  refuses.
 * ``signet audit verify`` — walk an HMAC-chained log and report any
-  tampering.
-* ``signet audit show`` — pretty-print one entry by ID. (Was
-  ``signet replay`` in v0.1.0; that name remains as a deprecated
-  alias because the original name implied pipeline re-execution
-  which is roadmap not v0.1.)
+  tampering. With ``--including-archives <dir>`` (v0.1.6+), also
+  walks every referenced compaction archive end-to-end.
+* ``signet audit show`` — pretty-print one entry by ID.
+* ``signet audit count`` / ``audit tail`` — quick group-by counts
+  and tail with field filters.
+* ``signet audit compact`` (v0.1.6+) — Merkle-archive a prefix of
+  the chain and replace it with a compaction marker. Operator MUST
+  quiesce the chain first (``--quiesce-confirm``).
+* ``signet audit report`` (v0.1.6+) — periodic decision summary:
+  decision distribution, top firing checks, top blocked owners
+  (anonymized by default), deltas vs the prior period, chain-
+  integrity attestation. Markdown or JSON.
+* ``signet replay <id>`` — first-class shorthand for
+  ``signet audit show <id>``. Promoted to first-class in v0.1.6;
+  the v0.1.0 deprecation note has been retired since the name
+  applies just fine to "replay this audit row to my eyeballs"
+  even though true pipeline re-execution remains roadmap.
+* ``signet plugins list`` (v0.1.6+) — discover installed
+  ``signet.checks`` / ``signet.adapters`` / ``signet.anchors``
+  entry points and report load status (``loaded``,
+  ``incompatible_abi``, ``load_error``).
+* ``signet keys generate-ed25519`` — fresh keypair for asymmetric
+  receipt signing.
+* ``signet lint`` — static analysis on a pipeline file.
 
 Built on click. Entry point ``signet`` is registered in
 ``pyproject.toml`` under ``[project.scripts]``.
@@ -384,7 +406,20 @@ def keys_generate_ed25519(
     "no-owner refusal round-trip. Use this to verify a running proxy "
     "against the gate's documented behavior.",
 )
-def doctor(upstream_url: str | None, signet_url: str | None) -> None:
+@click.option(
+    "--probe-injection",
+    "probe_injection",
+    is_flag=True,
+    help="Send a corpus of obfuscated injection attempts to --self "
+    "and assert every one is blocked. Catches 'someone "
+    "mis-edited the rule list and the prompt-injection check "
+    "stopped firing' regressions in CI.",
+)
+def doctor(
+    upstream_url: str | None,
+    signet_url: str | None,
+    probe_injection: bool,
+) -> None:
     """Preflight check — is everything wired the way you think?
 
     Always prints versions and dependency status. With ``--upstream``,
@@ -489,7 +524,129 @@ def doctor(upstream_url: str | None, signet_url: str | None) -> None:
     if not upstream_url and not signet_url:
         click.echo("\n(pass --upstream <url> and/or --self <url> to probe endpoints)")
 
+    if probe_injection:
+        if not signet_url:
+            click.secho(
+                "  --probe-injection requires --self <url>; the corpus must "
+                "be sent against a running signet proxy.",
+                fg="red",
+            )
+            sys.exit(1)
+        probe_failed = _run_probe_injection_corpus(signet_url)
+        if probe_failed:
+            failed = True
+
     sys.exit(1 if failed else 0)
+
+
+def _run_probe_injection_corpus(signet_url: str) -> bool:
+    """Send every probe in :data:`PROMPT_INJECTION_PROBE_CORPUS` and
+    assert every one is refused.
+
+    Returns ``True`` if any probe leaked through (gate failure),
+    ``False`` if every probe was correctly blocked.
+
+    Each probe is sent as an OpenAI-shaped chat-completion to
+    ``<signet_url>/v1/chat/completions`` with a default
+    ``X-Commit-Owner: human:doctor-probe`` header so OwnerResolutionCheck
+    doesn't fire first. A successful probe sees one of:
+
+    * HTTP 403 — strict-error-redaction default refusal.
+    * HTTP 202 — escalation path (still a refusal at the response
+      layer).
+    * HTTP 200 with ``X-Signet-Shadow-Decision: block`` — shadow mode
+      on the target.
+
+    Any 200 without a shadow-block header counts as a leak.
+    """
+    import httpx
+
+    from signet.cli_helpers.probe_injection_corpus import (
+        PROMPT_INJECTION_PROBE_CORPUS,
+    )
+
+    base = signet_url.rstrip("/")
+    click.echo(f"\nprobing prompt-injection corpus against: {base}")
+    click.echo(f"  ({len(PROMPT_INJECTION_PROBE_CORPUS)} probes)")
+    leaked = False
+
+    for probe in PROMPT_INJECTION_PROBE_CORPUS:
+        try:
+            resp = httpx.post(
+                f"{base}/v1/chat/completions",
+                headers={
+                    "Content-Type": "application/json",
+                    # Pre-resolved owner so OwnerResolutionCheck does not
+                    # fire first and shadow our intended target check.
+                    "X-Commit-Owner": "human:doctor-probe",
+                },
+                json={
+                    "model": "test",
+                    "messages": [
+                        {"role": "user", "content": probe.payload},
+                    ],
+                },
+                timeout=10.0,
+            )
+        except httpx.HTTPError as exc:
+            click.secho(
+                f"  [{probe.name:<24}] errored: {type(exc).__name__}: {exc}",
+                fg="red",
+            )
+            leaked = True
+            continue
+
+        # Decide pass/fail. The "shadow-mode block" path is the only
+        # case where 200 is acceptable.
+        shadow_decision = resp.headers.get("X-Signet-Shadow-Decision", "")
+        firing_check = _probe_firing_check(resp)
+        if resp.status_code == 403 or resp.status_code == 202:
+            click.secho(
+                f"  [{probe.name:<24}] refused HTTP {resp.status_code} "
+                f"(check={firing_check or 'redacted'})",
+                fg="green",
+            )
+        elif resp.status_code == 200 and shadow_decision == "block":
+            click.secho(
+                f"  [{probe.name:<24}] shadow-blocked "
+                f"(check={firing_check or 'redacted'})",
+                fg="green",
+            )
+        else:
+            click.secho(
+                f"  [{probe.name:<24}] LEAKED HTTP {resp.status_code} "
+                f"(expected refusal; shadow_decision={shadow_decision!r})",
+                fg="red",
+            )
+            leaked = True
+
+    if leaked:
+        click.secho("\n  prompt-injection probe: FAIL (gate let one through)", fg="red")
+    else:
+        click.secho("\n  prompt-injection probe: ok (all probes blocked)", fg="green")
+    return leaked
+
+
+def _probe_firing_check(resp: Any) -> str | None:
+    """Best-effort extraction of the firing check name from a refusal.
+
+    Looks first at the ``X-Signet-Shadow-Decision-Check`` header
+    (shadow mode), then at the response JSON body's ``check`` field
+    (only populated when ``--no-strict-error-redaction`` is on the
+    target). Returns ``None`` when neither channel surfaces it.
+    """
+    name = resp.headers.get("X-Signet-Shadow-Decision-Check")
+    if name:
+        return str(name)
+    try:
+        body = resp.json()
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(body, dict):
+        check = body.get("check") or body.get("firing_check")
+        if isinstance(check, str):
+            return check
+    return None
 
 
 @main.group()
@@ -520,11 +677,26 @@ def audit() -> None:
     help="Emit machine-readable JSON instead of colored text. Use this "
     "from cron jobs, CI checks, and any scripted invocation.",
 )
-def audit_verify(log_path: Path, hmac_secret: str, key_id: str, as_json: bool) -> None:
+@click.option(
+    "--including-archives",
+    "archive_dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Walk the live chain plus every referenced compaction archive "
+    "as one logical chain. Recomputes Merkle roots and reports "
+    "MERKLE_MISMATCH / ARCHIVE_MISSING / ARCHIVE_FORMAT_INVALID.",
+)
+def audit_verify(
+    log_path: Path,
+    hmac_secret: str,
+    key_id: str,
+    as_json: bool,
+    archive_dir: Path | None,
+) -> None:
     """Walk LOG_PATH and report any tampering."""
     from signet.audit.backend import JsonlBackend
     from signet.audit.keyring import Key, KeyRing
-    from signet.audit.verifier import ChainVerifier
+    from signet.audit.verifier import ChainVerifier, verify_with_archives
 
     keyring = KeyRing(
         active=Key(
@@ -533,7 +705,10 @@ def audit_verify(log_path: Path, hmac_secret: str, key_id: str, as_json: bool) -
         )
     )
     backend = JsonlBackend(log_path)
-    report = ChainVerifier(backend, keyring).verify()
+    if archive_dir is None:
+        report = ChainVerifier(backend, keyring).verify()
+    else:
+        report = verify_with_archives(backend, keyring, archive_dir)
 
     if as_json:
         payload = {
@@ -569,9 +744,39 @@ def audit_verify(log_path: Path, hmac_secret: str, key_id: str, as_json: bool) -
     )
     for b in report.breaks[:50]:
         click.echo(f"  line {b.index} [{b.kind.value}] entry={b.entry_id}: {b.detail}")
+        hint = _verify_break_hint(b.kind.value)
+        if hint:
+            click.echo(f"      hint: {hint}")
     if len(report.breaks) > 50:
         click.echo(f"  ... and {len(report.breaks) - 50} more")
     sys.exit(2)
+
+
+def _verify_break_hint(kind: str) -> str:
+    """Return an operator-readable hint for a verify break kind.
+
+    The new v0.1.6 archive-aware kinds (``MERKLE_MISMATCH``,
+    ``ARCHIVE_MISSING``, ``ARCHIVE_FORMAT_INVALID``) get explicit
+    remediation guidance because they're brand new to operators
+    upgrading from v0.1.5. The pre-existing kinds already render with
+    enough detail in ``b.detail``.
+    """
+    if kind == "merkle_mismatch":
+        return (
+            "the marker's claimed Merkle root no longer matches the archive. "
+            "Either the marker or the archive was tampered with."
+        )
+    if kind == "archive_missing":
+        return (
+            "pass --including-archives <dir> pointing at the directory that "
+            "contains the referenced archive file."
+        )
+    if kind == "archive_format_invalid":
+        return (
+            "the archive on disk is malformed (bad magic, version mismatch, "
+            "or truncated). Restore from a known-good copy."
+        )
+    return ""
 
 
 @audit.command("count")
@@ -730,6 +935,513 @@ def audit_show(entry_id: str, audit_log_path: Path) -> None:
     _show_entry(entry_id, audit_log_path)
 
 
+@audit.command("compact")
+@click.option(
+    "--audit-log",
+    "audit_log_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    envvar="SIGNET_AUDIT_LOG_PATH",
+    help="Path to the live JSONL audit chain to compact.",
+)
+@click.option(
+    "--before",
+    required=True,
+    help="ISO 8601 UTC timestamp; entries with ts strictly < this are "
+    "compacted into the archive.",
+)
+@click.option(
+    "--output",
+    required=True,
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Path to write the archive file. Parent directory is created "
+    "if missing.",
+)
+@click.option(
+    "--hmac-secret",
+    envvar="SIGNET_HMAC_SECRET",
+    required=True,
+    help="HMAC secret as hex (the same one the chain was written with).",
+)
+@click.option(
+    "--key-id",
+    "key_id",
+    envvar="SIGNET_HMAC_KEY_ID",
+    default="k1",
+    show_default=True,
+    help="ID of the active key. The compaction marker is signed with "
+    "this key.",
+)
+@click.option(
+    "--quiesce-confirm",
+    is_flag=True,
+    help="Confirm you have stopped all writers to the chain. "
+    "Compaction WILL corrupt the chain if writers are active. "
+    "See docs/audit-archive-format.md for the operator playbook.",
+)
+def audit_compact(
+    audit_log_path: Path,
+    before: str,
+    output: Path,
+    hmac_secret: str,
+    key_id: str,
+    quiesce_confirm: bool,
+) -> None:
+    """Archive entries before --before into --output and replace them
+    with a compaction marker in the live chain.
+
+    The live chain MUST be quiesced first (no concurrent writers).
+    Concurrent writes during compaction will corrupt the chain.
+    """
+    if not quiesce_confirm:
+        raise click.ClickException(
+            "audit compact REQUIRES --quiesce-confirm because the live "
+            "chain MUST be quiesced first (no concurrent writers). "
+            "Concurrent writes during compaction WILL corrupt the chain. "
+            "See docs/audit-archive-format.md threat-model section before "
+            "proceeding."
+        )
+
+    from datetime import UTC, datetime
+
+    from signet.audit.backend import JsonlBackend
+    from signet.audit.chain import HmacChain
+    from signet.audit.compactor import compact_audit_log
+    from signet.audit.keyring import Key, KeyRing
+
+    # Parse --before. Accept ``Z`` suffix and bare ISO; reject ambiguity
+    # by normalizing to UTC.
+    try:
+        before_dt = datetime.fromisoformat(before.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise click.ClickException(
+            f"--before {before!r} is not valid ISO 8601 ({exc}). "
+            "Try e.g. '2026-05-01T00:00:00Z'."
+        ) from exc
+    if before_dt.tzinfo is None:
+        before_dt = before_dt.replace(tzinfo=UTC)
+
+    keyring = KeyRing(
+        active=Key(
+            key_id=key_id,
+            secret=_parse_hex_secret(hmac_secret, "--hmac-secret/SIGNET_HMAC_SECRET"),
+        )
+    )
+    backend = JsonlBackend(audit_log_path)
+    chain = HmacChain(backend, keyring)
+
+    result = compact_audit_log(
+        chain=chain,
+        backend=backend,
+        before=before_dt,
+        output=output,
+    )
+
+    if result is None:
+        click.secho(
+            f"no-op: nothing before {before_dt.isoformat()}",
+            fg="yellow",
+        )
+        sys.exit(0)
+
+    click.secho("compaction complete:", fg="green")
+    click.echo(f"  marker_entry_id:   {result.marker_entry_id}")
+    click.echo(f"  merkle_root:       {result.merkle_root}")
+    click.echo(f"  compacted_count:   {result.compacted_count}")
+    click.echo(f"  range_start:       {result.range[0]}")
+    click.echo(f"  range_end:         {result.range[1]}")
+    click.echo(f"  archive_path:      {result.archive_path}")
+    click.echo(
+        "\nverify with:\n"
+        f"  signet audit verify {audit_log_path} --hmac-secret <hex> "
+        f"--including-archives {result.archive_path.parent}"
+    )
+
+
+@audit.command("report")
+@click.option(
+    "--audit-log",
+    "audit_log_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    envvar="SIGNET_AUDIT_LOG_PATH",
+    help="Path to the JSONL audit chain.",
+)
+@click.option(
+    "--since",
+    default="24h",
+    show_default=True,
+    help="Duration of the report window. Accepts 1h, 24h, 7d, 30d.",
+)
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["markdown", "json"]),
+    default="markdown",
+    show_default=True,
+    help="Output format. ``markdown`` is human-readable; ``json`` is "
+    "structured for downstream tooling.",
+)
+@click.option(
+    "--anonymize/--no-anonymize",
+    default=True,
+    show_default=True,
+    help="Hash owner IDs with a salted SHA-256 before rendering. "
+    "--no-anonymize emits raw owner IDs (only safe in private "
+    "incident-response channels).",
+)
+@click.option(
+    "--anonymize-salt",
+    envvar="SIGNET_ANONYMIZE_SALT",
+    default=None,
+    help="Salt used for owner-ID anonymization. Required with "
+    "--anonymize unless SIGNET_ANONYMIZE_SALT env is set.",
+)
+@click.option(
+    "--hmac-secret",
+    envvar="SIGNET_HMAC_SECRET",
+    default=None,
+    help="HMAC secret as hex. When provided, the chain is verified "
+    "and the integrity section reports ok/breaks. Without it the "
+    "integrity section is omitted (still safe for ops dashboards).",
+)
+@click.option(
+    "--key-id",
+    "key_id",
+    envvar="SIGNET_HMAC_KEY_ID",
+    default="k1",
+    show_default=True,
+    help="ID of the active key for chain integrity verification.",
+)
+@click.option(
+    "--service-label",
+    "service_label",
+    default=None,
+    help="Optional service label rendered in the report header (e.g. "
+    "'thornveil-prod'). Defaults to omitting the suffix.",
+)
+def audit_report(
+    audit_log_path: Path,
+    since: str,
+    fmt: str,
+    anonymize: bool,
+    anonymize_salt: str | None,
+    hmac_secret: str | None,
+    key_id: str,
+    service_label: str | None,
+) -> None:
+    """Periodic decision summary suitable for dashboards and weekly
+    reviews.
+
+    Aggregates decisions, top firing checks, top blocked owners
+    (anonymized by default), deltas vs the prior equivalent period,
+    and the chain-integrity attestation when --hmac-secret is supplied.
+    """
+    from datetime import UTC, datetime
+
+    if anonymize and not anonymize_salt:
+        raise click.ClickException(
+            "--anonymize requires --anonymize-salt or SIGNET_ANONYMIZE_SALT. "
+            "Pass --no-anonymize only if you understand the disclosure risk."
+        )
+
+    duration = _parse_duration(since)
+    now = datetime.now(tz=UTC)
+    window_start = now - duration
+    prior_start = now - 2 * duration
+    prior_end = window_start
+
+    from signet.audit.backend import JsonlBackend
+
+    backend = JsonlBackend(audit_log_path)
+    cur_window: list[Any] = []
+    prior_window: list[Any] = []
+    for entry in backend.iter_entries():
+        ts = datetime.fromtimestamp(entry.ts_ns / 1e9, tz=UTC)
+        if window_start <= ts <= now:
+            cur_window.append(entry)
+        elif prior_start <= ts < prior_end:
+            prior_window.append(entry)
+
+    integrity_section: dict[str, Any] | None = None
+    if hmac_secret:
+        from signet.audit.keyring import Key, KeyRing
+        from signet.audit.verifier import ChainVerifier
+
+        keyring = KeyRing(
+            active=Key(
+                key_id=key_id,
+                secret=_parse_hex_secret(hmac_secret, "--hmac-secret/SIGNET_HMAC_SECRET"),
+            )
+        )
+        report = ChainVerifier(backend, keyring).verify()
+        head_hmac = report.last_known_good_hmac
+        integrity_section = {
+            "ok": report.ok,
+            "breaks": len(report.breaks),
+            "head_hmac_short": head_hmac[-8:] if head_hmac else "",
+            "total_entries": report.total_entries,
+        }
+
+    aggregates = _aggregate_audit_window(
+        cur_window,
+        anonymize=anonymize,
+        salt=anonymize_salt or "",
+    )
+    prior_aggregates = _aggregate_audit_window(
+        prior_window,
+        anonymize=anonymize,
+        salt=anonymize_salt or "",
+    )
+
+    payload = {
+        "range": {
+            "start": window_start.isoformat(timespec="minutes"),
+            "end": now.isoformat(timespec="minutes"),
+            "duration": since,
+        },
+        "service": service_label,
+        "signet_version": __version__,
+        "total_decisions": aggregates["total"],
+        "decision_counts": aggregates["decision_counts"],
+        "top_checks": aggregates["top_checks"],
+        "top_blocked_owners": aggregates["top_blocked_owners"],
+        "deltas": _compute_deltas(aggregates, prior_aggregates),
+        "integrity": integrity_section,
+    }
+
+    if fmt == "json":
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    click.echo(_render_audit_report_markdown(payload))
+
+
+def _parse_duration(spec: str) -> Any:
+    """Parse one of ``Nh`` / ``Nd`` to a :class:`datetime.timedelta`.
+
+    Accepts the four documented shorthands ``1h`` / ``24h`` / ``7d`` /
+    ``30d``, and any other ``<int>h`` or ``<int>d`` form for forward
+    compatibility. Raises :class:`click.ClickException` on bad input
+    so the operator gets a clear error rather than a ValueError.
+
+    Returns a :class:`datetime.timedelta`; typed as :class:`Any` only
+    because importing ``datetime`` at module top would force every
+    other CLI subcommand to pay that import even when not needed.
+    """
+    import re
+    from datetime import timedelta
+
+    m = re.fullmatch(r"\s*(\d+)\s*([hd])\s*", spec)
+    if not m:
+        raise click.ClickException(
+            f"--since {spec!r} is not a valid duration; expected '1h', "
+            "'24h', '7d', '30d' or another <int>h/<int>d form."
+        )
+    n = int(m.group(1))
+    unit = m.group(2)
+    if unit == "h":
+        return timedelta(hours=n)
+    return timedelta(days=n)
+
+
+def _aggregate_audit_window(
+    entries: list[Any],
+    *,
+    anonymize: bool,
+    salt: str,
+) -> dict[str, Any]:
+    """Roll up an audit-log window into the report's aggregate fields.
+
+    Memory note: this loads the entries that fall in the window into
+    memory before aggregating. For chains with very large 24h windows
+    that's the cap on this command's footprint — see the report-back
+    note about scalability.
+    """
+    from collections import Counter
+
+    decision_counts: Counter[str] = Counter()
+    check_counts: Counter[str] = Counter()
+    check_owner_sets: dict[str, set[str]] = {}
+    check_decision_breakdown: dict[str, Counter[str]] = {}
+    blocked_owner_counts: Counter[str] = Counter()
+
+    for entry in entries:
+        d = entry.decision.value
+        decision_counts[d] += 1
+        if d in {"block", "escalate", "redact"}:
+            check_counts[entry.check_name] += 1
+            check_owner_sets.setdefault(entry.check_name, set()).add(str(entry.owner))
+            check_decision_breakdown.setdefault(entry.check_name, Counter())[d] += 1
+        if d == "block":
+            owner_str = str(entry.owner)
+            rendered = _maybe_anonymize_owner(owner_str, anonymize=anonymize, salt=salt)
+            blocked_owner_counts[rendered] += 1
+
+    top_checks: list[dict[str, Any]] = []
+    for name, count in check_counts.most_common(10):
+        top_checks.append(
+            {
+                "name": name,
+                "firings": count,
+                "distinct_owners": len(check_owner_sets.get(name, set())),
+                "by_decision": dict(check_decision_breakdown.get(name, Counter())),
+            }
+        )
+    top_blocked_owners = [
+        {"owner": k, "blocks": v} for k, v in blocked_owner_counts.most_common(10)
+    ]
+    return {
+        "total": sum(decision_counts.values()),
+        "decision_counts": dict(decision_counts),
+        "top_checks": top_checks,
+        "top_blocked_owners": top_blocked_owners,
+    }
+
+
+def _maybe_anonymize_owner(owner_str: str, *, anonymize: bool, salt: str) -> str:
+    """Render an owner string for the report.
+
+    With ``anonymize=True``, returns ``owner_<8hex>`` where the 8 hex
+    characters are the first 8 of ``SHA-256(salt + ":" + owner_str)``.
+    With ``anonymize=False``, returns the raw owner string.
+    """
+    if not anonymize:
+        return owner_str
+    import hashlib
+
+    h = hashlib.sha256(f"{salt}:{owner_str}".encode()).hexdigest()
+    return f"owner_{h[:8]}"
+
+
+def _compute_deltas(
+    cur: dict[str, Any], prior: dict[str, Any]
+) -> dict[str, Any]:
+    """Compute "current vs prior" deltas the report renders.
+
+    Two notable signals:
+
+    * ``check_pct_delta`` — for every name in the current top-10, what
+      was its count in the prior window? Render ``inf`` when the prior
+      count was zero (genuinely new firing).
+    * ``new_blocked_owners`` — owners in the current top-10 not present
+      in the prior top-10. ``len(...)`` is the headline number; the
+      list of names is the supporting detail.
+    """
+    prior_check_counts = {row["name"]: row["firings"] for row in prior.get("top_checks", [])}
+    check_pct_delta: list[dict[str, Any]] = []
+    for row in cur.get("top_checks", []):
+        prev = prior_check_counts.get(row["name"], 0)
+        cur_n = row["firings"]
+        if prev == 0:
+            pct: float | None = float("inf") if cur_n > 0 else 0.0
+        else:
+            pct = (cur_n - prev) / prev * 100.0
+        check_pct_delta.append(
+            {
+                "name": row["name"],
+                "prior": prev,
+                "current": cur_n,
+                "pct_delta": pct,
+            }
+        )
+
+    prior_owner_set = {row["owner"] for row in prior.get("top_blocked_owners", [])}
+    cur_owner_list = [row["owner"] for row in cur.get("top_blocked_owners", [])]
+    new_owners = [o for o in cur_owner_list if o not in prior_owner_set]
+    return {
+        "check_pct_delta": check_pct_delta,
+        "new_blocked_owners": new_owners,
+    }
+
+
+def _render_audit_report_markdown(payload: dict[str, Any]) -> str:
+    """Render the report payload as the operator-facing markdown doc."""
+    lines: list[str] = []
+    rng = payload["range"]
+    service_suffix = f" @ {payload['service']}" if payload.get("service") else ""
+    lines.append("# signet audit report")
+    lines.append(
+        f"**Range:** {rng['start']} -> {rng['end']} UTC ({rng['duration']})"
+    )
+    lines.append(
+        f"**Service:** signet {payload['signet_version']}{service_suffix}"
+    )
+    lines.append(f"**Total decisions:** {payload['total_decisions']:,}")
+    lines.append("")
+
+    lines.append("## Decision distribution")
+    lines.append("| Decision  | Count | %     |")
+    lines.append("|-----------|-------|-------|")
+    total = max(1, payload["total_decisions"])
+    for d in ("allow", "block", "escalate", "redact"):
+        n = payload["decision_counts"].get(d, 0)
+        pct = n / total * 100.0
+        lines.append(f"| {d:<9} | {n:>5} | {pct:5.1f}% |")
+    lines.append("")
+
+    lines.append("## Top firing checks (block + escalate + redact)")
+    if not payload["top_checks"]:
+        lines.append("(no block/escalate/redact decisions in the window)")
+    else:
+        for i, row in enumerate(payload["top_checks"], start=1):
+            by = row.get("by_decision", {})
+            if by and len(by) > 1:
+                breakdown = ", ".join(f"{v} {k}" for k, v in sorted(by.items()))
+                detail = f"{row['firings']} firings ({breakdown})"
+            else:
+                detail = (
+                    f"{row['firings']} firings, {row['distinct_owners']} distinct owners"
+                )
+            lines.append(f"{i}. `{row['name']}` -- {detail}")
+    lines.append("")
+
+    lines.append("## Top blocked owners (anonymized)" if payload.get("top_blocked_owners") else "")
+    if payload.get("top_blocked_owners"):
+        for i, row in enumerate(payload["top_blocked_owners"], start=1):
+            lines.append(f"{i}. `{row['owner']}` -- {row['blocks']} blocks")
+        lines.append("")
+
+    lines.append("## Notable deltas vs prior period")
+    deltas = payload.get("deltas", {})
+    rendered_any = False
+    for d in deltas.get("check_pct_delta", []):
+        pct = d["pct_delta"]
+        if pct is None or pct == 0.0:
+            continue
+        if pct == float("inf"):
+            lines.append(
+                f"- `{d['name']}` firings NEW in this window "
+                f"({d['current']} firings; prior=0)"
+            )
+        else:
+            arrow = "up" if pct > 0 else "down"
+            lines.append(
+                f"- `{d['name']}` firings {arrow} {abs(pct):.0f}% "
+                f"({d['prior']} -> {d['current']})"
+            )
+        rendered_any = True
+    new_owners = deltas.get("new_blocked_owners", [])
+    if new_owners:
+        lines.append(
+            f"- New blocked owners: {len(new_owners)} first-time appearances "
+            "in the top-10"
+        )
+        rendered_any = True
+    if not rendered_any:
+        lines.append("(no notable deltas)")
+    lines.append("")
+
+    if payload.get("integrity"):
+        i = payload["integrity"]
+        lines.append("## Audit chain integrity")
+        lines.append(f"- Verified: ok={i['ok']}, breaks={i['breaks']}")
+        if i.get("head_hmac_short"):
+            lines.append(f"- Head HMAC (last 8 hex): `{i['head_hmac_short']}`")
+        lines.append(f"- Total entries (entire chain): {i['total_entries']:,}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 @main.command()
 @click.argument(
     "config_path",
@@ -788,30 +1500,182 @@ def lint(config_path: Path, strict: bool) -> None:
     sys.exit(0)
 
 
-@main.command(hidden=True)
+@main.group()
+def plugins() -> None:
+    """Plugin discovery and management."""
+
+
+@plugins.command("list")
+@click.option(
+    "--group",
+    type=click.Choice(["signet.checks", "signet.adapters", "signet.anchors", "all"]),
+    default="all",
+    show_default=True,
+    help="Restrict the listing to a single entry-point group.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit a JSON array matching the DiscoveredPlugin shape.",
+)
+def plugins_list(group: str, as_json: bool) -> None:
+    """List discovered plugins.
+
+    Reports every entry point under ``signet.checks``,
+    ``signet.adapters`` and ``signet.anchors``, including
+    ``loaded``, ``incompatible_abi`` and ``load_error`` statuses so
+    misconfiguration is visible (rather than silently dropped).
+    """
+    from signet.plugins import discover_plugins
+
+    plugins_found = discover_plugins(refresh=True)
+    if group != "all":
+        plugins_found = [p for p in plugins_found if p.group == group]
+
+    if as_json:
+        payload = []
+        for p in plugins_found:
+            payload.append(
+                {
+                    "group": p.group,
+                    "name": p.name,
+                    "package": p.package,
+                    "package_version": p.package_version,
+                    "target": p.target,
+                    "status": p.status,
+                    "abi_declared": p.abi_declared,
+                    "abi_required": p.abi_required,
+                    "error": p.error,
+                }
+            )
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+
+    # Group rows by group for readability. Order: checks, adapters,
+    # anchors. Empty sections render an explicit "(none)" line so the
+    # operator can tell "no plugins" apart from "we forgot to scan".
+    group_titles = {
+        "signet.checks": "INSTALLED CHECKS",
+        "signet.adapters": "INSTALLED ADAPTERS",
+        "signet.anchors": "INSTALLED ANCHORS",
+    }
+    seen_any = False
+    for grp in ("signet.checks", "signet.adapters", "signet.anchors"):
+        if group != "all" and group != grp:
+            continue
+        rows = [p for p in plugins_found if p.group == grp]
+        click.echo(f"\n{group_titles[grp]} ({len(rows)})")
+        if not rows:
+            click.echo("  (none)")
+            continue
+        seen_any = True
+        # Compute aligned columns. ``name`` and ``package`` have the
+        # widest variance.
+        name_w = max(len(p.name) for p in rows)
+        pkg_w = max(len(_render_pkg(p)) for p in rows)
+        for p in rows:
+            pkg = _render_pkg(p)
+            abi_seg = ""
+            if grp == "signet.checks":
+                abi = p.abi_declared if p.abi_declared is not None else "?"
+                abi_seg = f"ABI {abi:<3}"
+            status_seg = _render_plugin_status(p)
+            line = f"  {p.name:<{name_w}}  {pkg:<{pkg_w}}  {abi_seg:<8}{status_seg}".rstrip()
+            color = (
+                "green"
+                if p.status == "loaded"
+                else "red"
+                if p.status == "load_error"
+                else "yellow"
+            )
+            click.secho(line, fg=color)
+
+    if not seen_any and group == "all":
+        click.echo("\n(no plugins discovered; install signet plugin packages "
+                   "to populate this list)")
+
+
+def _render_pkg(p: Any) -> str:
+    """Render a plugin's package name + version in one column.
+
+    Empty package strings happen for dynamically-registered entry
+    points (test fixtures, in-process registration). Render those as
+    ``-`` so the column never collapses.
+    """
+    pkg = p.package or "-"
+    ver = p.package_version or ""
+    return f"{pkg} {ver}".strip() if pkg != "-" else "-"
+
+
+def _render_plugin_status(p: Any) -> str:
+    """Format the status column for one plugin."""
+    if p.status == "loaded":
+        return "loaded"
+    if p.status == "incompatible_abi":
+        # Use the structured error if present; otherwise synthesize.
+        err = p.error or (
+            f"declares CHECK_ABI_VERSION={p.abi_declared}; "
+            f"signet requires {p.abi_required}"
+        )
+        return f"incompatible_abi: {err}"
+    if p.status == "load_error":
+        return f"load_error: {p.error or 'unknown'}"
+    return p.status  # forward-compat for new statuses
+
+
+@main.command()
 @click.argument("entry_id")
 @click.option(
     "--audit-log",
     "audit_log_path",
-    required=True,
+    default=Path("audit.jsonl"),
+    show_default=True,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     envvar="SIGNET_AUDIT_LOG_PATH",
     help="Path to the JSONL audit chain.",
 )
-def replay(entry_id: str, audit_log_path: Path) -> None:
-    """Deprecated alias for `signet audit show`.
+@click.option(
+    "--hmac-secret",
+    envvar="SIGNET_HMAC_SECRET",
+    default=None,
+    help="HMAC secret as hex. When provided, the entry's HMAC is "
+    "verified against this key and the hmac line is annotated as "
+    "``(verified against ring <key-id>)``. Without it, the hmac is "
+    "rendered unverified.",
+)
+@click.option(
+    "--key-id",
+    "key_id",
+    default="k1",
+    show_default=True,
+    envvar="SIGNET_HMAC_KEY_ID",
+    help="ID of the active key to verify against when --hmac-secret "
+    "is provided.",
+)
+def replay(
+    entry_id: str,
+    audit_log_path: Path,
+    hmac_secret: str | None,
+    key_id: str,
+) -> None:
+    """Pretty-print the audit row for ENTRY_ID.
 
-    Original name was misleading — this command does NOT re-execute
-    the pipeline (that needs request-body archival, roadmap for v0.2).
-    Use `signet audit show <entry-id>` instead. The `replay` alias
-    will be removed in v0.2.
+    First-class incident-response surface. Hand it the
+    ``correlation_id`` from a 403/202 refusal body and it prints the
+    full audit row with field labels aligned. With
+    ``SIGNET_HMAC_SECRET`` (or ``--hmac-secret``) configured, the hmac
+    line is verified against the active key and annotated.
+
+    Equivalent to ``signet audit show <id>`` (which remains as the
+    canonical alias). Exit 0 if found, 1 if not.
     """
-    click.secho(
-        "warning: `signet replay` is deprecated; use `signet audit show` instead.",
-        err=True,
-        fg="yellow",
+    _replay_pretty_print(
+        entry_id=entry_id,
+        audit_log_path=audit_log_path,
+        hmac_secret=hmac_secret,
+        key_id=key_id,
     )
-    _show_entry(entry_id, audit_log_path)
 
 
 def _show_entry(entry_id: str, audit_log_path: Path) -> None:
@@ -828,6 +1692,103 @@ def _show_entry(entry_id: str, audit_log_path: Path) -> None:
             return
     click.secho(f"no entry with id {entry_id!r} found in {audit_log_path}", fg="red")
     sys.exit(1)
+
+
+def _replay_pretty_print(
+    *,
+    entry_id: str,
+    audit_log_path: Path,
+    hmac_secret: str | None,
+    key_id: str,
+) -> None:
+    """Look up ENTRY_ID in ``audit_log_path`` and pretty-print it.
+
+    Output format mirrors the ``signet replay`` example in the v0.1.6
+    docs: aligned ``label: value`` rows, ISO timestamps, indented
+    metadata block, and an optional ``(verified against ring k1)``
+    annotation on the hmac line when ``hmac_secret`` is supplied and
+    the recomputed HMAC matches.
+    """
+    import hashlib
+    import hmac as _hmac
+
+    from signet.audit.backend import JsonlBackend
+    from signet.audit.chain import KEY_ID_FIELD, _serialize_for_signing
+
+    target = entry_id.strip().lower()
+    backend = JsonlBackend(audit_log_path)
+    found = None
+    for entry in backend.iter_entries():
+        if entry.entry_id.lower() == target:
+            found = entry
+            break
+
+    if found is None:
+        click.secho(f"no entry with id {entry_id!r} found in {audit_log_path}", fg="red")
+        sys.exit(1)
+
+    ts_iso = _ns_to_iso(found.ts_ns)
+    hmac_full = found.hmac or ""
+    hmac_short = (hmac_full[:8] + "...") if hmac_full else "(none)"
+    hmac_suffix = ""
+    if hmac_secret:
+        secret = _parse_hex_secret(hmac_secret, "--hmac-secret/SIGNET_HMAC_SECRET")
+        entry_key_id = str(found.metadata.get(KEY_ID_FIELD, key_id))
+        try:
+            payload = _serialize_for_signing(found)
+            recomputed = _hmac.new(secret, payload, hashlib.sha256).hexdigest()
+        except Exception as exc:  # pragma: no cover — payload integrity issue
+            hmac_suffix = f"  (verification error: {type(exc).__name__})"
+        else:
+            if _hmac.compare_digest(recomputed, hmac_full):
+                hmac_suffix = f"  (verified against ring {entry_key_id})"
+            else:
+                hmac_suffix = f"  (FAILED verification against ring {entry_key_id})"
+    else:
+        hmac_suffix = "  (unverified — pass --hmac-secret/SIGNET_HMAC_SECRET to check)"
+
+    # Render aligned label: value rows. Width chosen to line up the
+    # documented fields.
+    rows: list[tuple[str, str]] = [
+        ("entry_id", found.entry_id),
+        ("ts", ts_iso),
+        ("owner", str(found.owner)),
+        # ``_stage`` is the convention used elsewhere (audit count, tail) for
+        # surfacing the pipeline stage out of metadata. Fall back to "-".
+        ("stage", str(found.metadata.get("_stage", "-"))),
+        ("check", found.check_name),
+        ("decision", found.decision.value),
+        ("reason", found.reason),
+    ]
+    label_width = max(len(label) for label, _ in rows) + 1  # ":"
+    for label, value in rows:
+        click.echo(f"{(label + ':').ljust(label_width)}    {value}")
+
+    # Metadata block. Skip the chain-internal fields (key id, anchor
+    # receipt) by default — they're load-bearing for the chain but
+    # noisy for an operator paging through one row. Show them under a
+    # collapsed "_chain" line so power users still see they exist.
+    visible_meta: dict[str, Any] = {}
+    chain_meta_keys: list[str] = []
+    for k, v in found.metadata.items():
+        if k.startswith("_"):
+            chain_meta_keys.append(k)
+        else:
+            visible_meta[k] = v
+
+    click.echo("metadata:".ljust(label_width))
+    if not visible_meta and not chain_meta_keys:
+        click.echo("    (none)")
+    else:
+        # Inner alignment for the metadata sub-rows.
+        meta_label_w = max((len(k) for k in visible_meta), default=0) + 1
+        for k, v in visible_meta.items():
+            click.echo(f"  {(k + ':').ljust(meta_label_w)}  {v}")
+        if chain_meta_keys:
+            click.echo(f"  (chain-internal: {', '.join(sorted(chain_meta_keys))})")
+
+    click.echo(f"{('hmac:').ljust(label_width)}    {hmac_short}{hmac_suffix}")
+    sys.exit(0)
 
 
 @main.command()
@@ -953,9 +1914,7 @@ def _lint_pipeline(config_path: Path) -> list[_LintFinding]:
     # possible so renames or re-exports don't fool us.
     from signet.checks.classification_gate import ClassificationGateCheck
     from signet.checks.owner_resolution import OwnerResolutionCheck
-    from signet.checks.prompt_injection import PromptInjectionCheck
     from signet.checks.rate_limit import RateLimitCheck
-    from signet.checks.regex_content import RegexContentCheck
     from signet.checks.scope_drift import ScopeDriftCheck
     from signet.checks.tool_call_inspector import ToolCallInspectorCheck
     from signet.core.stage import Stage
@@ -985,32 +1944,38 @@ def _lint_pipeline(config_path: Path) -> list[_LintFinding]:
             )
         )
 
-    # Rule 1: RateLimit ordered before content-scanning ADMISSION checks.
-    # By v0.1.5, RateLimitCheck.priority=100 self-orders late, so this
-    # only fires when a custom subclass overrides priority back to <=
-    # the default of a content check.
-    content_check_classes = (RegexContentCheck, PromptInjectionCheck)
-    rl_indexes = [i for i, c in enumerate(checks_by_index) if isinstance(c, RateLimitCheck)]
-    content_indexes = [
-        i for i, c in enumerate(checks_by_index) if isinstance(c, content_check_classes)
-    ]
-    for rl_i in rl_indexes:
-        misordered = [ci for ci in content_indexes if ci > rl_i]
-        if misordered:
+    # Rule 1 (SIG001 — v0.1.6 repurpose):
+    # The original v0.1.4 SIG001 fired on declared-position misordering of
+    # RateLimitCheck before content checks. v0.1.5 made that moot: the
+    # check's class-level ``priority=100`` self-orders it last within
+    # ADMISSION regardless of registration order. The remaining footgun
+    # is operators who construct ``RateLimitCheck`` with an explicit
+    # ``priority`` override below 100, which re-creates the original
+    # drain-on-refused-request behavior.
+    #
+    # CHANGELOG: SIG001 was repurposed in v0.1.6. Its original
+    # registration-order check was retired alongside the v0.1.5 priority
+    # default. The rule now fires on explicit priority<100 overrides.
+    for c in checks_by_index:
+        if not isinstance(c, RateLimitCheck):
+            continue
+        # The class default is 100. ``c.priority`` may be a class attr
+        # or an instance attr depending on whether the operator
+        # subclassed and overrode it. Compare to 100 directly.
+        rl_priority = getattr(c, "priority", 100)
+        if isinstance(rl_priority, int) and rl_priority < 100:
             findings.append(
                 _LintFinding(
                     code="SIG001",
                     severity="warning",
                     message=(
-                        "RateLimitCheck runs before content-scanning checks "
-                        f"(positions: rate_limit at {rl_i}, content at "
-                        f"{misordered}). Refused requests still drain the "
-                        "owner's token bucket."
+                        f"RateLimitCheck has priority={rl_priority}; values < 100 "
+                        "recreate the v0.1.4 footgun where rate limits drain "
+                        "on downstream-blocked requests."
                     ),
                     hint=(
-                        "Either accept the default RateLimitCheck.priority=100 "
-                        "(don't subclass to override), or set the content "
-                        "check's priority lower than rate_limit's."
+                        "Remove the priority override unless you specifically "
+                        "need rate limiting before content checks."
                     ),
                 )
             )

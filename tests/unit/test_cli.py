@@ -170,7 +170,14 @@ class TestAuditShowAlias:
         assert appended.entry_id in result.output
         assert "alice" in result.output
 
-    def test_replay_still_works_with_deprecation_warning(self, tmp_path: Path) -> None:
+    def test_replay_promoted_to_first_class_no_deprecation_warning(
+        self, tmp_path: Path
+    ) -> None:
+        """v0.1.6 F2 promoted ``signet replay`` to first-class. The old
+        v0.1.0 deprecation warning has been retired; the command is now
+        the recommended UX. ``signet audit show`` continues to work as
+        the canonical alias.
+        """
         log_path = tmp_path / "audit.jsonl"
         secret = b"x" * 32
         keyring = KeyRing(active=Key(key_id="k1", secret=secret))
@@ -186,10 +193,10 @@ class TestAuditShowAlias:
         runner = CliRunner()
         result = runner.invoke(main, ["replay", appended.entry_id, "--audit-log", str(log_path)])
         assert result.exit_code == 0, result.output
-        # Output should still print the entry...
+        # Output prints the entry pretty-formatted and does NOT emit
+        # the v0.1.0 deprecation warning anymore.
         assert appended.entry_id in result.output
-        # ...and include the deprecation warning
-        assert "deprecated" in result.output.lower()
+        assert "deprecated" not in result.output.lower()
 
 
 class TestKeysGenerateEd25519:
@@ -513,3 +520,628 @@ class TestReplay:
         )
         assert result.exit_code == 1
         assert "no entry with id" in result.output
+
+
+class TestReplayFirstClass:
+    """v0.1.6 F2: signet replay <id> is the operator's primary
+    incident-response surface. Pretty-prints the audit row with field
+    labels aligned, optionally verifies the HMAC against the active
+    key.
+    """
+
+    def _build_log_with_entries(self, log_path: Path, secret: bytes) -> list[AuditEntry]:
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        appended = []
+        for name, owner_principal in (
+            ("owner_resolution", "alice"),
+            ("rate_limit", "bob"),
+            ("prompt_injection", "carol"),
+        ):
+            appended.append(
+                chain.append(
+                    AuditEntry(
+                        owner=Owner.human(owner_principal),
+                        check_name=name,
+                        decision=Decision.ALLOW,
+                        reason="ok",
+                    )
+                )
+            )
+        return appended
+
+    def test_replay_pretty_prints_each_entry(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        entries = self._build_log_with_entries(log_path, secret)
+
+        runner = CliRunner()
+        for entry in entries:
+            result = runner.invoke(
+                main,
+                ["replay", entry.entry_id, "--audit-log", str(log_path)],
+            )
+            assert result.exit_code == 0, result.output
+            assert entry.entry_id in result.output
+            assert "entry_id:" in result.output
+            assert "decision:" in result.output
+            assert "hmac:" in result.output
+            assert entry.check_name in result.output
+
+    def test_replay_id_not_found_exits_1(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        log_path.touch()
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["replay", "00000000-0000-0000-0000-000000000000", "--audit-log", str(log_path)],
+        )
+        assert result.exit_code == 1
+        assert "no entry with id" in result.output
+
+    def test_replay_audit_log_flag_overrides_default(self, tmp_path: Path) -> None:
+        # Default --audit-log is ``./audit.jsonl``; here we pass a
+        # file in a different directory and confirm it's used.
+        custom = tmp_path / "elsewhere.jsonl"
+        secret = b"x" * 32
+        entries = self._build_log_with_entries(custom, secret)
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["replay", entries[0].entry_id, "--audit-log", str(custom)],
+        )
+        assert result.exit_code == 0, result.output
+
+    def test_replay_with_hmac_secret_marks_verified(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        entries = self._build_log_with_entries(log_path, secret)
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "replay",
+                entries[0].entry_id,
+                "--audit-log",
+                str(log_path),
+                "--hmac-secret",
+                secret.hex(),
+                "--key-id",
+                "k1",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "verified against ring k1" in result.output
+
+
+class TestLintSIG001:
+    """v0.1.6 F6: SIG001 was repurposed. It now fires when
+    RateLimitCheck is constructed with an explicit priority < 100.
+    Default priority (100) does NOT fire.
+    """
+
+    _PIPELINE_DEFAULT_PRIORITY = """
+from signet.checks import (OwnerResolutionCheck, RateLimitCheck,
+    ScopeDriftCheck, ClassificationGateCheck)
+from signet.core.pipeline import Pipeline
+pipeline = Pipeline(checks=[
+    OwnerResolutionCheck(require_owner=True),
+    ClassificationGateCheck(),
+    RateLimitCheck(capacity=60, refill_per_second=1.0),
+    ScopeDriftCheck(),
+])
+"""
+
+    _PIPELINE_PRIORITY_OVERRIDE = """
+from signet.checks import (OwnerResolutionCheck, RateLimitCheck,
+    ScopeDriftCheck, ClassificationGateCheck)
+from signet.core.pipeline import Pipeline
+
+
+class EarlyRateLimitCheck(RateLimitCheck):
+    priority = 10  # explicit override, < 100, the v0.1.4 footgun
+
+
+pipeline = Pipeline(checks=[
+    OwnerResolutionCheck(require_owner=True),
+    ClassificationGateCheck(),
+    EarlyRateLimitCheck(capacity=60, refill_per_second=1.0),
+    ScopeDriftCheck(),
+])
+"""
+
+    def test_sig001_does_not_fire_with_default_priority(self, tmp_path: Path) -> None:
+        path = tmp_path / "pipeline.py"
+        path.write_text(self._PIPELINE_DEFAULT_PRIORITY, encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(main, ["lint", str(path)])
+        assert result.exit_code == 0, result.output
+        assert "SIG001" not in result.output
+
+    def test_sig001_fires_on_explicit_priority_override(self, tmp_path: Path) -> None:
+        path = tmp_path / "pipeline.py"
+        path.write_text(self._PIPELINE_PRIORITY_OVERRIDE, encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(main, ["lint", str(path)])
+        # Severity is warning -> exit 0 without --strict, but the
+        # finding text is rendered.
+        assert "SIG001" in result.output
+        assert "priority=10" in result.output
+
+
+class TestProbeInjection:
+    """v0.1.6 N1: ``signet doctor --probe-injection`` ships with a
+    static obfuscated-injection corpus. We don't run a full integration
+    here (would require booting a real signet proxy); we test the
+    observable contract: corpus content + missing-target error.
+    """
+
+    def test_corpus_loadable_and_documented(self) -> None:
+        from signet.cli_helpers.probe_injection_corpus import (
+            PROMPT_INJECTION_PROBE_CORPUS,
+        )
+
+        names = {p.name for p in PROMPT_INJECTION_PROBE_CORPUS}
+        # Every documented probe class must be present.
+        assert "plain_ignore_previous" in names
+        assert "cyrillic_confusable" in names
+        assert "stretched_whitespace" in names
+        assert "zero_width_inserts" in names
+        assert "base64_encoded" in names
+        assert "rot13_encoded" in names
+        assert "base32_encoded" in names
+        assert "hex_encoded" in names
+        assert "dan_persona_attack" in names
+        # Every probe carries the documented metadata fields with
+        # plausible values.
+        for p in PROMPT_INJECTION_PROBE_CORPUS:
+            assert p.payload.strip()
+            assert p.expected_match_source
+            assert p.severity == "high"
+
+    def test_probe_injection_without_self_errors(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(main, ["doctor", "--probe-injection"])
+        # Without --self the command refuses with a useful message.
+        assert result.exit_code == 1
+        assert "--self" in result.output
+        assert "probe-injection" in result.output
+
+
+class TestPluginsList:
+    """v0.1.6 A1: ``signet plugins list`` enumerates entry points and
+    reports load status.
+    """
+
+    def _stub_plugins(self):
+        from signet.plugins.discovery import DiscoveredPlugin
+
+        return [
+            DiscoveredPlugin(
+                group="signet.checks",
+                name="geopolitical_compliance",
+                package="thornveil-extras",
+                package_version="0.2.1",
+                target="thornveil_extras.geo:GeoCheck",
+                status="loaded",
+                abi_declared=1,
+                abi_required=1,
+                error=None,
+                obj=object,
+            ),
+            DiscoveredPlugin(
+                group="signet.checks",
+                name="future_thing",
+                package="future-pkg",
+                package_version="0.0.1",
+                target="future_pkg.thing:FutureCheck",
+                status="incompatible_abi",
+                abi_declared=99,
+                abi_required=1,
+                error="declares CHECK_ABI_VERSION=99; signet requires 1",
+                obj=None,
+            ),
+            DiscoveredPlugin(
+                group="signet.adapters",
+                name="openai_pinned",
+                package="signet-extras",
+                package_version="0.5.0",
+                target="signet_extras.adapters:OpenAIPinnedAdapter",
+                status="loaded",
+                abi_declared=None,
+                abi_required=1,
+                error=None,
+                obj=object,
+            ),
+        ]
+
+    def test_plugins_list_text_output(self, monkeypatch) -> None:
+        plugins = self._stub_plugins()
+        # Patch the symbol the CLI imports lazily inside plugins_list.
+        import signet.plugins as signet_plugins
+
+        monkeypatch.setattr(
+            signet_plugins, "discover_plugins", lambda *, refresh=False: plugins
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["plugins", "list"])
+        assert result.exit_code == 0, result.output
+        # Section headers + plugin names visible.
+        assert "INSTALLED CHECKS (2)" in result.output
+        assert "INSTALLED ADAPTERS (1)" in result.output
+        assert "INSTALLED ANCHORS (0)" in result.output
+        assert "geopolitical_compliance" in result.output
+        assert "future_thing" in result.output
+        assert "openai_pinned" in result.output
+        assert "incompatible_abi" in result.output
+
+    def test_plugins_list_json_output(self, monkeypatch) -> None:
+        import json
+
+        plugins = self._stub_plugins()
+        import signet.plugins as signet_plugins
+
+        monkeypatch.setattr(
+            signet_plugins, "discover_plugins", lambda *, refresh=False: plugins
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["plugins", "list", "--json"])
+        assert result.exit_code == 0, result.output
+        parsed = json.loads(result.output)
+        assert isinstance(parsed, list)
+        assert len(parsed) == 3
+        names = {row["name"] for row in parsed}
+        assert names == {"geopolitical_compliance", "future_thing", "openai_pinned"}
+
+    def test_plugins_list_group_filter(self, monkeypatch) -> None:
+        plugins = self._stub_plugins()
+        import signet.plugins as signet_plugins
+
+        monkeypatch.setattr(
+            signet_plugins, "discover_plugins", lambda *, refresh=False: plugins
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ["plugins", "list", "--group", "signet.checks"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "INSTALLED CHECKS (2)" in result.output
+        # Adapters should be filtered out -- we did not pass --group all.
+        assert "INSTALLED ADAPTERS" not in result.output
+        assert "openai_pinned" not in result.output
+
+
+class TestAuditCompact:
+    """v0.1.6 A2: ``signet audit compact`` Merkle-archives a prefix of
+    the chain. Tests cover quiesce-confirm refusal, the no-op path, and
+    a successful round-trip that verifies cleanly with
+    ``--including-archives``.
+    """
+
+    def _build_chain_with_entries(self, log_path: Path, secret: bytes, n: int):
+        from datetime import UTC, datetime
+
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        # Stagger ts_ns so the cutoff can split them deterministically.
+        # We do it via direct AuditEntry construction.
+        appended: list[AuditEntry] = []
+        base_ts = int(datetime(2026, 1, 1, tzinfo=UTC).timestamp() * 1e9)
+        for i in range(n):
+            entry = AuditEntry(
+                owner=Owner.human(f"u{i}"),
+                check_name="owner_resolution",
+                decision=Decision.ALLOW,
+                reason="ok",
+                ts_ns=base_ts + i * 1_000_000_000,  # 1s apart
+            )
+            appended.append(chain.append(entry))
+        return appended
+
+    def test_compact_refuses_without_quiesce_confirm(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_chain_with_entries(log_path, secret, 3)
+        archive = tmp_path / "archive.bin"
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "compact",
+                "--audit-log",
+                str(log_path),
+                "--before",
+                "2030-01-01T00:00:00Z",
+                "--output",
+                str(archive),
+                "--hmac-secret",
+                secret.hex(),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "--quiesce-confirm" in result.output
+        # Archive must NOT have been written.
+        assert not archive.exists()
+
+    def test_compact_no_op_when_nothing_eligible(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_chain_with_entries(log_path, secret, 3)
+        archive = tmp_path / "archive.bin"
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "compact",
+                "--audit-log",
+                str(log_path),
+                "--before",
+                "2000-01-01T00:00:00Z",  # earlier than every entry
+                "--output",
+                str(archive),
+                "--hmac-secret",
+                secret.hex(),
+                "--quiesce-confirm",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "no-op" in result.output
+        # No archive written on the no-op path.
+        assert not archive.exists()
+
+    def test_compact_round_trip_verifies(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        entries = self._build_chain_with_entries(log_path, secret, 5)
+        # Cutoff between entry 2 and entry 3.
+        from datetime import UTC, datetime
+
+        cutoff_ts_ns = entries[3].ts_ns
+        cutoff_dt = datetime.fromtimestamp(cutoff_ts_ns / 1e9, tz=UTC)
+        cutoff_iso = cutoff_dt.isoformat().replace("+00:00", "Z")
+
+        archive = tmp_path / "archive.bin"
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "compact",
+                "--audit-log",
+                str(log_path),
+                "--before",
+                cutoff_iso,
+                "--output",
+                str(archive),
+                "--hmac-secret",
+                secret.hex(),
+                "--quiesce-confirm",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "compaction complete" in result.output
+        assert archive.exists()
+
+        # ``audit verify --including-archives`` must succeed.
+        verify = runner.invoke(
+            main,
+            [
+                "audit",
+                "verify",
+                str(log_path),
+                "--hmac-secret",
+                secret.hex(),
+                "--including-archives",
+                str(archive.parent),
+            ],
+        )
+        assert verify.exit_code == 0, verify.output
+        assert "OK:" in verify.output
+
+    def test_verify_including_archives_detects_tampered_archive(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        entries = self._build_chain_with_entries(log_path, secret, 5)
+        from datetime import UTC, datetime
+
+        cutoff_ts_ns = entries[3].ts_ns
+        cutoff_iso = (
+            datetime.fromtimestamp(cutoff_ts_ns / 1e9, tz=UTC)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+        archive = tmp_path / "archive.bin"
+        runner = CliRunner()
+        compact = runner.invoke(
+            main,
+            [
+                "audit",
+                "compact",
+                "--audit-log",
+                str(log_path),
+                "--before",
+                cutoff_iso,
+                "--output",
+                str(archive),
+                "--hmac-secret",
+                secret.hex(),
+                "--quiesce-confirm",
+            ],
+        )
+        assert compact.exit_code == 0, compact.output
+
+        # Tamper: corrupt the Merkle blob's stored root region. The
+        # archive layout puts the Merkle tree's serialized form between
+        # ``MERKLE-START\n`` and ``\nMERKLE-END\n``; the last bytes
+        # before ``MERKLE-END`` are the hex-encoded root. Flipping one
+        # of those bytes makes ``MerkleTree.deserialize`` fail with
+        # "stored root does not match recomputed root", which the
+        # verifier surfaces as ARCHIVE_FORMAT_INVALID.
+        raw = archive.read_bytes()
+        tampered = bytearray(raw)
+        end = raw.find(b"\nMERKLE-END\n")
+        assert end != -1
+        # Flip a byte two positions before MERKLE-END -- comfortably
+        # inside the stored hex root.
+        tampered[end - 2] ^= 0x01
+        archive.write_bytes(bytes(tampered))
+
+        verify = runner.invoke(
+            main,
+            [
+                "audit",
+                "verify",
+                str(log_path),
+                "--hmac-secret",
+                secret.hex(),
+                "--including-archives",
+                str(archive.parent),
+            ],
+        )
+        # A tampered archive must trigger a non-zero exit. The exact
+        # break kind depends on which byte we hit (ARCHIVE_FORMAT_INVALID
+        # or MERKLE_MISMATCH), but the operator-facing signal is the
+        # same: non-zero exit + "BROKEN" in the output.
+        assert verify.exit_code == 2, verify.output
+        assert "BROKEN" in verify.output
+
+
+class TestAuditReport:
+    """v0.1.6 A4: ``signet audit report`` rolls a window of audit
+    entries up into the operator-facing summary.
+    """
+
+    def _build_mixed_chain(self, log_path: Path, secret: bytes) -> None:
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        # Mix decisions and checks. Most entries are recent; a couple
+        # in the prior window to exercise the deltas section.
+        import time
+
+        now_ns = time.time_ns()
+        layouts = [
+            (Owner.human("alice"), "owner_resolution", Decision.ALLOW, "ok", now_ns - 5 * 60 * 1_000_000_000),
+            (Owner.human("bob"), "rate_limit", Decision.ALLOW, "ok", now_ns - 4 * 60 * 1_000_000_000),
+            (Owner.human("alice"), "prompt_injection", Decision.BLOCK, "blocked", now_ns - 3 * 60 * 1_000_000_000),
+            (Owner.human("alice"), "prompt_injection", Decision.BLOCK, "blocked", now_ns - 2 * 60 * 1_000_000_000),
+            (Owner.human("eve"), "tool_call_inspector", Decision.ESCALATE, "escalate", now_ns - 1 * 60 * 1_000_000_000),
+        ]
+        for owner, check, decision, reason, ts in layouts:
+            chain.append(
+                AuditEntry(
+                    owner=owner,
+                    check_name=check,
+                    decision=decision,
+                    reason=reason,
+                    ts_ns=ts,
+                )
+            )
+
+    def test_report_markdown_contains_expected_sections(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_mixed_chain(log_path, secret)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "report",
+                "--audit-log",
+                str(log_path),
+                "--since",
+                "1h",
+                "--anonymize-salt",
+                "test-salt",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "# signet audit report" in result.output
+        assert "## Decision distribution" in result.output
+        assert "## Top firing checks" in result.output
+        assert "Total decisions" in result.output
+        # block decisions exist -> top firing checks must list
+        # prompt_injection.
+        assert "prompt_injection" in result.output
+
+    def test_report_json_format_parses(self, tmp_path: Path) -> None:
+        import json
+
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_mixed_chain(log_path, secret)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "report",
+                "--audit-log",
+                str(log_path),
+                "--since",
+                "1h",
+                "--format",
+                "json",
+                "--anonymize-salt",
+                "test-salt",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        parsed = json.loads(result.output)
+        assert "range" in parsed
+        assert "decision_counts" in parsed
+        assert "top_checks" in parsed
+        assert parsed["total_decisions"] >= 1
+
+    def test_report_no_anonymize_shows_raw_owner_ids(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_mixed_chain(log_path, secret)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "report",
+                "--audit-log",
+                str(log_path),
+                "--since",
+                "1h",
+                "--no-anonymize",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        # ``alice`` had two block decisions in the window, so the raw
+        # owner string must appear in the top-blocked-owners section.
+        assert "human:alice" in result.output
+
+    def test_report_anonymize_requires_salt(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_mixed_chain(log_path, secret)
+
+        runner = CliRunner()
+        # Use isolated_filesystem to ensure no SIGNET_ANONYMIZE_SALT in env
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "report",
+                "--audit-log",
+                str(log_path),
+                "--since",
+                "1h",
+            ],
+            env={"SIGNET_ANONYMIZE_SALT": ""},
+        )
+        assert result.exit_code != 0
+        assert "anonymize-salt" in result.output.lower()
