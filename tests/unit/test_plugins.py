@@ -21,7 +21,14 @@ import pytest
 
 from signet.core.context import RequestContext, ResponseContext, ToolCallContext
 from signet.core.owner import Owner
-from signet.plugins import discover, load_by_name, reset_cache
+from signet.plugins import (
+    DiscoveredPlugin,
+    discover,
+    discover_plugins,
+    load_by_name,
+    reset_cache,
+    resolve,
+)
 from signet.plugins.sandbox import (
     SandboxPreviewCheck,
     SandboxResult,
@@ -55,6 +62,124 @@ class TestDiscovery:
         reset_cache()
         with pytest.raises(KeyError, match="no signet plugin named"):
             load_by_name("definitely-not-installed-7e3a8c")
+
+    def test_discover_plugins_returns_structured_result(self) -> None:
+        # Without plugins installed, returns []. With them, every entry
+        # carries the documented fields. We only assert structure here —
+        # content is environment-dependent.
+        reset_cache()
+        result = discover_plugins(refresh=True)
+        assert isinstance(result, list)
+        for entry in result:
+            assert isinstance(entry, DiscoveredPlugin)
+            assert entry.group in {
+                "signet.checks",
+                "signet.adapters",
+                "signet.anchors",
+            }
+            assert isinstance(entry.name, str) and entry.name
+            assert isinstance(entry.package, str)
+            assert isinstance(entry.package_version, str)
+            assert isinstance(entry.target, str) and ":" in entry.target
+            assert entry.status in {"loaded", "incompatible_abi", "load_error"}
+            assert isinstance(entry.abi_required, int)
+            if entry.status == "loaded":
+                assert entry.error is None
+                assert entry.obj is not None
+            else:
+                assert entry.error  # non-empty error text on failure
+                assert entry.obj is None
+
+    def test_check_abi_version_constant(self) -> None:
+        from signet.core.check import CHECK_ABI_VERSION, Check
+
+        assert CHECK_ABI_VERSION == 1
+        assert Check.CHECK_ABI_VERSION == 1
+
+    def test_resolve_unknown_plugin_raises(self) -> None:
+        reset_cache()
+        with pytest.raises(KeyError, match="no signet plugin named"):
+            resolve("nonexistent-plugin-9f7c1a")
+
+    def test_resolve_returns_check_class(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from signet.core.check import CHECK_ABI_VERSION, Check
+        from signet.core.stage import Stage
+        from signet.plugins import discovery as discovery_mod
+
+        class _StubCheck(Check):
+            name = "stub_resolve_check"
+            stage = Stage.ADMISSION
+
+        stub = DiscoveredPlugin(
+            group="signet.checks",
+            name="stub_resolve_check",
+            package="stub-pkg",
+            package_version="0.0.1",
+            target="tests.fake:_StubCheck",
+            status="loaded",
+            abi_declared=CHECK_ABI_VERSION,
+            abi_required=CHECK_ABI_VERSION,
+            error=None,
+            obj=_StubCheck,
+        )
+
+        def fake_discover_plugins(*, refresh: bool = False) -> list[DiscoveredPlugin]:
+            return [stub]
+
+        monkeypatch.setattr(discovery_mod, "discover_plugins", fake_discover_plugins)
+        # resolve() lives in signet.plugins and imports discover_plugins
+        # from discovery; patch the import site too.
+        import signet.plugins as plugins_pkg
+
+        monkeypatch.setattr(plugins_pkg, "discover_plugins", fake_discover_plugins)
+
+        cls = resolve("stub_resolve_check")
+        assert cls is _StubCheck
+
+    def test_incompatible_abi_marked_as_unloaded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from signet.core.check import CHECK_ABI_VERSION, Check
+        from signet.core.stage import Stage
+
+        class _FutureCheck(Check):
+            name = "future_check"
+            stage = Stage.ADMISSION
+            CHECK_ABI_VERSION = 99
+
+        stub = DiscoveredPlugin(
+            group="signet.checks",
+            name="future_check",
+            package="future-pkg",
+            package_version="0.0.1",
+            target="tests.fake:_FutureCheck",
+            status="incompatible_abi",
+            abi_declared=99,
+            abi_required=CHECK_ABI_VERSION,
+            error=(
+                f"plugin 'future_check' declares CHECK_ABI_VERSION=99; "
+                f"signet requires {CHECK_ABI_VERSION}"
+            ),
+            obj=None,
+        )
+
+        def fake_discover_plugins(*, refresh: bool = False) -> list[DiscoveredPlugin]:
+            return [stub]
+
+        import signet.plugins as plugins_pkg
+        from signet.plugins import discovery as discovery_mod
+
+        monkeypatch.setattr(discovery_mod, "discover_plugins", fake_discover_plugins)
+        monkeypatch.setattr(plugins_pkg, "discover_plugins", fake_discover_plugins)
+
+        # Status is reported as incompatible_abi, not loaded.
+        plugins = plugins_pkg.discover_plugins()
+        assert plugins[0].status == "incompatible_abi"
+        assert plugins[0].abi_declared == 99
+
+        # And resolve() refuses with a RuntimeError naming the mismatch.
+        with pytest.raises(RuntimeError, match="incompatible_abi"):
+            resolve("future_check")
 
 
 class TestTribunalConstruction:

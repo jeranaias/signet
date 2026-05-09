@@ -20,9 +20,16 @@ signet then enumerates every entry under that group at startup
 
 This package provides:
 
-* :func:`signet.plugins.discover` — list every check class registered
-  under ``signet.checks``.
-* :func:`signet.plugins.load_by_name` — fetch one by entry-point name.
+* :func:`signet.plugins.discover_plugins` — structured discovery
+  report covering ``signet.checks``, ``signet.adapters`` and
+  ``signet.anchors``, including load failures and ABI mismatches.
+* :func:`signet.plugins.discover` — back-compat dict of loaded
+  ``signet.checks`` plugins (name → class).
+* :func:`signet.plugins.load_by_name` — fetch one Check class by
+  entry-point name (raises ``KeyError`` if unknown).
+* :func:`signet.plugins.resolve` — like :func:`load_by_name` but also
+  surfaces ``RuntimeError`` for plugins that failed to load or
+  declared an incompatible ABI.
 * :class:`signet.plugins.tribunal.TribunalCheck` — reference dual-judge
   dissent check (caller supplies judge endpoint URLs).
 * :class:`signet.plugins.sandbox.SandboxPreviewCheck` — reference
@@ -35,9 +42,15 @@ Pyros engine, not in this OSS release.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from signet.plugins.discovery import (
     ENTRY_POINT_GROUP,
+    ENTRY_POINT_GROUPS,
+    DiscoveredPlugin,
+    PluginStatus,
     discover,
+    discover_plugins,
     load_by_name,
     reset_cache,
 )
@@ -49,14 +62,65 @@ from signet.plugins.sandbox import (
 )
 from signet.plugins.tribunal import TribunalCheck
 
+if TYPE_CHECKING:
+    from signet.core.check import Check
+
+
+def resolve(name: str, *, group: str = "signet.checks") -> type[Check]:
+    """Look up a discovered plugin by entry-point name and return its class.
+
+    Args:
+        name: The entry-point name (the key on the left of
+            ``[project.entry-points."signet.checks"]`` in
+            ``pyproject.toml``).
+        group: Which entry-point group to search. Defaults to
+            ``"signet.checks"``.
+
+    Returns:
+        The plugin class.
+
+    Raises:
+        KeyError: When no plugin with that name is registered in
+            ``group``. The message lists the known names so typos
+            surface immediately.
+        RuntimeError: When the plugin was discovered but failed to
+            load or declared an ABI version signet refuses
+            (status ``"load_error"`` or ``"incompatible_abi"``).
+            The original error message is embedded.
+    """
+    plugins = discover_plugins()
+    matches = [p for p in plugins if p.group == group and p.name == name]
+    if not matches:
+        known = sorted({p.name for p in plugins if p.group == group}) or [
+            "(none registered)"
+        ]
+        raise KeyError(
+            f"no signet plugin named {name!r} in group {group!r}; "
+            f"known plugins: {', '.join(known)}"
+        )
+    plugin = matches[0]
+    if plugin.status != "loaded":
+        raise RuntimeError(
+            f"signet plugin {name!r} ({group}) is unavailable "
+            f"[status={plugin.status}]: {plugin.error}"
+        )
+    assert plugin.obj is not None  # status == "loaded" implies obj set
+    return plugin.obj
+
+
 __all__ = [
     "ENTRY_POINT_GROUP",
+    "ENTRY_POINT_GROUPS",
+    "DiscoveredPlugin",
+    "PluginStatus",
     "SandboxPolicy",
     "SandboxPreviewCheck",
     "SandboxResult",
     "SandboxRunner",
     "TribunalCheck",
     "discover",
+    "discover_plugins",
     "load_by_name",
     "reset_cache",
+    "resolve",
 ]

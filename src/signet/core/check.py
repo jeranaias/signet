@@ -39,6 +39,22 @@ if TYPE_CHECKING:
     from signet.core.context import RequestContext, ResponseContext, ToolCallContext
 
 
+CHECK_ABI_VERSION = 1
+"""Plugin ABI version.
+
+Increments when the :class:`Check` lifecycle contract changes in a way
+that breaks third-party plugin classes built against an older signet.
+Plugins MUST declare compatibility by setting their own
+``CHECK_ABI_VERSION`` class attribute and signet refuses to load
+plugins whose declared ABI doesn't match.
+
+History:
+- v0.1.6: introduced as 1 (the contract added Check.priority in v0.1.5
+  but no plugins existed against the pre-priority shape; we anchor
+  ABI 1 to the v0.1.6 baseline going forward).
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class CheckResult:
     """The outcome of a single check evaluation.
@@ -146,6 +162,11 @@ class Check:
     ``priority=100`` so it runs after content-scanning ADMISSION checks
     and a refused request never costs a token. Set ``priority < 0`` to
     force a check earlier than the default cohort."""
+
+    CHECK_ABI_VERSION: int = CHECK_ABI_VERSION
+    """ABI version this Check subclass was built against. Plugins
+    inherit this default; plugin authors who need to declare
+    compatibility against a newer ABI override at the class level."""
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
