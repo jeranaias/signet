@@ -40,7 +40,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from signet import __version__
@@ -347,6 +347,20 @@ class SignetApp:
         async def embeddings(request: Request) -> Response:
             return await self._handle_embeddings(request)
 
+        # WebSocket pass-through for the OpenAI realtime API. ADMISSION
+        # runs once at connect time. COMMITMENT runs on every function-
+        # call event during the session. RECORD writes session-start +
+        # periodic flush + session-end audit rows. INSPECTION runs on
+        # text chunks; audio frames pass through with metadata-only
+        # audit rows (no transcription in 0.1.6). See
+        # :mod:`signet.server.realtime` and ``docs/realtime.md`` for
+        # the full state machine and wire contract.
+        if self.config.realtime_enabled:
+
+            @self.app.websocket("/v1/realtime")
+            async def realtime_websocket(websocket: WebSocket) -> None:
+                await self._handle_realtime(websocket)
+
         # Explicit refusal for OpenAI endpoints we do NOT yet gate.
         # /v1/audio/* and /v1/images/* are deferred because their
         # request shapes (binary uploads, multi-part forms) don't fit
@@ -540,6 +554,25 @@ class SignetApp:
                     "exception": type(exc).__name__,
                 },
             )
+
+    async def _handle_realtime(self, websocket: WebSocket) -> None:
+        """Drive the OpenAI realtime API WebSocket session.
+
+        The route handler is intentionally a thin shim: the
+        per-connection state machine lives in
+        :class:`signet.server.realtime.RealtimeHandler` so the
+        WebSocket logic does not bloat this module. The handler
+        receives a back-reference to ``self`` so it can reuse the
+        shared helpers (``_record_decision``, ``_stash_shadow_headers``,
+        ``_record_exception``, the pipeline, the keyring) — no
+        parallel implementation, single source of truth on audit row
+        shape and shadow handling.
+        """
+        from signet.server.realtime import RealtimeHandler
+
+        self.metrics.inc("signet_requests_total", {"path": "/v1/realtime"})
+        handler = RealtimeHandler(self, websocket)
+        await handler.run()
 
     async def _handle_embeddings(self, request: Request) -> Response:
         """Embeddings endpoint — non-streaming, no INSPECTION text content.
@@ -738,6 +771,7 @@ class SignetApp:
             client = self._ensure_http()
             completed_normally = False
             inspection_aborted = False
+            upstream_aborted = False
             # Bump in-flight counter so graceful shutdown waits for us.
             # getattr handles the embedded-app case where _lifespan
             # never ran (e.g. mounting SignetApp.app inside a parent
@@ -752,83 +786,141 @@ class SignetApp:
                     json=ctx.body,
                     headers=self._upstream_headers(ctx),
                 ) as upstream:
-                    async for raw_chunk in upstream.aiter_bytes():
-                        rctx.chunk_count += 1
-                        chunk_text = raw_chunk.decode("utf-8", errors="replace")
-                        # extend_text enforces the per-response cap so a
-                        # multi-megabyte stream cannot OOM the proxy.
-                        rctx.extend_text(_extract_sse_content(chunk_text))
+                    # Upstream-status guard: a 5xx (or any non-2xx) means
+                    # the upstream is broken mid-handshake or about to
+                    # ship an error body. Emit a structured abort frame
+                    # so the SDK sees a parseable terminal frame rather
+                    # than an opaque error body or a hung stream. We
+                    # deliberately don't try to forward the upstream's
+                    # error body — different upstreams shape errors
+                    # differently and a half-mixed stream is harder for
+                    # SDKs to handle than a clean signet-abort.
+                    if upstream.status_code >= 400:
+                        upstream_aborted = True
+                        rctx.finish_reason = "upstream_error"
+                        async for frame in self._emit_upstream_error_abort(
+                            ctx,
+                            rctx,
+                            upstream_status=upstream.status_code,
+                            reason_detail=f"upstream returned {upstream.status_code}",
+                        ):
+                            yield frame
+                        return
 
-                        inspection = await self.pipeline.inspect_response_chunk(rctx, chunk_text)
-                        if not inspection.is_allow:
-                            if self.config.shadow:
-                                # Shadow mode: do NOT abort. Record the
-                                # would-have-blocked decision in the
-                                # audit chain (with shadow=True) and let
-                                # the chunk pass through. Streaming
-                                # responses cannot retroactively add
-                                # response headers (they were sent at
-                                # handshake), so the per-block
-                                # X-Signet-Shadow-* headers cannot reach
-                                # the caller for INSPECTION-stage
-                                # decisions; the audit chain remains the
-                                # source of truth and operators correlate
-                                # via the timestamps + request
-                                # fingerprint. The handshake-time header
-                                # ``X-Signet-Shadow-Inspection-Active:
-                                # 1`` tells callers shadow inspection is
-                                # running so they should consult the
-                                # chain for any neutralized decisions.
-                                self._record_decision(
+                    try:
+                        async for raw_chunk in upstream.aiter_bytes():
+                            rctx.chunk_count += 1
+                            chunk_text = raw_chunk.decode("utf-8", errors="replace")
+                            # extend_text enforces the per-response cap so a
+                            # multi-megabyte stream cannot OOM the proxy.
+                            rctx.extend_text(_extract_sse_content(chunk_text))
+
+                            inspection = await self.pipeline.inspect_response_chunk(
+                                rctx, chunk_text
+                            )
+                            if not inspection.is_allow:
+                                if self.config.shadow:
+                                    # Shadow mode: do NOT abort. Record the
+                                    # would-have-blocked decision in the
+                                    # audit chain (with shadow=True) and let
+                                    # the chunk pass through. Streaming
+                                    # responses cannot retroactively add
+                                    # response headers (they were sent at
+                                    # handshake), so the per-block
+                                    # X-Signet-Shadow-* headers cannot reach
+                                    # the caller for INSPECTION-stage
+                                    # decisions; the audit chain remains the
+                                    # source of truth and operators correlate
+                                    # via the timestamps + request
+                                    # fingerprint. The handshake-time header
+                                    # ``X-Signet-Shadow-Inspection-Active:
+                                    # 1`` tells callers shadow inspection is
+                                    # running so they should consult the
+                                    # chain for any neutralized decisions.
+                                    self._record_decision(
+                                        ctx,
+                                        result=inspection,
+                                        check_name="pipeline.inspection",
+                                    )
+                                    ctx.scratch["_shadow_inspection_count"] = (
+                                        ctx.scratch.get("_shadow_inspection_count", 0) + 1
+                                    )
+                                    yield raw_chunk
+                                    continue
+                                # Non-shadow INSPECTION block: do NOT
+                                # forward the offending chunk. Record
+                                # the decision first so we have an
+                                # entry_id to put in correlation_id.
+                                rctx.finish_reason = "abort"
+                                entry = self._record_decision(
                                     ctx,
                                     result=inspection,
                                     check_name="pipeline.inspection",
+                                    metadata={
+                                        # chunks_delivered = how many
+                                        # passed through to the client
+                                        # before this one. The blocking
+                                        # chunk itself is counted in
+                                        # rctx.chunk_count (we bumped
+                                        # before inspecting) but is NOT
+                                        # delivered.
+                                        "chunks_delivered": rctx.chunk_count - 1,
+                                        "chunk_count_at_abort": rctx.chunk_count,
+                                        "abort_stage": "inspection",
+                                    },
                                 )
-                                ctx.scratch["_shadow_inspection_count"] = (
-                                    ctx.scratch.get("_shadow_inspection_count", 0) + 1
-                                )
-                                yield raw_chunk
-                                continue
-                            # Abort the stream with a trailer event.
-                            yield (
-                                b"data: "
-                                + json.dumps(
-                                    {
-                                        "signet_aborted": True,
-                                        "reason": inspection.reason,
-                                        "check": inspection.metadata.get("_check_name"),
-                                    }
-                                ).encode("utf-8")
-                                + b"\n\n"
-                            )
-                            yield b"data: [DONE]\n\n"
-                            rctx.finish_reason = "abort"
-                            self._record_decision(
-                                ctx,
-                                result=inspection,
-                                check_name="pipeline.inspection",
-                            )
-                            inspection_aborted = True
-                            return
+                                for frame in self._build_abort_frames(
+                                    reason=inspection.reason,
+                                    stage="inspection",
+                                    check_name=inspection.metadata.get("_check_name"),
+                                    entry=entry,
+                                ):
+                                    yield frame
+                                inspection_aborted = True
+                                return
 
-                        yield raw_chunk
+                            yield raw_chunk
+                    except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+                        # Upstream tore down the stream or shipped
+                        # malformed bytes after the headers. We have
+                        # already streamed some chunks to the client (or
+                        # at least committed to a 200), so emit an
+                        # abort frame so the SDK sees a clean terminal
+                        # event instead of a hung connection.
+                        upstream_aborted = True
+                        rctx.finish_reason = "upstream_protocol_violation"
+                        async for frame in self._emit_upstream_error_abort(
+                            ctx,
+                            rctx,
+                            upstream_status=upstream.status_code,
+                            reason_detail=(
+                                f"upstream protocol violation: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        ):
+                            yield frame
+                        return
 
                 rctx.finish_reason = rctx.finish_reason or "stop"
                 completed_normally = True
             finally:
-                # Two reasons we land here without completed_normally:
+                # Three reasons we land here without completed_normally:
                 # 1. The caller disconnected mid-stream and the
                 #    StreamingResponse cancelled the generator.
                 # 2. The upstream raised after we already started
                 #    yielding (the outer 502 path is too late —
                 #    bytes were already on the wire).
-                # In both cases we still want exactly one terminal row
+                # 3. The upstream returned a 5xx or shipped malformed
+                #    SSE; we already emitted a structured abort frame
+                #    and recorded the row in
+                #    ``_emit_upstream_error_abort``.
+                # In all cases we still want exactly one terminal row
                 # in the chain so audit consumers can see the request
-                # ended and how. inspection_aborted already wrote its
-                # own row — don't double-count. Avoid `return` in
-                # finally (would swallow in-flight exceptions); guard
-                # the body instead.
-                if not inspection_aborted:
+                # ended and how. inspection_aborted/upstream_aborted
+                # already wrote their own rows — don't double-count.
+                # Avoid `return` in finally (would swallow in-flight
+                # exceptions); guard the body instead.
+                if not inspection_aborted and not upstream_aborted:
                     if not completed_normally:
                         rctx.finish_reason = rctx.finish_reason or "client_disconnect"
                     # Run RECORD checks even on disconnect — they may flag
@@ -886,6 +978,119 @@ class SignetApp:
             media_type="text/event-stream",
             headers=stream_headers,
         )
+
+    def _build_abort_frames(
+        self,
+        *,
+        reason: str,
+        stage: str,
+        check_name: str | None,
+        entry: AuditEntry | None,
+    ) -> list[bytes]:
+        """Build the structured SSE abort-frame pair.
+
+        Wire format (see ``docs/streaming.md``)::
+
+            data: {"signet_abort": true,
+                   "reason": "<reason>",
+                   "correlation_id": "<entry_id>",
+                   "stage": "<stage>",
+                   "check": "<check_name>"}\\n\\n
+            data: [DONE]\\n\\n
+
+        Strict-redaction rule: when
+        ``self.config.strict_error_redaction`` is on, ``reason`` is
+        coarsened to the literal string ``"refused"`` and the ``check``
+        field is omitted entirely — same coarsening
+        :meth:`_refusal` applies to 4xx response bodies. Operators
+        recover the full detail from the audit row via
+        ``correlation_id``. ``correlation_id`` and ``stage`` always
+        survive coarsening because they're structural (incident
+        response can't pivot without them) rather than
+        policy-revealing.
+        """
+        if self.config.strict_error_redaction:
+            payload: dict[str, Any] = {
+                "signet_abort": True,
+                "reason": "refused",
+                "stage": stage,
+            }
+        else:
+            payload = {
+                "signet_abort": True,
+                "reason": reason,
+                "stage": stage,
+            }
+            if check_name:
+                payload["check"] = str(check_name)
+        if entry is not None:
+            payload["correlation_id"] = entry.entry_id
+        else:
+            # Audit chain disabled (no audit_log_path). Surface this so
+            # the SDK can distinguish "no chain" from "chain entry
+            # write failed".
+            payload["correlation_id"] = None
+        return [
+            b"data: " + json.dumps(payload).encode("utf-8") + b"\n\n",
+            b"data: [DONE]\n\n",
+        ]
+
+    async def _emit_upstream_error_abort(
+        self,
+        ctx: RequestContext,
+        rctx: ResponseContext,
+        *,
+        upstream_status: int,
+        reason_detail: str,
+    ) -> AsyncIterator[bytes]:
+        """Yield the abort-frame pair for an upstream malformation/5xx.
+
+        Records a synthetic audit row tagged with the upstream status
+        and the verbatim error detail, then yields the structured
+        SSE abort frame followed by ``data: [DONE]``. The audit row's
+        ``check_name`` is ``"pipeline.upstream"`` so dashboards can
+        distinguish proxy-side aborts (INSPECTION block) from
+        upstream-failure aborts.
+
+        Frame ``reason`` is the stable token
+        ``"upstream_protocol_violation"`` so SDKs can match against it
+        without parsing the trailing detail string. Detail is logged in
+        the audit row for incident review, not in the wire frame.
+        """
+        # Build a synthetic CheckResult-shape so _record_decision
+        # treats this as a non-allow with stage metadata; we want
+        # signet_pipeline_decisions_total to fire so dashboards see
+        # upstream-induced aborts in the same panel as INSPECTION
+        # blocks.
+        from signet.core.check import CheckResult
+
+        synthetic = CheckResult.block(
+            reason_detail,
+            _check_name="pipeline.upstream",
+            _stage="inspection",
+            upstream_status=upstream_status,
+        )
+        entry = self._record_decision(
+            ctx,
+            result=synthetic,
+            check_name="pipeline.upstream",
+            metadata={
+                "chunks_delivered": rctx.chunk_count,
+                "chunk_count_at_abort": rctx.chunk_count,
+                "abort_stage": "upstream",
+                "upstream_status": upstream_status,
+            },
+        )
+        for frame in self._build_abort_frames(
+            reason="upstream_protocol_violation",
+            stage="inspection",
+            # No firing check — the upstream itself failed. Strict
+            # mode would omit this anyway; verbose-mode SDKs see
+            # check absent rather than misleading.
+            check_name=None,
+            entry=entry,
+        ):
+            yield frame
 
     def _upstream_headers(self, ctx: RequestContext) -> dict[str, str]:
         """Headers to forward to the upstream. Strip signet-only headers."""
