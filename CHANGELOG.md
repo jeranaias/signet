@@ -8,6 +8,196 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.6] — 2026-05-07
+
+### The architectural-stretch release — bug fixes, the marquee feature, plus six P3 items at ship-in-0.1.6 scope
+
+Three release candidates (`v0.1.6-rc1` through `v0.1.6-rc3`) staged
+the work over the sprint window so each chunk got soak time on PyPI
+before the final tag. Final tag includes all of P0, P1, P2, and the
+ship-in-0.1.6 boundary of P3.
+
+### Fixed (P0)
+
+- **B1**: `Owner.create(type="human")` previously did not coerce string
+  inputs to the `OwnerType` enum, leaving `owner.owner_type` as a raw
+  string and breaking downstream `is OwnerType.HUMAN` checks. Now
+  routed through a new `_coerce_owner_type` helper that accepts the
+  enum, lowercase, uppercase, and Title Case strings; invalid strings
+  raise `ValueError` with the list of valid values.
+- **B2**: `KeyRing(keys={"k1": b"x" * 32}, active_id="k1")` previously
+  stored raw bytes instead of `Key` instances, causing
+  `kr.active.key_id` to raise `AttributeError`. The dict-shape
+  constructor now wraps bytes values into `Key` before falling through
+  to the list-handling path.
+- **B3**: New `tests/unit/test_constructor_aliases.py` parametrizes
+  every public constructor over its accepted input forms (24 cases).
+  Both bugs above slipped through 262 unit tests in v0.1.5 because
+  coverage only exercised canonical typed inputs; this test file
+  catches the next alias drift.
+
+### Added (P1 polish)
+
+- **F1 — `--shadow` mode** *(the marketing-leverage feature)*. Run
+  signet in non-enforcing pilot mode: pipeline runs, audit chain
+  records every decision with `metadata.shadow=True`, metrics fire,
+  but block / escalate / redact decisions are neutralized at the
+  response layer. The would-be refusal is surfaced to the caller as
+  response headers (`X-Signet-Shadow-Decision`, `-Reason`, `-Stage`,
+  `-Check`, plus `X-Signet-Correlation-Id`). New
+  `signet_shadow_would_have_blocked_total` Prometheus counter tracks
+  the would-be refusal rate during pilots. `/health` body gains
+  `"shadow": true` when shadow is on. `--shadow` /
+  `SIGNET_SHADOW=1` / `ServerConfig.shadow=True` to enable.
+- **F2 — `signet replay <correlation_id>`** promoted to first-class.
+  Takes the correlation_id from a 403 / 202 response (the only field
+  exposed under strict redaction) and pretty-prints the full audit
+  row, including HMAC verification against the configured key.
+  `signet audit show` continues to work as the canonical alias.
+- **F3 — Case-insensitive header sweep** via a new `get_header_ci`
+  helper in `signet.core.context`. Production traffic from reverse
+  proxies that normalize headers differently (uvicorn lowercases,
+  nginx may preserve case) no longer silently misses lookups. 29 new
+  parametrize cases cover `X-Classification`, `X-Commit-Owner`,
+  `X-Agent-Id`, `X-Policy-Name` across canonical / lowercase /
+  uppercase variants.
+- **F4 — Three-state `audit_chain_head_hmac`** on `/health`:
+  `"disabled"` (no audit configured), `null` (configured but empty),
+  or 8-hex-char tail (has entries). Monitoring can distinguish
+  "alive but no audit" from "alive but chain not yet written to."
+- **F5 — Per-check latency histograms**. New
+  `signet_check_duration_seconds{check, stage, decision}` Prometheus
+  histogram. Pipeline wraps every check hook
+  (`pre_request`, `inspect_response_chunk`, `inspect_tool_call`,
+  `post_complete`) in a `perf_counter` timer. Timeouts map to
+  `decision=block`. Optional dependency: `Pipeline` without metrics
+  observer just skips observation.
+- **F6 — `signet lint` SIG001 repurposed** for explicit
+  `RateLimitCheck.priority` overrides below the default 100. The
+  original SIG001 was made moot by v0.1.5's
+  `RateLimitCheck.priority=100` default; the rule now catches plugin
+  authors / pipeline hand-edits that recreate the v0.1.4 footgun
+  (rate limits draining on downstream-blocked requests).
+
+### Added (P2 nice-to-haves)
+
+- **N1 — `signet doctor --probe-injection`**. New flag on the
+  existing doctor command. Sends a 9-payload corpus of obfuscated
+  injection attempts (cyrillic confusable, stretched whitespace,
+  base64, ROT13, base32, hex, DAN persona, etc.) to `--self` and
+  asserts every one is blocked. Catches "someone mis-edited the rule
+  list" regressions in CI. Corpus lives at
+  `signet.cli_helpers.probe_injection_corpus` for reuse.
+- **N2 — `signet_response_text_truncated_total` counter**. Increments
+  the first time `ResponseContext.accumulated_text_cap` is hit per
+  response. INSPECTION-stage drift checks scanning a prefix instead
+  of the full output is now visible in Prometheus.
+- **N3 — `--upstream-label` round-trip integration test**. Locks in
+  the chain from CLI flag → `ServerConfig.upstream_label` →
+  `X-Signet-Upstream` response header on success, refusal, and
+  escalation paths. `/health`, `/healthz`, `/version`, `/readyz`
+  correctly omit the header.
+- **N4 — Multi-worker rate-limit caveat documented** in
+  `docs/deploying.md`. Default in-process bucket store means
+  `uvicorn --workers N>1` gives effective per-owner rate limit of N×
+  configured. Bundled `RedisRateLimitState` documented as the
+  strict-limit fix.
+
+### Added (P3 architectural stretch — ship-in-0.1.6 boundary)
+
+- **A1 — Plugin entry-point convention + ABI versioning**. Third-
+  party `Check` authors register against
+  `[project.entry-points."signet.checks"]`. New
+  `signet.plugins.discover_plugins()` walks
+  `signet.checks` / `signet.adapters` / `signet.anchors` groups and
+  returns a structured `DiscoveredPlugin` list with status per
+  entry (`loaded`, `incompatible_abi`, `load_error`).
+  `signet.core.check.CHECK_ABI_VERSION = 1` anchors plugin ABI
+  compatibility going forward. New `signet plugins list` CLI
+  surfaces the discovery report. Spec at `docs/plugin-authors.md`.
+  Deferred to 0.1.7: hot-reload, plugin-supplied lint rules,
+  plugin-supplied report formats.
+- **A2 — Audit log compaction with Merkle archival**. JSONL chains
+  grow unboundedly; this adds happy-path compaction that archives
+  old ranges while preserving end-to-end verifiability.
+  `signet audit compact --before <ts> --output <archive>` builds a
+  SHA-256 Merkle tree over the entries, writes a byte-stable archive
+  (header + Merkle tree + gzip JSONL), and replaces the compacted
+  range in the live log with a single HMAC-chained compaction
+  marker. `signet audit verify --including-archives <dir>` walks
+  live log + every referenced archive and reports `MERKLE_MISMATCH`
+  / `ARCHIVE_MISSING` / `ARCHIVE_FORMAT_INVALID` breaks alongside
+  the existing kinds. Spec at `docs/audit-archive-format.md`.
+  Deferred to 0.1.7: concurrent-write safety (chain MUST be
+  quiesced; documented in three places and enforced via
+  `--quiesce-confirm`), partial-compaction recovery,
+  encryption-at-rest, sub-range incremental verification.
+- **A3 — Streaming abort-frame contract**. Drove an SSE stream
+  end-to-end through the proxy for the first time at v0.1.6 RC and
+  the test harness surfaced 5 real bugs in the existing streaming
+  path. All fixed: discriminator key was `signet_aborted` not
+  `signet_abort` (wire spec mismatch), abort frame missed
+  `correlation_id` and `stage`, no strict-redaction coarsening, no
+  audit row for partial state on mid-stream block, malformed
+  upstream / 5xx mid-stream emitted nothing. Now standardized: the
+  abort frame is `{"signet_abort":true,"reason":...,"correlation_id":...,"stage":...,"check":...}`
+  followed by `data: [DONE]`. Strict redaction collapses `reason` to
+  `"refused"` and omits `check`. Spec at `docs/streaming.md`.
+- **A4 — `signet audit report --since <duration>`**. Daily / weekly
+  markdown summary suitable for direct paste into incident review.
+  Aggregates by decision distribution, top firing checks, top
+  blocked owners (anonymized by default via SHA-256 of
+  `salt:owner_id`). Shows deltas vs prior period. Includes audit-
+  chain integrity check + head HMAC tail. `--format json` for
+  programmatic consumers; `--no-anonymize` for authorized roles.
+  Salt comes from `SIGNET_ANONYMIZE_SALT` or `--anonymize-salt`.
+  Deferred to 0.1.7: HTML output with sparklines, time-series export
+  to Prometheus / Datadog, auto-cron emission to Slack / webhooks.
+- **A5 — WebSocket / OpenAI realtime API support**. Pass-through proxy
+  at `/v1/realtime`. ADMISSION runs at handshake, COMMITMENT runs on
+  every function-call event in the session (the highest-risk surface
+  for voice agents — `send_email` / `delete_file` from voice is the
+  same gating problem as from chat), INSPECTION runs on text content
+  events only (audio passes through with audit row tagged
+  `metadata.audio_inspection_skipped=True`), RECORD writes
+  session-start / session-end rows with cumulative session metadata
+  plus periodic 30-second interim flushes so a crash doesn't lose
+  hours of audit data. Refusal events use a structured
+  `signet.refusal` shape that SDK callers can parse. Spec at
+  `docs/realtime.md`. Deferred to 0.1.7+: audio transcription +
+  INSPECTION on transcribed text (needs local Whisper integration
+  design), interruption handling (linear-stream model breaks here),
+  latency-aware check ordering.
+- **A6 — `Owner.approval_chain` surface in COMMITMENT escalation**.
+  When `ToolCallInspectorCheck` escalates an irreversible high-tier
+  tool call, the audit row now carries
+  `requires_approval_from` (full ordered approval chain) and
+  `current_approver` (first link, or `None`) so downstream approval
+  workflows can route without re-deriving them. Spec at
+  `docs/escalation.md`. Deferred to 0.1.7: `signet escalation
+  pending|approve|deny` subcommand suite, multi-step chain walking,
+  webhook config, timeout / auto-deny policy.
+
+### Changed
+
+- `RateLimitCheck` no longer rejects `priority < 100` at construction;
+  `signet lint` SIG001 surfaces it as a warning instead so authors
+  who genuinely need pre-content rate limiting can opt in.
+- The Knowledge of which check fired (the `_check_name` metadata key)
+  on every `CheckResult` continues to flow through the pipeline; the
+  new abort-frame contract surfaces it in shadow / streaming response
+  envelopes alongside the strict-redaction-mode `correlation_id`.
+
+### Tests
+
+- 262 unit tests at v0.1.5 → 418 at v0.1.6. Phase-by-phase: rc1 added
+  parametrize sweep + header case variants + 3-state health + per-
+  check latency histograms + escalation metadata coverage; rc2 added
+  shadow mode (6) + truncation counter (9) + upstream-label round-
+  trip (5); rc3 added plugin discovery (5) + audit compaction (21) +
+  CLI sweep (19); final tag added streaming abort harness (8) +
+  WebSocket realtime (8).
+
 ## [0.1.5] — 2026-05-06
 
 ### Operator-day-one polish — 13 items from the v0.1.4 evaluation pass
