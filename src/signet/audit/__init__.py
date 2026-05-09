@@ -24,4 +24,40 @@ and every entry carries non-repudiable attribution to an :class:`Owner`.
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from signet.audit.compactor import (
+    ARCHIVE_FORMAT_VERSION,
+    COMPACTION_CHECK_NAME,
+    COMPACTION_MARKER_FIELD,
+    ArchiveHeader,
+    CompactionResult,
+    MerkleTree,
+    compact_audit_log,
+    is_compaction_marker,
+    read_archive,
+    trim_before_index,
+)
+from signet.audit.verifier import (
+    BreakKind,
+    ChainBreak,
+    ChainVerifier,
+    VerificationReport,
+    verify_with_archives,
+)
+
+__all__: list[str] = [
+    "ARCHIVE_FORMAT_VERSION",
+    "COMPACTION_CHECK_NAME",
+    "COMPACTION_MARKER_FIELD",
+    "ArchiveHeader",
+    "BreakKind",
+    "ChainBreak",
+    "ChainVerifier",
+    "CompactionResult",
+    "MerkleTree",
+    "VerificationReport",
+    "compact_audit_log",
+    "is_compaction_marker",
+    "read_archive",
+    "trim_before_index",
+    "verify_with_archives",
+]
