@@ -130,6 +130,14 @@ class ServerConfig:
     counter increments. Operators pilot signet in shadow mode against
     production traffic to see what would be blocked before flipping
     enforcement on."""
+    realtime_enabled: bool = True
+    """Whether to register the ``/v1/realtime`` WebSocket route.
+    Defaults to ``True`` — the route is always registered and FastAPI
+    does not pre-allocate handlers, so deployments that never receive
+    realtime traffic incur no cost. Set ``False`` to skip route
+    registration entirely; deployments that want a hard guarantee
+    against an opened WebSocket can flip this off. The HTTP routes
+    are unaffected either way."""
 
     # Forwarded fields the user can tune via env-var: see _ENV_KEYS below.
     extra_forward_headers: tuple[str, ...] = field(
