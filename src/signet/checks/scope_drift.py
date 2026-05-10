@@ -161,6 +161,11 @@ class ScopeDriftCheck(Check):
             re.compile("|".join(escaped), flags) if escaped else re.compile(r"(?!x)x")
         )
 
+    # Scratch keys threaded through ``ResponseContext.scratch`` so the
+    # cumulative-scan path doesn't redo work on every chunk. Per-context
+    # state -- a fresh response gets a fresh scratch dict.
+    _LAST_POS_KEY = "_scope_drift_last_pos"
+
     async def inspect_response_chunk(self, ctx: ResponseContext, chunk: str) -> CheckResult:
         # Token-count drift
         max_tokens = ctx.request.body.get("max_tokens")
@@ -177,35 +182,104 @@ class ScopeDriftCheck(Check):
                     cap=char_cap,
                 )
 
-        # Classification drift
+        # Classification drift.
+        #
+        # S1 (v0.1.7 follow-up): the v0.1.6 / v0.1.7 implementation only
+        # scanned ``ctx.accumulated_text``. ``ResponseContext.extend_text``
+        # enforces a 1 MiB cap to bound proxy memory -- once the cap is
+        # hit, subsequent chunks are dropped from the accumulated buffer.
+        # A leaker that pads with 1 MiB of benign content and then ships
+        # the classification marker in a single late chunk slipped past
+        # the check because that chunk never landed in ``accumulated_text``.
+        #
+        # Fix strategy: prefer the accumulated buffer as the scan
+        # source (so the proxy's SSE-line filter -- ``inspect_all_sse_
+        # lines`` -- still gates what we see, including the v0.1.7 S6
+        # contract that ``event:`` / ``id:`` lines are out of scope by
+        # default). When the cap is saturated -- ``accumulated_text_
+        # truncated=True`` AND the buffer didn't grow on this call --
+        # the chunk parameter is the only signal, so we scan it
+        # directly. The cap is meant to bound memory, not enforcement.
+        #
+        # De-dup: scan only the new portion of ``accumulated_text`` past
+        # ``ctx.scratch[_LAST_POS_KEY]``, with an overlap of
+        # ``longest_marker - 1`` chars so a marker straddling the
+        # boundary is fully visible.
         if self.check_classification_drift:
             request_level = self._declared_classification(ctx)
-            match = self._classification_pattern.search(ctx.accumulated_text)
-            if match:
-                marker = match.group(0)
-                # Look up via the case-folded view so a lowercase
-                # ``secret//noforn`` match still resolves to its
-                # SECRET-level configured value. ``99`` is the
-                # paranoid fallback for an unrecognized match (which
-                # shouldn't happen since the regex is built from the
-                # same dict, but keeps the invariant safe).
-                if self.case_sensitive:
-                    marker_level = self._marker_levels.get(marker)
-                else:
-                    marker_level = self._marker_levels_ci.get(marker.lower())
-                if marker_level is None:
-                    marker_level = 99
-                if marker_level > request_level:
-                    return CheckResult.block(
-                        f"output marker {marker!r} implies classification level "
-                        f"{marker_level} > request-declared level {request_level}",
-                        drift_kind="classification",
-                        marker=marker,
-                        marker_level=marker_level,
-                        request_level=request_level,
-                    )
+
+            last_pos = ctx.scratch.get(self._LAST_POS_KEY, 0)
+            longest_marker = max((len(m) for m in self._marker_levels), default=0)
+            overlap = max(0, longest_marker - 1)
+            scan_start = max(0, last_pos - overlap)
+            tail = ctx.accumulated_text[scan_start:]
+
+            # Update last-pos BEFORE any early return so a no-match
+            # call still advances the cursor and the next call doesn't
+            # re-scan the same content.
+            ctx.scratch[self._LAST_POS_KEY] = len(ctx.accumulated_text)
+
+            # Cumulative scan -- the canonical path. Respects the
+            # proxy's SSE-line filtering because only the extracted
+            # content (``_extract_sse_content`` output) lands in
+            # ``accumulated_text``.
+            if tail:
+                tail_match = self._classification_pattern.search(tail)
+                if tail_match:
+                    result = self._classification_block(tail_match, request_level)
+                    if result is not None:
+                        return result
+
+            # Chunk-direct scan -- the S1 safety net. Only runs when
+            # the accumulated-text cap has been hit on this context
+            # (``accumulated_text_truncated=True``). At that point the
+            # buffer is missing content and we'd otherwise allow a
+            # leaker who padded with > 1 MiB of benign output. Gating
+            # on the truncation flag preserves the proxy's
+            # ``inspect_all_sse_lines=False`` semantics on the common
+            # path -- raw SSE prelude lines are only scanned once the
+            # buffer-based defense has demonstrably stopped working.
+            if ctx.accumulated_text_truncated and chunk:
+                chunk_match = self._classification_pattern.search(chunk)
+                if chunk_match:
+                    result = self._classification_block(chunk_match, request_level)
+                    if result is not None:
+                        return result
 
         return CheckResult.allow()
+
+    def _classification_block(
+        self, match: re.Match[str], request_level: int
+    ) -> CheckResult | None:
+        """Resolve ``match`` to a BLOCK CheckResult, or ``None`` when the
+        marker level is compatible with the request's declared level.
+
+        Factored out of :meth:`inspect_response_chunk` so the chunk-direct
+        and cumulative-scan paths share identical resolution semantics.
+        """
+        marker = match.group(0)
+        # Look up via the case-folded view so a lowercase
+        # ``secret//noforn`` match still resolves to its
+        # SECRET-level configured value. ``99`` is the
+        # paranoid fallback for an unrecognized match (which
+        # shouldn't happen since the regex is built from the
+        # same dict, but keeps the invariant safe).
+        if self.case_sensitive:
+            marker_level = self._marker_levels.get(marker)
+        else:
+            marker_level = self._marker_levels_ci.get(marker.lower())
+        if marker_level is None:
+            marker_level = 99
+        if marker_level > request_level:
+            return CheckResult.block(
+                f"output marker {marker!r} implies classification level "
+                f"{marker_level} > request-declared level {request_level}",
+                drift_kind="classification",
+                marker=marker,
+                marker_level=marker_level,
+                request_level=request_level,
+            )
+        return None
 
     @staticmethod
     def _declared_classification(ctx: ResponseContext) -> int:

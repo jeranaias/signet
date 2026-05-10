@@ -67,13 +67,25 @@ the ``severity_actions`` mapping (set the rule's severity to
 ``"allow"``) and rely on a downstream LLM-judge plugin for the
 ambiguous cases.
 
-**ROT13 fast-path (C6.7, v0.1.7).** ROT13 decoding used to run on
-*every* input, doubling scan cost for natural-English text that has
-no chance of being ROT13'd. v0.1.7 adds a fast-path: an input
-containing more than 3 of {``the``, ``and``, ``is``, ``to``} as
-whole words is treated as natural English and ROT13 is skipped. The
-heuristic is intentionally simple -- common stop-words are absent
-from any meaningful ROT13'd English payload.
+**ROT13 fast-path REMOVED (N1, v0.1.8).** v0.1.7 introduced a
+``_looks_like_natural_english`` fast-path that skipped ROT13 decoding
+when the first 4 KB of input contained 3+ common English stop-words.
+This was a HIGH-severity bypass: an attacker prepends ~4 KB of stop-
+words and tail-appends a ROT13'd attack, so the prefix passes the
+heuristic and ROT13 is never tried on the suffix. v0.1.8 removes the
+fast-path entirely. ROT13 decode is cheap (~1-2 ms on a 1 MB input
+under the 512 KB scan cap) and the savings the fast-path produced
+were measured at 33 ms -> 32 ms during the v0.1.7 confidence hunt --
+not worth the bypass surface.
+
+**Truncation-tail fail-closed (N2, v0.1.8).** v0.1.7 added
+``scan_max_chars=512 KB`` to cap input scanning. The truncated suffix
+was silently allowed, giving an attacker a trivial bypass: place
+``"ignore previous instructions"`` past 512 KB of junk. v0.1.8
+defaults to fail-closed on truncation via ``on_scan_truncated="block"``.
+Operators that legitimately need to scan very long inputs can either
+raise ``scan_max_chars`` or pass ``on_scan_truncated="allow"`` /
+``"escalate"`` -- the tradeoff is documented in the constructor.
 
 Treat this check as a tripwire, not a wall. For deployments where the
 20% of attacks beyond OSS scope would be unacceptable, layer a
@@ -102,7 +114,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from signet.core.check import Check, CheckResult
 from signet.core.context import RequestContext
@@ -201,27 +213,14 @@ _ZERO_WIDTH_RE = re.compile(f"[{re.escape(_ZERO_WIDTH_CHARS)}]")
 # length >= 6 to avoid mangling legitimate prose.
 _STRETCHED_RE = re.compile(r"\b(?:[A-Za-z]\s){5,}[A-Za-z]\b")
 
-# C6.7 (v0.1.7): tiny stop-word fast-path used to skip ROT13 decoding
-# on natural-English inputs. The threshold is intentionally low (3+
-# matches of any combination of these four whole-words). Any text
-# meeting the bar is trivially identifiable as plain English; ROT13
-# of plain English is gibberish and the second scan is wasted work.
-_ENGLISH_STOPWORD_RE = re.compile(r"\b(?:the|and|is|to)\b", re.IGNORECASE)
-_ENGLISH_STOPWORD_THRESHOLD = 3
-
-
-def _looks_like_natural_english(text: str) -> bool:
-    """Return True when ``text`` contains enough common stop-words to
-    be trivially identifiable as plain English. Used as a ROT13
-    fast-path skip -- see C6.7."""
-    # Bound the scan so a 1MB input doesn't pay an extra full regex
-    # walk just to decide whether to skip ROT13. Iteration short-
-    # circuits as soon as the threshold is met.
-    sample = text[:4096] if len(text) > 4096 else text
-    for matches, _ in enumerate(_ENGLISH_STOPWORD_RE.finditer(sample), start=1):
-        if matches >= _ENGLISH_STOPWORD_THRESHOLD:
-            return True
-    return False
+# C6.7 (v0.1.7) introduced a stop-word fast-path that skipped ROT13
+# decoding for natural-English text. N1 (v0.1.8) removed it: a 4 KB
+# benign-English prefix would trip the heuristic and let a ROT13
+# attack land in the unsampled tail. The constants and helper are
+# intentionally NOT replaced -- ROT13 now always runs. If a future
+# audit shows ROT13 decode is a measurable hotspot, replace with a
+# whole-payload sampler (first 2 KB + middle 2 KB + last 2 KB; trip
+# if ANY window fails the English check), not a prefix-only sampler.
 
 
 def _normalize_for_scan(text: str) -> str:
@@ -321,13 +320,26 @@ class PromptInjectionCheck(Check):
     Args:
         severity_actions: Map of :class:`Severity` to action string. Valid
             actions are ``"block"``, ``"escalate"``, and ``"allow"``
-            (audit-only). Defaults: HIGH→block, MEDIUM→escalate, LOW→allow.
+            (audit-only). Defaults: HIGH->block, MEDIUM->escalate, LOW->allow.
         base64_min_length: Minimum length of a base64-looking blob to
             attempt decoding. Shorter blobs are too noisy to be worth
             scanning. Defaults to 64.
         scan_decoded_base64: If ``True``, decoded base64 strings are
             re-scanned with the same rules. Catches the trivial
             "base64-encode my injection" trick.
+        scan_max_chars: Hard upper bound on the number of characters
+            scanned. Inputs longer than this are truncated to the first
+            ``scan_max_chars`` characters. Default 512 KB.
+        on_scan_truncated: Policy when ``scan_max_chars`` is exceeded.
+            ``"block"`` (default, N1/N2 v0.1.8) refuses the request --
+            fail-closed -- since the un-scanned suffix could carry an
+            injection that no rule had a chance to see. ``"escalate"``
+            records the truncation as an ESCALATE result and lets a
+            downstream judge (TribunalCheck) make the final call.
+            ``"allow"`` preserves the v0.1.7 behavior (silently allow
+            with ``scan_truncated=True`` metadata) for operators that
+            legitimately ship multi-megabyte user content and prefer
+            to raise ``scan_max_chars`` rather than fail closed.
     """
 
     name = "prompt_injection"
@@ -353,6 +365,13 @@ class PromptInjectionCheck(Check):
     # concurrency. Larger inputs are truncated at this boundary and an
     # ``scan_truncated=True`` flag is emitted in audit metadata.
     scan_max_chars: int = 512 * 1024
+    # N2 (v0.1.8): default fail-closed on truncation. v0.1.7 silently
+    # allowed the unscanned suffix, giving an attacker a one-line
+    # bypass: prefix 600 KB of junk and tail-append the injection.
+    # Operators that need to scan very long inputs should either raise
+    # ``scan_max_chars`` or set this to ``"allow"`` / ``"escalate"``
+    # to restore the prior behavior consciously.
+    on_scan_truncated: Literal["block", "escalate", "allow"] = "block"
 
     def __post_init__(self) -> None:
         for sev, action in self.severity_actions.items():
@@ -368,6 +387,11 @@ class PromptInjectionCheck(Check):
             )
         if self.scan_max_chars < 1:
             raise ValueError(f"scan_max_chars must be >= 1, got {self.scan_max_chars}")
+        if self.on_scan_truncated not in ("block", "escalate", "allow"):
+            raise ValueError(
+                f"on_scan_truncated must be block|escalate|allow, "
+                f"got {self.on_scan_truncated!r}"
+            )
 
     async def pre_request(self, ctx: RequestContext) -> CheckResult:
         text = self._extract_text(ctx.body)
@@ -407,6 +431,29 @@ class PromptInjectionCheck(Check):
 
         if not matches:
             if scan_truncated:
+                # N2 (v0.1.8): the un-scanned suffix could carry an
+                # injection that no rule got to see. Default policy is
+                # fail-closed; operators that need a different shape
+                # can configure ``on_scan_truncated``.
+                trunc_meta = {
+                    "scan_truncated": True,
+                    "scan_max_chars": self.scan_max_chars,
+                    "match_source": "truncation-fail-closed",
+                }
+                if self.on_scan_truncated == "block":
+                    return CheckResult.block(
+                        "input exceeded scan cap; refusing as a precaution "
+                        f"(scan_max_chars={self.scan_max_chars}). Raise the cap "
+                        "or set on_scan_truncated='allow' to restore v0.1.7 "
+                        "behavior.",
+                        **trunc_meta,
+                    )
+                if self.on_scan_truncated == "escalate":
+                    return CheckResult.escalate(
+                        "input exceeded scan cap; escalating for downstream judge",
+                        **trunc_meta,
+                    )
+                # on_scan_truncated == "allow" -- preserve v0.1.7 shape.
                 return CheckResult.allow(
                     "no injection patterns in scanned prefix",
                     scan_truncated=True,
@@ -510,17 +557,14 @@ class PromptInjectionCheck(Check):
         # decoded form contains an ASCII English-looking phrase that the
         # raw form did not.
         #
-        # C6.7 (v0.1.7): fast-path skip when the input contains common
-        # English stop-words. ROT13 of natural English produces
-        # gibberish -- running both scans on every English input doubles
-        # match cost for no defensive benefit. A simple stop-word count
-        # is sufficient: a payload with three or more whole-word
-        # matches of {the, and, is, to} is unambiguously plain English
-        # and not a ROT13-encoded attack.
-        if not _looks_like_natural_english(text):
-            rot13 = codecs.encode(text, "rot_13")
-            if rot13 != text:
-                decoded.append((rot13, "rot13"))
+        # N1 (v0.1.8): the v0.1.7 ``_looks_like_natural_english``
+        # fast-path was removed. A benign-English 4 KB prefix made the
+        # heuristic skip ROT13 on the whole payload, letting a tail-
+        # appended attack through. The measured speedup was ~1 ms on
+        # a 512 KB input -- not worth the bypass surface.
+        rot13 = codecs.encode(text, "rot_13")
+        if rot13 != text:
+            decoded.append((rot13, "rot13"))
 
         return decoded
 

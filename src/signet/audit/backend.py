@@ -17,7 +17,7 @@ import contextlib
 import json
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -331,11 +331,89 @@ class FileLockingJsonlBackend(JsonlBackend):
             finally:
                 _LOCK_IMPL.release(f.fileno())
 
+    def append_locked_with_link(
+        self,
+        link_fn: Callable[[str], AuditEntry],
+    ) -> AuditEntry:
+        """Read chain tail, build linked entry, write -- all under one lock.
+
+        V2 (v0.1.7 follow-up): previously :class:`HmacChain.append` read
+        the previous HMAC OUTSIDE the cross-process file lock, then
+        called :meth:`append` to take the lock and write. Two appenders
+        in separate processes could both read the same ``prev_hmac``
+        before either landed its write, forking the chain. The window
+        was narrow on Linux but routinely tripped on Windows where the
+        compactor's ``os.replace`` raced with the appender's open.
+
+        This method gives :class:`HmacChain` an atomic read-modify-write:
+
+        1. Acquire the sidecar coordination lock (blocks while the
+           compactor is rewriting) and the byte-range lock on the live
+           log file.
+        2. Call :meth:`_read_tail_hmac` to read the last entry's HMAC
+           from disk -- guaranteed not to race with sibling writers
+           because they're blocked on the same lock.
+        3. Invoke ``link_fn(prev_hmac)``. The callable signs the entry
+           with the freshly-read ``prev_hmac`` and returns the linked
+           :class:`AuditEntry` ready for persistence.
+        4. Write the entry under the same lock.
+
+        Returns the linked entry produced by ``link_fn`` so callers can
+        propagate the chain HMACs without a second read.
+
+        File-handle layering: the sidecar coordination lock (held for
+        the entire critical section) blocks the compactor and any
+        sibling :meth:`append_locked_with_link` callers. The tail read
+        happens BEFORE the append-mode handle is opened so Windows
+        doesn't refuse the concurrent read+append on the same file
+        (msvcrt locks are per-handle and an open append handle blocks
+        a read on the same path). The byte-range lock on the
+        append-mode handle then serializes us against
+        :meth:`append_locked` callers that don't hold the sidecar
+        lock.
+        """
+        with exclusive_log_lock(self._path):
+            prev_hmac = self._read_tail_hmac()
+            linked = link_fn(prev_hmac)
+            with self._path.open("a", encoding="utf-8") as f:
+                _LOCK_IMPL.acquire(f.fileno())
+                try:
+                    line = json.dumps(
+                        linked.to_dict(),
+                        separators=(",", ":"),
+                        sort_keys=True,
+                        allow_nan=False,
+                        ensure_ascii=False,
+                    )
+                    f.write(line + "\n")
+                    if self._fsync:
+                        f.flush()
+                        os.fsync(f.fileno())
+                    return linked
+                finally:
+                    _LOCK_IMPL.release(f.fileno())
+
+    def _read_tail_hmac(self) -> str:
+        """Return the HMAC of the last entry in the log, or ``""`` if empty.
+
+        Intended for use only inside the cross-process lock of
+        :meth:`append_locked_with_link`. Performs a linear scan via
+        :meth:`iter_entries`; for the volumes this backend targets
+        (single-host, low-to-medium throughput) the cost is acceptable.
+        High-throughput multi-writer deployments should plug in a
+        database-backed backend with O(1) tail access.
+        """
+        last: AuditEntry | None = None
+        for entry in self.iter_entries():
+            last = entry
+        return last.hmac if last is not None else ""
+
     def append(self, entry: AuditEntry) -> None:
         """Single-writer append under cross-process lock.
 
         Multi-process safe: only one worker holds the lock at a time.
         For chain-aware appends that need to re-read prev_hmac under
-        the lock, use :meth:`append_locked`.
+        the lock, use :meth:`append_locked` or
+        :meth:`append_locked_with_link`.
         """
         self.append_locked(entry)

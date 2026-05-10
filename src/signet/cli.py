@@ -605,6 +605,13 @@ def _run_probe_injection_corpus(signet_url: str) -> bool:
     click.echo(f"\nprobing prompt-injection corpus against: {base}")
     click.echo(f"  ({len(PROMPT_INJECTION_PROBE_CORPUS)} probes)")
     leaked = False
+    # v0.1.7 F3: when EVERY probe leaks with a plain HTTP 200 (no
+    # shadow decision, no refusal), the most likely cause is that the
+    # operator's pipeline does not register PromptInjectionCheck. Track
+    # the leak shape so we can give an actionable hint instead of a
+    # red wall of "LEAKED" lines.
+    plain_200_leaks = 0
+    total_probes = len(PROMPT_INJECTION_PROBE_CORPUS)
 
     for probe in PROMPT_INJECTION_PROBE_CORPUS:
         try:
@@ -655,9 +662,28 @@ def _run_probe_injection_corpus(signet_url: str) -> bool:
                 fg="red",
             )
             leaked = True
+            if resp.status_code == 200 and not shadow_decision:
+                plain_200_leaks += 1
 
     if leaked:
         click.secho("\n  prompt-injection probe: FAIL (gate let one through)", fg="red")
+        # F3 hint: if every probe came back as a plain HTTP 200 with no
+        # shadow decision, the pipeline almost certainly has no
+        # PromptInjectionCheck registered. Tell the operator how to fix
+        # it, instead of leaving them with N red "LEAKED" lines and no
+        # next step.
+        if plain_200_leaks == total_probes and total_probes > 0:
+            click.secho(
+                "\n  hint: every probe returned plain HTTP 200 with no "
+                "X-Signet-Shadow-Decision header. The proxy at "
+                f"{base} likely has no PromptInjectionCheck in its "
+                "pipeline; the probes pass straight through to the "
+                "upstream. Add ``PromptInjectionCheck()`` to your "
+                "pipeline.py (ADMISSION stage) and restart `signet "
+                "serve`. The default scaffold from ``signet init`` "
+                "includes this check; only hand-written pipelines miss it.",
+                fg="yellow",
+            )
     else:
         click.secho("\n  prompt-injection probe: ok (all probes blocked)", fg="green")
     return leaked
@@ -767,8 +793,16 @@ def audit_verify(
         raise _malformed_audit_to_click_exception(exc) from exc
 
     if as_json:
+        # A13 (v0.1.7): surface ``signet_version`` and ``verified_at``
+        # from the VerificationReport dataclass so a stored JSON report
+        # is self-describing for long-term forensics. The dataclass
+        # already populates both via default factories (see
+        # signet.audit.verifier.VerificationReport); the CLI just has
+        # to pass them through.
         payload = {
             "ok": report.ok,
+            "signet_version": report.signet_version,
+            "verified_at": report.verified_at,
             "total_entries": report.total_entries,
             "last_known_good_index": report.last_known_good_index,
             "last_known_good_hmac": report.last_known_good_hmac,
@@ -1145,8 +1179,14 @@ def audit_compact(
     chain = HmacChain(backend, keyring)
 
     # ``compact_audit_log`` raises ``FileExistsError`` when output
-    # exists and ``force`` is False. Surface that as a ClickException
-    # rather than a Python traceback.
+    # exists and ``force`` is False, and ``ValueError`` for other
+    # operator-fixable conditions (most prominently the A2 stacked-
+    # compaction guard: "previous compaction marker in eligible-entries
+    # window"). v0.1.7 F1: surface both as ClickException so operators
+    # see an actionable message instead of a raw Python traceback.
+    # ``--force`` overrides the file-overwrite refusal but does NOT
+    # silence the stacked-compaction ValueError (the marker check is a
+    # data-integrity guard, not a UX nicety).
     try:
         result = compact_audit_log(
             chain=chain,
@@ -1160,6 +1200,8 @@ def audit_compact(
             f"refusing to overwrite existing archive at {output}; "
             f"pass --force to override ({exc})"
         ) from exc
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     if result is None:
         click.secho(
@@ -1500,8 +1542,12 @@ def _aggregate_audit_window(
 def _maybe_anonymize_owner(owner_str: str, *, anonymize: bool, salt: str) -> str:
     """Render an owner string for the report.
 
-    With ``anonymize=True``, returns ``owner_<8hex>`` where the 8 hex
-    characters are the first 8 of ``SHA-256(salt + ":" + owner_str)``.
+    With ``anonymize=True``, returns ``owner_<16hex>`` where the 16 hex
+    characters are the first 16 of ``SHA-256(salt + ":" + owner_str)``,
+    i.e. 64 bits of slug entropy. The v0.1.7 charter bumped this from 8
+    to 16 hex chars to widen the search space against rainbow-table
+    attacks on plausible owner IDs (an 8-hex slug is only 32 bits, well
+    inside precompute range for a small enumerable owner namespace).
     With ``anonymize=False``, returns the raw owner string.
     """
     if not anonymize:
@@ -1509,7 +1555,7 @@ def _maybe_anonymize_owner(owner_str: str, *, anonymize: bool, salt: str) -> str
     import hashlib
 
     h = hashlib.sha256(f"{salt}:{owner_str}".encode()).hexdigest()
-    return f"owner_{h[:8]}"
+    return f"owner_{h[:16]}"
 
 
 def _compute_deltas(
@@ -2640,6 +2686,7 @@ from signet.checks import (
     ClassificationGateCheck,
     LoopbackTrustCheck,
     OwnerResolutionCheck,
+    PromptInjectionCheck,
     RateLimitCheck,
     ScopeDriftCheck,
     ToolCallInspectorCheck,
@@ -2656,6 +2703,10 @@ pipeline = Pipeline(checks=[
     OwnerResolutionCheck(require_owner=True),
     RateLimitCheck(capacity=60, refill_per_second=1.0),
     ClassificationGateCheck(),
+    # PromptInjectionCheck must be in the default pipeline so
+    # ``signet doctor --probe-injection`` reports refusals out of the
+    # box on a fresh ``signet init`` scaffold (v0.1.7 F3).
+    PromptInjectionCheck(),
 
     # INSPECTION
     ScopeDriftCheck(),

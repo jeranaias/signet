@@ -2259,3 +2259,325 @@ class TestParseDurationExtended:
         )
         assert result.exit_code == 0, result.output
         assert "# signet audit report" in result.output
+
+
+class TestV018ConfidenceHuntFixes:
+    """Regression tests for the v0.1.7 -> v0.1.7.1 confidence-hunt
+    findings (A9, A13/F2, F1, F3). Each test name carries the finding
+    ID so future hunters can correlate the regression back to the
+    original report.
+    """
+
+    def _build_chain(
+        self,
+        log_path: Path,
+        secret: bytes,
+        n: int = 5,
+        *,
+        owner_human: str = "alice",
+        decision: Decision = Decision.BLOCK,
+    ):
+        from datetime import UTC, datetime
+
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        base_ts = int(datetime(2026, 1, 1, tzinfo=UTC).timestamp() * 1e9)
+        appended = []
+        for i in range(n):
+            entry = AuditEntry(
+                owner=Owner.human(owner_human),
+                check_name="owner_resolution",
+                decision=decision,
+                reason="ok",
+                ts_ns=base_ts + i * 1_000_000_000,
+            )
+            appended.append(chain.append(entry))
+        return appended
+
+    # ------------------------------------------------------------------
+    # A9: --anonymize slug must be 16 hex characters (64 bits)
+    # ------------------------------------------------------------------
+    def test_a9_anonymize_slug_16_hex(self, tmp_path: Path) -> None:
+        """v0.1.7 charter: anonymize slug is 16 hex chars (64 bits) for
+        better resistance to rainbow-table attacks on plausible owner IDs.
+
+        v0.1.7-rc kept ``h[:8]`` in ``_maybe_anonymize_owner`` despite
+        the charter bump; this test pins the 16-hex contract so a
+        future regression to 8 hex is caught at CI time.
+        """
+        import re
+
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_chain(log_path, secret, n=3, owner_human="alice")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "report",
+                "--audit-log",
+                str(log_path),
+                "--since",
+                "100000h",  # window large enough to include 2026-01-01
+                "--anonymize",
+                "--anonymize-salt",
+                "foo",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        slug_match = re.search(r"owner_([0-9a-f]+)", result.output)
+        assert slug_match is not None, (
+            f"no owner_<hex> slug in report output:\n{result.output}"
+        )
+        slug_hex = slug_match.group(1)
+        assert len(slug_hex) == 16, (
+            f"anonymize slug is {len(slug_hex)} hex chars (expected 16, "
+            f"i.e. 64 bits of entropy). v0.1.7 charter bug A9 has "
+            f"regressed. Match: {slug_match.group(0)!r}"
+        )
+
+    def test_a9_anonymize_helper_returns_16_hex(self) -> None:
+        """Unit-level pin on ``_maybe_anonymize_owner`` so even renderer
+        refactors that bypass the markdown path can't silently revert
+        the slug width.
+        """
+        from signet.cli import _maybe_anonymize_owner
+
+        slug = _maybe_anonymize_owner(
+            "human:alice@example.com", anonymize=True, salt="any-salt"
+        )
+        assert slug.startswith("owner_")
+        hex_part = slug[len("owner_"):]
+        assert len(hex_part) == 16
+        assert all(c in "0123456789abcdef" for c in hex_part)
+
+    # ------------------------------------------------------------------
+    # A13 / F2: audit verify --json must include signet_version + verified_at
+    # ------------------------------------------------------------------
+    def test_a13_verify_json_includes_version_and_verified_at(
+        self, tmp_path: Path
+    ) -> None:
+        """v0.1.7 charter: ``audit verify --json`` payload includes
+        ``signet_version`` (binary identity for long-term forensics)
+        and ``verified_at`` (UTC ISO 8601 stamp for "when was this
+        checked"). Both came in on the ``VerificationReport`` dataclass
+        in v0.1.7 but the CLI's JSON serializer didn't surface them.
+        """
+        import json as _json
+        import re
+
+        import signet as _signet
+
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_chain(log_path, secret, n=2, decision=Decision.ALLOW)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "verify",
+                str(log_path),
+                "--hmac-secret",
+                secret.hex(),
+                "--key-id",
+                "k1",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        payload = _json.loads(result.output)
+
+        assert "signet_version" in payload, (
+            f"--json missing signet_version: {payload!r}"
+        )
+        assert payload["signet_version"] == _signet.__version__
+
+        assert "verified_at" in payload, (
+            f"--json missing verified_at: {payload!r}"
+        )
+        # Loose ISO 8601 UTC pattern: 2026-05-09T17:42:31.123456+00:00
+        # (datetime.now(UTC).isoformat() always emits +00:00, not Z).
+        assert re.match(
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?\+00:00$",
+            payload["verified_at"],
+        ), f"verified_at not ISO 8601 UTC: {payload['verified_at']!r}"
+
+    def test_a13_verify_json_includes_fields_on_broken_chain(
+        self, tmp_path: Path
+    ) -> None:
+        """The same two fields must appear on the failure path too --
+        a stored verification of a broken chain is exactly where
+        long-term forensics needs the binary version and timestamp.
+        """
+        import json as _json
+
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_chain(
+            log_path, secret, n=2, owner_human="alice", decision=Decision.ALLOW
+        )
+        # Tamper.
+        text = log_path.read_text(encoding="utf-8")
+        log_path.write_text(text.replace("alice", "mallory"), encoding="utf-8")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "verify",
+                str(log_path),
+                "--hmac-secret",
+                secret.hex(),
+                "--key-id",
+                "k1",
+                "--json",
+            ],
+        )
+        assert result.exit_code == 2, result.output
+        payload = _json.loads(result.output)
+        assert "signet_version" in payload
+        assert "verified_at" in payload
+        assert payload["ok"] is False
+
+    # ------------------------------------------------------------------
+    # F1: audit compact --force surfaces ValueError as ClickException
+    # ------------------------------------------------------------------
+    def test_f1_compact_stacked_marker_no_traceback(
+        self, tmp_path: Path
+    ) -> None:
+        """v0.1.7 F1: when the compactor refuses to stack a second
+        compaction over a previous marker, the CLI surfaces it as a
+        ClickException (Error: ...) instead of dumping a raw Python
+        traceback. --force does not silence the marker check (that's a
+        data-integrity guard, not the file-overwrite refusal).
+        """
+        from datetime import UTC, datetime, timedelta
+
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        base_dt = datetime(2026, 1, 1, tzinfo=UTC)
+        base_ns = int(base_dt.timestamp() * 1_000_000_000)
+        for i in range(10):
+            chain.append(
+                AuditEntry(
+                    owner=Owner.human(f"u{i}"),
+                    check_name="owner_resolution",
+                    decision=Decision.ALLOW,
+                    reason="ok",
+                    ts_ns=base_ns + i * 1_000_000_000,
+                )
+            )
+
+        runner = CliRunner()
+        # First compaction succeeds.
+        archive1 = tmp_path / "archive-1.bin"
+        first_cutoff = (base_dt + timedelta(seconds=5)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "compact",
+                "--audit-log",
+                str(log_path),
+                "--before",
+                first_cutoff,
+                "--output",
+                str(archive1),
+                "--hmac-secret",
+                secret.hex(),
+                "--quiesce-confirm",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+
+        # Append entries past the marker so the second compaction has
+        # something eligible plus the marker in-window.
+        keyring2 = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain2 = HmacChain(JsonlBackend(log_path), keyring2)
+        for i in range(3):
+            chain2.append(
+                AuditEntry(
+                    owner=Owner.human(f"post-{i}"),
+                    check_name="owner_resolution",
+                    decision=Decision.ALLOW,
+                    reason="ok",
+                )
+            )
+
+        # Second compaction with --force AND a far-future cutoff that
+        # sweeps in the existing marker. compactor must refuse with
+        # ValueError("previous compaction marker ...").
+        archive2 = tmp_path / "archive-2.bin"
+        result2 = runner.invoke(
+            main,
+            [
+                "audit",
+                "compact",
+                "--audit-log",
+                str(log_path),
+                "--before",
+                "2099-01-01T00:00:00Z",
+                "--output",
+                str(archive2),
+                "--hmac-secret",
+                secret.hex(),
+                "--quiesce-confirm",
+                "--force",
+            ],
+        )
+        assert result2.exit_code != 0, result2.output
+        # Click's ClickException renders as "Error: <msg>" without
+        # leaking a Python traceback into stdout/stderr capture.
+        assert "Traceback" not in result2.output
+        assert "previous compaction marker" in result2.output
+        # The error must be surfaced via click's Error: prefix so the
+        # operator sees actionable text, not an internal exception type.
+        assert "Error:" in result2.output
+
+    # ------------------------------------------------------------------
+    # F3: signet init scaffold must include PromptInjectionCheck
+    # ------------------------------------------------------------------
+    def test_f3_scaffold_includes_prompt_injection_check(
+        self, tmp_path: Path
+    ) -> None:
+        """v0.1.7 F3: the init scaffold's pipeline.py must include
+        ``PromptInjectionCheck`` so ``signet doctor --probe-injection``
+        run against a fresh ``signet init`` scaffold returns refusals,
+        not 9/9 LEAKED. The check is the only one that gates the probe
+        corpus; an operator who follows the README to the letter
+        should not have to learn about it the hard way.
+        """
+        runner = CliRunner()
+        result = runner.invoke(main, ["init", str(tmp_path)])
+        assert result.exit_code == 0, result.output
+
+        pipeline_text = (tmp_path / "pipeline.py").read_text(encoding="utf-8")
+        assert "PromptInjectionCheck" in pipeline_text, (
+            "scaffolded pipeline.py does not register PromptInjectionCheck; "
+            "doctor --probe-injection will report 9/9 LEAKED against a "
+            "fresh init. See v0.1.7 F3."
+        )
+
+        # Load the scaffolded pipeline and assert the check is actually
+        # in pipeline.checks (the source text check above is necessary
+        # but not sufficient -- a stray import without registration
+        # would still pass that text-match).
+        from signet.checks import PromptInjectionCheck
+        from signet.cli import _load_pipeline_from_path
+
+        pipeline = _load_pipeline_from_path(tmp_path / "pipeline.py")
+        assert any(
+            isinstance(c, PromptInjectionCheck) for c in pipeline.checks
+        ), (
+            "scaffolded pipeline imports PromptInjectionCheck but does "
+            "not register it in the Pipeline(checks=[...]) list."
+        )

@@ -105,70 +105,105 @@ class HmacChain:
         ``RuntimeError`` and the entry is NOT written to the backend.
         Default behavior (``require_anchor_success=False``) writes the
         entry with the failure recorded in ``metadata['_anchor']``.
+
+        Concurrency: the in-process :class:`threading.Lock` serializes
+        callers within one process. When ``cache_prev=False`` AND the
+        backend exposes :meth:`append_locked_with_link` (i.e.
+        :class:`FileLockingJsonlBackend`), the read-prev / compute /
+        write sequence runs INSIDE the cross-process file lock so
+        sibling worker processes cannot fork the chain. Without
+        ``append_locked_with_link`` -- e.g. for custom backends -- we
+        fall back to the legacy pattern: read prev outside the lock,
+        write inside. That fallback is single-process safe via
+        ``self._lock`` but susceptible to multi-process forks; document
+        the limitation on the custom backend.
         """
         with self._lock:
+            if not self._cache_prev and hasattr(
+                self._backend, "append_locked_with_link"
+            ):
+                # V2 (v0.1.7 follow-up): atomic multi-process path.
+                linked = self._backend.append_locked_with_link(
+                    lambda prev: self._build_linked_entry(entry, prev)
+                )
+                self._cached_prev = linked.hmac
+                return linked
+
+            # Legacy single-process / non-FileLockingJsonlBackend path.
             prev_hmac = self._read_prev_hmac()
-            active = self._keyring.active
-
-            # First pass: compute a tentative HMAC over the payload
-            # WITHOUT the anchor receipt. The tentative HMAC is what we
-            # submit to the anchor backend -- anchoring the input to the
-            # signing function, not the output, keeps the order of
-            # operations clean (anchor commits to the entry's identity,
-            # the chain HMAC commits to the anchor receipt + payload).
-            tentative_with_key = replace(
-                entry,
-                metadata={**entry.metadata, KEY_ID_FIELD: active.key_id},
-                prev_hmac=prev_hmac,
-            )
-            tentative_payload = _serialize_for_signing(tentative_with_key)
-            tentative_hmac = hmac.new(active.secret, tentative_payload, hashlib.sha256).hexdigest()
-
-            # Anchor the tentative HMAC. NoopAnchor returns success
-            # immediately; real backends do an external HTTP call.
-            try:
-                anchor_receipt = self._anchor.anchor_hmac(tentative_hmac)
-            except Exception as exc:
-                if self._require_anchor_success:
-                    raise
-                logger.warning(
-                    "anchor backend %s raised %s; recording failure on entry",
-                    self._anchor.name,
-                    type(exc).__name__,
-                )
-                from signet.audit.anchor import AnchorReceipt
-
-                anchor_receipt = AnchorReceipt(
-                    backend=self._anchor.name,
-                    success=False,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-
-            if not anchor_receipt.success and self._require_anchor_success:
-                raise RuntimeError(
-                    f"anchor backend {self._anchor.name!r} failed "
-                    f"(require_anchor_success=True): {anchor_receipt.error}"
-                )
-
-            # Final pass: rebuild the entry with the anchor receipt in
-            # metadata, then compute the chain HMAC over the full payload.
-            anchored_metadata = {
-                **entry.metadata,
-                KEY_ID_FIELD: active.key_id,
-                ANCHOR_FIELD: anchor_receipt.to_dict(),
-            }
-            entry_with_anchor = replace(
-                entry,
-                metadata=anchored_metadata,
-                prev_hmac=prev_hmac,
-            )
-            payload = _serialize_for_signing(entry_with_anchor)
-            new_hmac = hmac.new(active.secret, payload, hashlib.sha256).hexdigest()
-
-            linked = entry_with_anchor.with_chain_links(prev_hmac=prev_hmac, hmac=new_hmac)
+            linked = self._build_linked_entry(entry, prev_hmac)
             self._backend.append(linked)
-            self._cached_prev = new_hmac
+            self._cached_prev = linked.hmac
             return linked
+
+    def _build_linked_entry(self, entry: AuditEntry, prev_hmac: str) -> AuditEntry:
+        """Run the full sign-and-anchor pipeline against a known ``prev_hmac``.
+
+        Factored out of :meth:`append` so the V2 atomic path
+        (:meth:`FileLockingJsonlBackend.append_locked_with_link`) can
+        invoke the same sequence inside the cross-process lock with the
+        freshly-read tail HMAC.
+
+        Raises ``RuntimeError`` when the anchor backend fails and
+        ``require_anchor_success=True``.
+        """
+        active = self._keyring.active
+
+        # First pass: compute a tentative HMAC over the payload
+        # WITHOUT the anchor receipt. The tentative HMAC is what we
+        # submit to the anchor backend -- anchoring the input to the
+        # signing function, not the output, keeps the order of
+        # operations clean (anchor commits to the entry's identity,
+        # the chain HMAC commits to the anchor receipt + payload).
+        tentative_with_key = replace(
+            entry,
+            metadata={**entry.metadata, KEY_ID_FIELD: active.key_id},
+            prev_hmac=prev_hmac,
+        )
+        tentative_payload = _serialize_for_signing(tentative_with_key)
+        tentative_hmac = hmac.new(active.secret, tentative_payload, hashlib.sha256).hexdigest()
+
+        # Anchor the tentative HMAC. NoopAnchor returns success
+        # immediately; real backends do an external HTTP call.
+        try:
+            anchor_receipt = self._anchor.anchor_hmac(tentative_hmac)
+        except Exception as exc:
+            if self._require_anchor_success:
+                raise
+            logger.warning(
+                "anchor backend %s raised %s; recording failure on entry",
+                self._anchor.name,
+                type(exc).__name__,
+            )
+            from signet.audit.anchor import AnchorReceipt
+
+            anchor_receipt = AnchorReceipt(
+                backend=self._anchor.name,
+                success=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+        if not anchor_receipt.success and self._require_anchor_success:
+            raise RuntimeError(
+                f"anchor backend {self._anchor.name!r} failed "
+                f"(require_anchor_success=True): {anchor_receipt.error}"
+            )
+
+        # Final pass: rebuild the entry with the anchor receipt in
+        # metadata, then compute the chain HMAC over the full payload.
+        anchored_metadata = {
+            **entry.metadata,
+            KEY_ID_FIELD: active.key_id,
+            ANCHOR_FIELD: anchor_receipt.to_dict(),
+        }
+        entry_with_anchor = replace(
+            entry,
+            metadata=anchored_metadata,
+            prev_hmac=prev_hmac,
+        )
+        payload = _serialize_for_signing(entry_with_anchor)
+        new_hmac = hmac.new(active.secret, payload, hashlib.sha256).hexdigest()
+        return entry_with_anchor.with_chain_links(prev_hmac=prev_hmac, hmac=new_hmac)
 
     def _read_prev_hmac(self) -> str:
         """Return the HMAC of the latest entry in the chain, or ``""`` if

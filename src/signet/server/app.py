@@ -529,7 +529,31 @@ class SignetApp:
                 },
             )
 
+        # Build the headers / client_ip / session_id once; pre-pipeline
+        # refusals need them to write a synthetic audit row even though
+        # the body never parsed into a usable shape.
+        pre_headers = dict(request.headers.items())
+        pre_client_ip = request.client.host if request.client else None
+        pre_session_id_raw = get_header_ci(pre_headers, SESSION_HEADER) or get_header_ci(
+            pre_headers, SESSION_HEADER.lower()
+        )
+        pre_session_id = pre_session_id_raw.strip() if pre_session_id_raw else None
+        if not pre_session_id:
+            pre_session_id = None
+        pre_fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest() if raw else ""
+
         if not raw:
+            self._record_preflight_refusal(
+                request=request,
+                headers=pre_headers,
+                client_ip=pre_client_ip,
+                session_id=pre_session_id,
+                path=path,
+                fingerprint=pre_fingerprint,
+                reason="empty request body",
+                refusal_kind="empty_body",
+                extra_metadata={},
+            )
             return JSONResponse(
                 status_code=400,
                 content={
@@ -541,6 +565,17 @@ class SignetApp:
         try:
             body = json.loads(raw)
         except json.JSONDecodeError as e:
+            self._record_preflight_refusal(
+                request=request,
+                headers=pre_headers,
+                client_ip=pre_client_ip,
+                session_id=pre_session_id,
+                path=path,
+                fingerprint=pre_fingerprint,
+                reason="invalid JSON in request body",
+                refusal_kind="json_decode_error",
+                extra_metadata={"_decode_error": str(e)},
+            )
             return JSONResponse(
                 status_code=400,
                 content={"error": f"invalid JSON in request body: {e}"},
@@ -553,6 +588,17 @@ class SignetApp:
         # so callers get a parseable hint and the audit chain isn't
         # blamed for a client error.
         if not isinstance(body, dict):
+            self._record_preflight_refusal(
+                request=request,
+                headers=pre_headers,
+                client_ip=pre_client_ip,
+                session_id=pre_session_id,
+                path=path,
+                fingerprint=pre_fingerprint,
+                reason="request body is not a JSON object",
+                refusal_kind="non_object_body",
+                extra_metadata={"got_type": type(body).__name__},
+            )
             return JSONResponse(
                 status_code=400,
                 content={
@@ -562,20 +608,48 @@ class SignetApp:
                 },
             )
 
-        headers = dict(request.headers.items())
-        client_ip = request.client.host if request.client else None
-        # Starlette typically lowercases header names but proxies may not;
-        # use get_header_ci so any case variant resolves. Strip surrounding
+        # NF2 (v0.1.7.1): Python's ``json.loads`` accepts the non-standard
+        # ``NaN`` / ``Infinity`` / ``-Infinity`` literals. httpx's
+        # ``encode_json`` (allow_nan=False) raises ``ValueError`` when
+        # asked to re-serialize them for the upstream, which previously
+        # surfaced as a misleading 502 "upstream forward failed". Catch
+        # the non-finite floats here and refuse as a 400 client error
+        # with a proper audit row.
+        if _contains_non_finite_float(body):
+            self._record_preflight_refusal(
+                request=request,
+                headers=pre_headers,
+                client_ip=pre_client_ip,
+                session_id=pre_session_id,
+                path=path,
+                fingerprint=pre_fingerprint,
+                reason="request body contains non-finite float (NaN/Infinity)",
+                refusal_kind="non_finite_float",
+                extra_metadata={},
+            )
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "request body contains non-finite float",
+                    "expected": (
+                        "all numeric values must be finite; NaN, Infinity, "
+                        "and -Infinity are not valid JSON and would be "
+                        "rejected by the upstream"
+                    ),
+                },
+            )
+
+        # Reuse the headers / client_ip / session_id resolved before the
+        # body shape gate. Starlette typically lowercases header names
+        # but proxies may not; ``get_header_ci`` is what
+        # ``_record_preflight_refusal`` already used. Strip surrounding
         # whitespace because some HTTP clients add a trailing space when
         # composing headers; an empty post-strip value is treated as
         # no-session so the session store doesn't index a blank key.
-        session_id_raw = get_header_ci(headers, SESSION_HEADER) or get_header_ci(
-            headers, SESSION_HEADER.lower()
-        )
-        session_id = session_id_raw.strip() if session_id_raw else None
-        if not session_id:
-            session_id = None
-        request_fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest() if raw else ""
+        headers = pre_headers
+        client_ip = pre_client_ip
+        session_id = pre_session_id
+        request_fingerprint = pre_fingerprint
 
         ctx = RequestContext(
             owner=Owner.unresolved(),
@@ -1637,6 +1711,60 @@ class SignetApp:
         )
         return self._chain.append(entry)
 
+    def _record_preflight_refusal(
+        self,
+        *,
+        request: Request,
+        headers: dict[str, str],
+        client_ip: str | None,
+        session_id: str | None,
+        path: str,
+        fingerprint: str,
+        reason: str,
+        refusal_kind: str,
+        extra_metadata: dict[str, Any],
+    ) -> AuditEntry | None:
+        """Persist a synthetic audit row for a 400 refused *before* the
+        pipeline ran (empty body, malformed JSON, non-object body,
+        non-finite floats).
+
+        v0.1.7 charter promised every refused request leaves an audit
+        row; v0.1.7 H1 wired the 400 response shape for non-object
+        bodies but missed the audit-row half of that promise. NF1
+        (v0.1.7.1) closes the gap by routing every pre-pipeline 400
+        through this helper.
+
+        The owner is :meth:`Owner.unresolved`: by definition admission
+        never ran so we have no resolved identity. Metadata stamps a
+        ``_pre_pipeline_refusal`` marker so downstream consumers can
+        filter these rows out of policy-decision dashboards if they
+        only care about pipeline-stage outcomes.
+        """
+        from signet.core.check import CheckResult
+
+        ctx = RequestContext(
+            owner=Owner.unresolved(),
+            headers=headers,
+            body={},
+            path=path,
+            method=request.method,
+            client_ip=client_ip,
+            session_id=session_id,
+        )
+        ctx.scratch["_request_fingerprint"] = fingerprint
+        result_metadata: dict[str, Any] = {
+            "_stage": "preflight",
+            "_refusal_kind": refusal_kind,
+        }
+        result_metadata.update(extra_metadata)
+        synthetic = CheckResult.block(reason, **result_metadata)
+        return self._record_decision(
+            ctx,
+            result=synthetic,
+            check_name="pipeline.preflight",
+            metadata={"_pre_pipeline_refusal": True, "_refusal_kind": refusal_kind},
+        )
+
 
 class _BodyTooLarge(Exception):
     """Raised when the inbound request body exceeds the configured cap."""
@@ -1657,6 +1785,49 @@ def _result_to_decision(result: Any) -> Decision:
     if result.is_escalate:
         return Decision.ESCALATE
     return Decision.BLOCK  # fail closed if a future Decision is added without a mapping
+
+
+#: Recursion ceiling for :func:`_contains_non_finite_float`. JSON
+#: documents that legitimately exceed this depth are exceptionally
+#: rare; deeper inputs are treated as suspicious and refused (returning
+#: ``True``) so we never recurse without bound on adversarial payloads.
+#: ``json.loads`` itself defends against pathological depth via its own
+#: recursion limit, so reaching this is effectively a no-op safety net.
+_NON_FINITE_WALK_MAX_DEPTH: int = 256
+
+
+def _contains_non_finite_float(obj: Any, _depth: int = 0) -> bool:
+    """Recursively scan a JSON-decoded value for NaN / Infinity / -Infinity.
+
+    Used by :meth:`SignetApp._admit` to refuse bodies that ``json.loads``
+    happily parsed (Python permits the non-standard NaN/Infinity
+    literals) but which httpx's strict JSON encoder would reject when
+    forwarding to the upstream. Catching this here turns a confusing
+    502 "upstream forward failed" into an honest 400 client error.
+
+    Notes on safety:
+
+    * ``json.loads`` produces tree-shaped structures (it never reuses a
+      node), so we don't need an ``id(obj)`` visited-set for cycle
+      detection on parsed bodies. The ``_depth`` ceiling is a belt-and-
+      braces guard for callers who happen to feed in hand-built objects.
+    * Booleans inherit from ``int``, not ``float``, so they don't trip
+      the float branch. ``int`` values are always finite.
+    """
+    if _depth > _NON_FINITE_WALK_MAX_DEPTH:
+        # Fail closed: deeper than we'll walk → treat as suspicious.
+        return True
+    if isinstance(obj, float):
+        # ``math.isfinite`` is the canonical predicate; the literal
+        # comparisons in the bug-report spec also work but are noisier.
+        import math
+
+        return not math.isfinite(obj)
+    if isinstance(obj, dict):
+        return any(_contains_non_finite_float(v, _depth + 1) for v in obj.values())
+    if isinstance(obj, list):
+        return any(_contains_non_finite_float(v, _depth + 1) for v in obj)
+    return False
 
 
 def _walk_path(data: Any, path: tuple[Any, ...]) -> Any:
