@@ -27,9 +27,38 @@ The :func:`wrap_openai` function works on both ``openai.OpenAI``
 
 from __future__ import annotations
 
+import warnings
 from typing import TypeVar
 
 ClientT = TypeVar("ClientT")
+
+#: Owner-attribution prefixes signet recognizes as well-formed (L2).
+#: A value lacking any of these is accepted (we don't reject bad
+#: owners — the audit chain still records exactly what the caller
+#: provided), but a ``UserWarning`` fires so the misuse is visible
+#: in test runs and dev consoles. Keep this in sync with the
+#: ``Owner`` model in :mod:`signet.core.owner`.
+_KNOWN_OWNER_PREFIXES: tuple[str, ...] = ("human:", "agent:", "policy:")
+
+
+def _warn_if_unprefixed_owner(owner: str | None, *, adapter_name: str) -> None:
+    """Emit a UserWarning when ``owner`` lacks a known attribution prefix.
+
+    Soft validation only: the audit chain still records whatever the
+    caller passed, so misuse is recoverable post-hoc. The warning
+    surfaces the misuse at wrap-time so dev consoles and CI test runs
+    catch it before production traffic flows.
+    """
+    if owner and not any(owner.startswith(p) for p in _KNOWN_OWNER_PREFIXES):
+        warnings.warn(
+            f"owner={owner!r} does not start with a known prefix "
+            f"(expected one of: {_KNOWN_OWNER_PREFIXES}). signet will treat "
+            "it as a literal string but the audit chain will record an "
+            "unattributed owner shape. Suggested form: 'human:<email>' or "
+            f"'agent:<id>'. ({adapter_name})",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 def wrap_openai(
@@ -77,6 +106,8 @@ def wrap_openai(
             "wrap_openai requires one of `owner`, `agent_id`, or `policy` "
             "(signet refuses requests without a resolvable commit owner)"
         )
+
+    _warn_if_unprefixed_owner(owner, adapter_name="wrap_openai")
 
     # Tested against openai>=1.0. The SDK exposes ``base_url`` and
     # ``default_headers`` as mutable attributes; if a future major

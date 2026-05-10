@@ -83,16 +83,25 @@ the proxy refuses to instantiate it.
 
 ## Pinning your dependency
 
-Until signet hits 1.0, pin against minor:
+Until signet hits 1.0, pin against the minor line so patch upgrades
+flow but a 0.2 ABI bump fails fast at install time:
 
 ```toml
 [project]
-dependencies = ["signet-sign~=0.1"]
+dependencies = ["signet-sign~=0.1.0"]
 ```
 
-The 0.1.x line is in active design; major-version (X.Y) is the
-boundary for ABI compatibility. After 1.0, pin against `~=1.0` and
-let patch versions float.
+PEP 440 semantics for the compatible-release operator (`~=`) depend
+on the precision you write:
+
+- `~=0.1.0` means `>=0.1.0, <0.2` — patch versions float, the next
+  minor (`0.2`) is excluded. This is what you want during 0.1.x.
+- `~=0.1` means `>=0.1, <1` — every 0.x minor is allowed, including
+  the breaking `0.2.0`. Do **not** use this; it defeats the purpose
+  of pinning during the pre-1.0 design window.
+
+After 1.0, pin against `~=1.0` and let minor + patch versions float
+(major-version `2` is the next ABI boundary).
 
 ## What's roadmap (not in 0.1.6)
 

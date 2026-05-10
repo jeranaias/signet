@@ -17,6 +17,27 @@ than via a constructor flag (which would defeat
 
 Pattern format: any Python ``re`` regex. Compiled once at construction.
 
+**Multi-pattern ordering (C4.4).** When more than one pattern matches
+the same input, the *first registered* pattern's result is returned.
+That means a security-sensitive ``block`` pattern registered AFTER a
+``redact`` pattern will be silently masked. **Register block patterns
+first** to keep the strictest decision in front. The same rule
+applies to :class:`RegexOutputCheck` for streaming output.
+
+**Vision-style content (C4.3).** When a message's ``content`` is an
+OpenAI-style list (mixed text + image_url parts), only the ``text``
+parts are extracted and scanned. Image bytes / URLs are left alone:
+they're outside this check's threat model. If you need image
+matching, layer a separate vision-aware check.
+
+**System-role messages (C4.2).** By default, every message is scanned
+regardless of role — system, user, and assistant messages all flow
+through the matcher. That preserves the v0.1.6 semantics. To restrict
+scanning to specific roles, pass ``roles=("user",)`` to either check
+constructor; messages with other roles are skipped entirely. The
+default ``roles=None`` keeps the v0.1.6 "scan everything" behavior
+so existing deployments are not silently relaxed.
+
 **ReDoS protection (v0.1.7).** When the third-party ``regex`` package
 is installed, every match is run with a per-pattern wall-clock
 ``timeout_seconds`` (default 0.5s). Pathological inputs against
@@ -26,7 +47,9 @@ result rather than holding the asyncio event loop for tens of
 seconds. Without ``regex`` the check falls back to ``re``; the
 timeout is best-effort and an attacker-controlled pattern can still
 hang the loop. ``pip install regex`` (or ``signet-sign[regex]``) for
-the production-grade behaviour.
+the production-grade behaviour. The same protection applies to
+:class:`RegexOutputCheck` (C5.2 — output-side regex shares the
+matcher and its per-pattern timeout).
 """
 
 from __future__ import annotations
@@ -184,19 +207,37 @@ def _scan(
     return tuple(results)
 
 
-def _extract_input_text(body: dict[str, Any]) -> str:
+def _extract_input_text(
+    body: dict[str, Any], roles: tuple[str, ...] | None = None
+) -> str:
     """Best-effort extraction of human-readable text from an OpenAI-shaped
     request body. Concatenates content of every message; ignores tool calls
-    and other non-text fields."""
+    and other non-text fields.
+
+    Args:
+        body: The OpenAI-shaped request body.
+        roles: When provided, only messages whose ``role`` is in this
+            tuple are extracted. ``None`` (default) scans every
+            message regardless of role — preserving the v0.1.6
+            behavior. C4.2: this is the lever operators use to keep
+            system-role messages out of the matcher's scope when their
+            templates legitimately contain marker-shaped strings.
+    """
     parts: list[str] = []
     for msg in body.get("messages", ()):
         if not isinstance(msg, dict):
             continue
+        if roles is not None:
+            role = msg.get("role")
+            if not isinstance(role, str) or role not in roles:
+                continue
         content = msg.get("content")
         if isinstance(content, str):
             parts.append(content)
         elif isinstance(content, list):
-            # OpenAI vision-style: list of content parts
+            # OpenAI vision-style: list of content parts. Only the
+            # ``text`` parts are scanned (C4.3 — image bytes/URLs are
+            # outside this check's threat model).
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
                     parts.append(str(part.get("text", "")))
@@ -204,16 +245,39 @@ def _extract_input_text(body: dict[str, Any]) -> str:
 
 
 class RegexContentCheck(Check):
-    """ADMISSION-stage scanner: applies patterns to the request body."""
+    """ADMISSION-stage scanner: applies patterns to the request body.
+
+    Args:
+        patterns: Patterns to register. The first registered pattern
+            that matches wins; **register block patterns before redact
+            patterns** so a strict decision is never silently masked
+            by a softer earlier match (C4.4).
+        roles: Optional tuple of message roles to scan. ``None``
+            (default) scans every message — the v0.1.6 behavior. Pass
+            ``roles=("user",)`` to skip system / assistant messages
+            (C4.2). Recipe::
+
+                check = RegexContentCheck(
+                    patterns=[Pattern(pattern=r"\\bSSN\\b-\\d+", action="block",
+                                      label="ssn")],
+                    roles=("user",),
+                )
+    """
 
     name = "regex_content"
     stage = Stage.ADMISSION
 
-    def __init__(self, patterns: Iterable[Pattern]) -> None:
+    def __init__(
+        self,
+        patterns: Iterable[Pattern],
+        *,
+        roles: tuple[str, ...] | None = None,
+    ) -> None:
         self._compiled = _compile_patterns(patterns)
+        self._roles = roles
 
     async def pre_request(self, ctx: RequestContext) -> CheckResult:
-        text = _extract_input_text(ctx.body)
+        text = _extract_input_text(ctx.body, roles=self._roles)
         if not text:
             return CheckResult.allow()
         results = _scan(text, self._compiled)
@@ -226,7 +290,13 @@ class RegexContentCheck(Check):
 
 
 class RegexOutputCheck(Check):
-    """INSPECTION-stage scanner: applies patterns to streaming output."""
+    """INSPECTION-stage scanner: applies patterns to streaming output.
+
+    Inherits the ReDoS-timeout protection from the shared matcher
+    (C5.2). The ``timeout_seconds`` field on each :class:`Pattern` is
+    honored on every chunk scan so a pathological output from upstream
+    cannot tie up the asyncio loop.
+    """
 
     name = "regex_output"
     stage = Stage.INSPECTION

@@ -72,6 +72,12 @@ _TRANSPORT_ABORT_REASONS: frozenset[str] = frozenset(
         "upstream_exception",
         "upstream_timeout",
         "upstream_error",
+        # S7: upstream returned non-SSE content-type on a streaming
+        # endpoint. SDKs need this distinct from a policy refusal so
+        # they can decide whether to retry against a different
+        # upstream / route, rather than re-issuing identical traffic
+        # to a misconfigured backend.
+        "upstream_content_type_invalid",
     }
 )
 
@@ -133,6 +139,7 @@ class SignetApp:
             lifespan=self._lifespan,
         )
         self._register_cors()
+        self._register_exception_handlers()
         self._register_routes()
 
     def _register_cors(self) -> None:
@@ -246,6 +253,50 @@ class SignetApp:
         client = httpx.AsyncClient(timeout=timeout)
         self._http = client
         return client
+
+    def _register_exception_handlers(self) -> None:
+        """Wire signet-shaped exception handlers (M8, L5).
+
+        Pre-fix: a wrong-method request could land in any of three
+        bodies depending on which Starlette path it took: the catch-all
+        ``unsupported_v1`` 404 ``{"error": "endpoint not implemented..."}``
+        for GET on registered POST endpoints; an empty 405 body for
+        HEAD; the Starlette default ``{"detail": "Method Not Allowed"}``
+        for OPTIONS. Three different shapes for the same class of
+        client error is poor UX.
+
+        Post-fix: register a single 405 handler that emits a stable
+        ``{"error": "method not allowed", "endpoint": "<path>",
+        "allowed_methods": [...]}`` body with the ``Allow`` header set
+        from the ``HTTPException`` instance when present. The catch-all
+        ``unsupported_v1`` keeps its 404 body for genuinely unimplemented
+        endpoints (``/v1/audio/*``, ``/v1/images/*``).
+        """
+        from fastapi import HTTPException
+        from starlette.exceptions import HTTPException as StarletteHTTPException
+
+        async def _method_not_allowed(
+            request: Request, exc: HTTPException | StarletteHTTPException
+        ) -> Response:
+            allow_header = exc.headers.get("Allow") if exc.headers else None
+            allowed = (
+                [m.strip() for m in allow_header.split(",") if m.strip()]
+                if allow_header
+                else []
+            )
+            body: dict[str, Any] = {
+                "error": "method not allowed",
+                "endpoint": request.url.path,
+                "allowed_methods": allowed,
+            }
+            headers = {"Allow": allow_header} if allow_header else {}
+            return JSONResponse(status_code=405, content=body, headers=headers)
+
+        # Starlette and FastAPI both raise HTTPException(405) for
+        # method-mismatch routing. Install a handler keyed on the
+        # status code so any future internal code path that raises 405
+        # also gets the unified shape.
+        self.app.add_exception_handler(405, _method_not_allowed)
 
     def _register_routes(self) -> None:
         async def _health_payload() -> dict[str, Any]:
@@ -389,6 +440,25 @@ class SignetApp:
             @self.app.websocket("/v1/realtime")
             async def realtime_websocket(websocket: WebSocket) -> None:
                 await self._handle_realtime(websocket)
+        else:
+            # R3: when the realtime endpoint is disabled, register an
+            # explicit stub handler that accepts the WebSocket and
+            # immediately closes with code 1011 + a human-readable
+            # reason. Without this, connecting clients see a generic
+            # ``WebSocketDisconnect`` with empty message — they cannot
+            # distinguish "endpoint disabled in config" from "endpoint
+            # not registered" or "transient network error". The 1011
+            # close-code is RFC 6455 internal-error: a stable signal
+            # that the server is up but refusing this specific
+            # endpoint by configuration.
+
+            @self.app.websocket("/v1/realtime")
+            async def realtime_disabled(websocket: WebSocket) -> None:
+                await websocket.accept()
+                await websocket.close(
+                    code=1011,
+                    reason="realtime endpoint disabled in config",
+                )
 
         # Explicit refusal for OpenAI endpoints we do NOT yet gate.
         # /v1/audio/* and /v1/images/* are deferred because their
@@ -397,9 +467,19 @@ class SignetApp:
         # surface. Adding them is roadmap for v0.2 and they will need
         # their own check protocols (vision-aware checks, audio
         # transcript checks, etc.).
+        #
+        # M8: catch-all only handles POST. GET/PUT/DELETE/PATCH/HEAD/
+        # OPTIONS on a *registered* POST endpoint hit the framework's
+        # 405 routing instead, where ``_register_exception_handlers``
+        # gives them the unified ``method not allowed`` shape. This
+        # avoids three different bodies for the same client error
+        # class (the pre-fix path returned a 404 catch-all body for GET
+        # on POST endpoints, which made the wrong-method failure mode
+        # indistinguishable from the unimplemented-endpoint failure
+        # mode).
         @self.app.api_route(
             "/v1/{path:path}",
-            methods=["POST", "GET", "PUT", "DELETE", "PATCH"],
+            methods=["POST"],
         )
         async def unsupported_v1(path: str) -> Response:
             return JSONResponse(
@@ -876,13 +956,62 @@ class SignetApp:
                             yield frame
                         return
 
+                    # S7: content-type guard. A 200 OK with
+                    # ``application/octet-stream`` (or any non-SSE
+                    # content type) means the upstream is shipping
+                    # something other than server-sent events through
+                    # what should be a streaming endpoint. Forwarding
+                    # the bytes verbatim would let upstream garbage
+                    # land on the client without ever being inspected.
+                    # Emit a structured abort so SDKs can react.
+                    #
+                    # Defensive lookup: some test stubs and minimal
+                    # transports don't expose a Headers-shaped object;
+                    # an absent or empty content-type is treated as
+                    # "trust the upstream" (the historical behavior).
+                    # Hostile bytes still get inspected line-by-line
+                    # downstream — the strict block here only fires
+                    # when the upstream explicitly declared a
+                    # non-SSE / non-text content type.
+                    upstream_headers = getattr(upstream, "headers", None) or {}
+                    try:
+                        upstream_content_type = upstream_headers.get(
+                            "content-type", ""
+                        )
+                    except AttributeError:  # pragma: no cover — defensive
+                        upstream_content_type = ""
+                    upstream_content_type = (upstream_content_type or "").lower()
+                    if upstream_content_type and not upstream_content_type.startswith(
+                        ("text/event-stream", "text/plain")
+                    ):
+                        upstream_aborted = True
+                        rctx.finish_reason = "upstream_content_type_invalid"
+                        async for frame in self._emit_upstream_error_abort(
+                            ctx,
+                            rctx,
+                            upstream_status=upstream.status_code,
+                            reason_detail=(
+                                f"upstream returned content-type "
+                                f"{upstream_content_type!r}; expected "
+                                "text/event-stream"
+                            ),
+                            reason_token="upstream_content_type_invalid",  # noqa: S106
+                        ):
+                            yield frame
+                        return
+
                     try:
                         async for raw_chunk in upstream.aiter_bytes():
                             rctx.chunk_count += 1
                             chunk_text = raw_chunk.decode("utf-8", errors="replace")
                             # extend_text enforces the per-response cap so a
                             # multi-megabyte stream cannot OOM the proxy.
-                            rctx.extend_text(_extract_sse_content(chunk_text))
+                            rctx.extend_text(
+                                _extract_sse_content(
+                                    chunk_text,
+                                    inspect_all_lines=self.config.inspect_all_sse_lines,
+                                )
+                            )
 
                             inspection = await self.pipeline.inspect_response_chunk(
                                 rctx, chunk_text
@@ -1123,10 +1252,22 @@ class SignetApp:
         keep behavior consistent with policy-blocked aborts.
         """
         is_transport = reason in _TRANSPORT_ABORT_REASONS
+        # Build the payload in the canonical key order documented in
+        # docs/streaming.md (M4): signet_abort, reason, correlation_id,
+        # stage, check. SDKs that parse JSON don't care about order, but
+        # operators reading a streamed log of frames do; aligning the
+        # wire shape with the documented order keeps eyeball-debugging
+        # honest. Python dict literals preserve insertion order since
+        # 3.7, so an explicit ordered construction below is sufficient.
+        correlation_id = entry.entry_id if entry is not None else None
+        # Audit chain disabled (no audit_log_path). The None value above
+        # surfaces this so the SDK can distinguish "no chain" from
+        # "chain entry write failed".
         if self.config.strict_error_redaction and not is_transport:
             payload: dict[str, Any] = {
                 "signet_abort": True,
                 "reason": "refused",
+                "correlation_id": correlation_id,
                 "stage": stage,
             }
         elif self.config.strict_error_redaction and is_transport:
@@ -1135,23 +1276,18 @@ class SignetApp:
             payload = {
                 "signet_abort": True,
                 "reason": reason,
+                "correlation_id": correlation_id,
                 "stage": stage,
             }
         else:
             payload = {
                 "signet_abort": True,
                 "reason": reason,
+                "correlation_id": correlation_id,
                 "stage": stage,
             }
             if check_name:
                 payload["check"] = str(check_name)
-        if entry is not None:
-            payload["correlation_id"] = entry.entry_id
-        else:
-            # Audit chain disabled (no audit_log_path). Surface this so
-            # the SDK can distinguish "no chain" from "chain entry
-            # write failed".
-            payload["correlation_id"] = None
         return [
             b"data: " + json.dumps(payload).encode("utf-8") + b"\n\n",
             b"data: [DONE]\n\n",
@@ -1541,7 +1677,14 @@ def _walk_path(data: Any, path: tuple[Any, ...]) -> Any:
     return cur
 
 
-def _extract_sse_content(chunk_text: str) -> str:
+#: SSE field-name prefixes that ``_extract_sse_content`` will scan
+#: when ``inspect_all_sse_lines`` is enabled (S6). The bare ``:``
+#: prefix is the SSE comment shape; everything else is a per-spec
+#: field. ``data:`` is always scanned regardless of the flag.
+_SSE_NON_DATA_PREFIXES: tuple[str, ...] = ("event:", "id:", "retry:", ":")
+
+
+def _extract_sse_content(chunk_text: str, *, inspect_all_lines: bool = False) -> str:
     """Pull the content text out of OpenAI-shaped SSE 'data:' frames.
 
     Best-effort. Used only to feed checks like ScopeDriftCheck that
@@ -1553,6 +1696,16 @@ def _extract_sse_content(chunk_text: str) -> str:
     never matters in practice, but other OpenAI-compatible upstreams
     (LiteLLM, vLLM with prompt-streaming) do emit multi-line events.
     Coalesce them so INSPECTION sees the full text.
+
+    S6 hardening: when ``inspect_all_lines`` is True, payloads carried
+    on ``event:``, ``id:``, ``retry:``, or ``:`` (comment) lines are
+    appended to the returned text verbatim. The default is False —
+    flipping it on closes the side-channel where a hostile upstream
+    could ship classified text via ``event: foo\\ndata: bar\\n\\n``
+    and have INSPECTION only see ``bar``. Trade-off: legitimate event
+    metadata that coincidentally contains scanner-sensitive substrings
+    becomes a false-positive source. Operators opt in via
+    ``ServerConfig.inspect_all_sse_lines``.
     """
     out: list[str] = []
     pending: list[str] = []  # data: lines for the current event
@@ -1578,14 +1731,23 @@ def _extract_sse_content(chunk_text: str) -> str:
         if raw_line.strip() == "":
             _flush_event()
             continue
-        if not raw_line.startswith("data:"):
+        if raw_line.startswith("data:"):
+            # Per spec: strip a single leading space after the colon,
+            # not arbitrary whitespace; preserve any further leading
+            # whitespace in the payload.
+            payload_line = raw_line[len("data:") :]
+            if payload_line.startswith(" "):
+                payload_line = payload_line[1:]
+            pending.append(payload_line)
             continue
-        # Per spec: strip a single leading space after the colon, not
-        # arbitrary whitespace; preserve any further leading whitespace
-        # in the payload.
-        payload_line = raw_line[len("data:") :]
-        if payload_line.startswith(" "):
-            payload_line = payload_line[1:]
-        pending.append(payload_line)
+        if inspect_all_lines:
+            for prefix in _SSE_NON_DATA_PREFIXES:
+                if raw_line.startswith(prefix):
+                    extra = raw_line[len(prefix) :]
+                    if extra.startswith(" "):
+                        extra = extra[1:]
+                    if extra:
+                        out.append(extra)
+                    break
     _flush_event()
     return "".join(out)

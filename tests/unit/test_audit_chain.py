@@ -588,3 +588,149 @@ class TestVerificationReportShape:
         assert breaks
         assert breaks[0].entry_id == a.entry_id
         assert "hmac" in breaks[0].detail.lower()
+
+
+class TestA13ReportProvenance:
+    """A13 (v0.1.7): VerificationReport carries ``signet_version`` and
+    ``verified_at`` for long-term forensics — a stored verify report
+    can be tied to the binary that produced it and the wall-clock
+    moment of verification."""
+
+    def test_clean_report_carries_version_and_timestamp(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        from signet import __version__
+
+        chain.append(_entry("a"))
+        report = ChainVerifier(backend, keyring).verify()
+        assert report.signet_version == __version__
+        # ISO 8601 with timezone — startswith digit and contains 'T'.
+        assert report.verified_at[0].isdigit()
+        assert "T" in report.verified_at
+
+    def test_broken_report_also_carries_provenance(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        """Provenance fields must be populated regardless of whether
+        the chain verifies clean — operators preserving evidence need
+        them on the broken-chain path most of all."""
+        from signet import __version__
+
+        chain.append(_entry("a"))
+        # Tamper to force a break.
+        lines = backend.path.read_text(encoding="utf-8").splitlines()
+        d = json.loads(lines[0])
+        d["reason"] = "MUTATED"
+        lines[0] = json.dumps(d, separators=(",", ":"), sort_keys=True)
+        backend.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        assert report.signet_version == __version__
+        assert report.verified_at
+
+
+class TestA14SentinelDocumented:
+    """A14 (v0.1.7): a ``last_known_good_index = -1`` is a sentinel
+    meaning "no entry verified cleanly", typically because the wrong
+    HMAC secret was supplied. The dataclass docstring documents this;
+    here we lock the behavior in a test."""
+
+    def test_wrong_secret_yields_sentinel(self, backend: JsonlBackend) -> None:
+        right_ring = KeyRing(active=Key.generate("k1"))
+        chain = HmacChain(backend, right_ring)
+        for i in range(3):
+            chain.append(_entry(f"e{i}"))
+
+        # Verify under a *different* secret — every entry self-mismatches.
+        wrong_ring = KeyRing(
+            active=Key(key_id="k1", secret=b"x" * 32)
+        )
+        report = ChainVerifier(backend, wrong_ring).verify()
+        assert not report.ok
+        assert report.last_known_good_index == -1
+        assert report.last_known_good_hmac == ""
+
+    def test_dataclass_docstring_documents_sentinel(self) -> None:
+        from signet.audit.verifier import VerificationReport
+
+        doc = VerificationReport.__doc__ or ""
+        # The docstring must call out the -1 sentinel meaning so
+        # consumers don't misread it as a head pointer.
+        assert "-1" in doc
+        assert "sentinel" in doc.lower() or "no entry" in doc.lower()
+
+
+class TestA10ArchiveFormatInvalidNoSyntheticLink:
+    """A10 (v0.1.7): an unreadable archive (ARCHIVE_FORMAT_INVALID)
+    used to surface a synthetic LINK_MISMATCH on the next live entry.
+    One corruption, two breaks. v0.1.7 suppresses the synthetic
+    follow-up so the report stays canonical."""
+
+    def test_corrupt_archive_does_not_emit_synthetic_link_break(
+        self, tmp_path: Path
+    ) -> None:
+        from signet.audit.compactor import compact_audit_log
+        from signet.audit.verifier import BreakKind, verify_with_archives
+
+        # Build a small chain and compact half of it.
+        log_path = tmp_path / "audit.jsonl"
+        archive_dir = tmp_path / "archives"
+        archive_dir.mkdir()
+
+        ring = KeyRing(active=Key.generate("k1"))
+        backend = JsonlBackend(log_path)
+        chain = HmacChain(backend, ring)
+        for i in range(6):
+            chain.append(_entry(f"e{i}"))
+
+        # Compact all entries strictly before a future cutoff.
+        from datetime import UTC, datetime, timedelta
+
+        future_cutoff = datetime.now(UTC) + timedelta(seconds=1)
+        archive_path = archive_dir / "archive-1.bin"
+        result = compact_audit_log(
+            chain=chain,
+            backend=backend,
+            before=future_cutoff,
+            output=archive_path,
+            quiesce_required=False,
+        )
+        assert result is not None and result.compacted_count > 0
+        # Append more live entries after the marker.
+        for i in range(3):
+            chain.append(_entry(f"after-{i}"))
+
+        # Corrupt the archive: flip a byte in the middle of the file.
+        raw = archive_path.read_bytes()
+        bad = bytearray(raw)
+        # Flip a byte well past the header to land in the body.
+        bad[len(bad) // 2] ^= 0xFF
+        archive_path.write_bytes(bytes(bad))
+
+        report = verify_with_archives(backend, ring, archive_dir)
+        # Exactly one ARCHIVE_FORMAT_INVALID; the synthetic link break
+        # on the first post-marker live entry must NOT also be present.
+        kinds = [b.kind for b in report.breaks]
+        assert BreakKind.ARCHIVE_FORMAT_INVALID in kinds, (
+            f"expected ARCHIVE_FORMAT_INVALID; got {kinds}"
+        )
+        # Count link breaks at the FIRST live-entry index after the
+        # marker. With A10, that synthetic break is suppressed.
+        # The verifier may still report deeper breaks if any, but the
+        # immediate downstream synthetic one should not be there.
+        format_breaks = [
+            b for b in report.breaks if b.kind is BreakKind.ARCHIVE_FORMAT_INVALID
+        ]
+        link_breaks = [
+            b for b in report.breaks if b.kind is BreakKind.LINK_MISMATCH
+        ]
+        # The post-A10 contract: at most one link_mismatch is acceptable
+        # if subsequent unrelated tampering is present, but with our
+        # clean post-marker writes there should be ZERO synthetic
+        # link breaks.
+        assert len(format_breaks) >= 1
+        assert len(link_breaks) == 0, (
+            f"A10 regression: synthetic link_mismatch surfaced after "
+            f"ARCHIVE_FORMAT_INVALID; breaks={report.breaks}"
+        )

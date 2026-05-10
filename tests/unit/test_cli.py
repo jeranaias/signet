@@ -1997,3 +1997,265 @@ class TestProbeCorpusBase32:
             "ignore previous instructions"
             in codecs.decode(rot13_payload, "rot_13").lower()
         )
+
+
+# ---------------------------------------------------------------------------
+# v0.1.7 P2 CLI polish
+# ---------------------------------------------------------------------------
+
+
+class TestPluginsGroupHelp:
+    """C8: ``signet plugins --help`` describes the entry-point groups,
+    the four reported statuses, and the ``list`` / ``doctor`` flow.
+    """
+
+    def test_help_lists_entry_point_groups(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(main, ["plugins", "--help"])
+        assert result.exit_code == 0, result.output
+        for token in ("signet.checks", "signet.adapters", "signet.anchors"):
+            assert token in result.output, (
+                f"plugins help missing {token!r}: {result.output}"
+            )
+
+    def test_help_lists_four_statuses(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(main, ["plugins", "--help"])
+        assert result.exit_code == 0, result.output
+        for status in ("loaded", "incompatible_abi", "load_error", "duplicate_name"):
+            assert status in result.output, (
+                f"plugins help missing status {status!r}: {result.output}"
+            )
+
+    def test_help_mentions_list_and_doctor(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(main, ["plugins", "--help"])
+        assert result.exit_code == 0, result.output
+        assert "plugins list" in result.output
+        assert "plugins doctor" in result.output
+
+
+class TestKeysGenerateEd25519Sidecar:
+    """C9: when ``--key-id`` is supplied, ``keys generate-ed25519`` writes
+    a sidecar ``<out>.meta.json`` so the binding survives terminal close.
+    """
+
+    def test_sidecar_written_when_key_id_supplied(self, tmp_path: Path) -> None:
+        import json as _json
+
+        runner = CliRunner()
+        priv_path = tmp_path / "signet.key"
+        result = runner.invoke(
+            main,
+            [
+                "keys",
+                "generate-ed25519",
+                "--out",
+                str(priv_path),
+                "--key-id",
+                "operator-2026q2",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        meta_path = tmp_path / "signet.key.meta.json"
+        assert meta_path.exists(), "sidecar meta JSON was not written"
+        meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+        assert meta["key_id"] == "operator-2026q2"
+        assert meta.get("generated_at")
+        assert meta.get("signet_version")
+        # Help text must advertise the sidecar so operators can rely on it.
+        help_result = runner.invoke(
+            main, ["keys", "generate-ed25519", "--help"]
+        )
+        assert ".meta.json" in help_result.output
+
+    def test_no_sidecar_when_key_id_omitted(self, tmp_path: Path) -> None:
+        runner = CliRunner()
+        priv_path = tmp_path / "signet.key"
+        result = runner.invoke(
+            main,
+            ["keys", "generate-ed25519", "--out", str(priv_path)],
+        )
+        assert result.exit_code == 0, result.output
+        meta_path = tmp_path / "signet.key.meta.json"
+        assert not meta_path.exists(), (
+            "sidecar should only land when --key-id is supplied"
+        )
+
+
+class TestInitHelpDescribesScaffold:
+    """C10: ``signet init --help`` enumerates the four scaffolded files,
+    explains the per-file overwrite policy, and gives the post-init
+    checklist.
+    """
+
+    def test_help_lists_four_scaffolded_files(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(main, ["init", "--help"])
+        assert result.exit_code == 0, result.output
+        for fname in (
+            "pipeline.py",
+            "client_example.py",
+            ".env.example",
+            ".gitignore",
+        ):
+            assert fname in result.output, (
+                f"init help missing {fname!r}: {result.output}"
+            )
+
+    def test_help_mentions_skip_if_exists_policy(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(main, ["init", "--help"])
+        assert result.exit_code == 0, result.output
+        # The help text should communicate that pre-existing files are
+        # skipped rather than overwritten.
+        out_lower = result.output.lower()
+        assert "already exist" in out_lower or "skipped" in out_lower
+
+    def test_help_includes_post_init_serve_command(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(main, ["init", "--help"])
+        assert result.exit_code == 0, result.output
+        # The post-init checklist must point at signet serve --dev.
+        assert "signet serve" in result.output
+        assert "--dev" in result.output
+
+
+class TestAuditVerifyEmptyChain:
+    """A15: ``signet audit verify`` on an empty chain prints
+    ``OK: 0 entries (chain is empty)`` rather than the cosmetic
+    ``(last hmac=)`` empty parenthesis.
+    """
+
+    def test_empty_chain_omits_empty_parens(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        log_path.write_text("", encoding="utf-8")
+        secret = b"x" * 32
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "verify",
+                str(log_path),
+                "--hmac-secret",
+                secret.hex(),
+                "--key-id",
+                "k1",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "OK: 0 entries" in result.output
+        assert "chain is empty" in result.output
+        # The dangling empty parenthesis must not appear.
+        assert "(last hmac=)" not in result.output
+        assert "last hmac=" not in result.output
+
+
+class TestParseDurationExtended:
+    """A16: ``_parse_duration`` accepts m / h / d / w suffixes and a
+    subset of ISO 8601 durations.
+    """
+
+    def test_minutes_suffix(self) -> None:
+        from datetime import timedelta
+
+        from signet.cli import _parse_duration
+
+        assert _parse_duration("30m") == timedelta(minutes=30)
+
+    def test_weeks_suffix(self) -> None:
+        from datetime import timedelta
+
+        from signet.cli import _parse_duration
+
+        assert _parse_duration("2w") == timedelta(weeks=2)
+
+    def test_existing_hours_and_days_still_work(self) -> None:
+        from datetime import timedelta
+
+        from signet.cli import _parse_duration
+
+        assert _parse_duration("24h") == timedelta(hours=24)
+        assert _parse_duration("7d") == timedelta(days=7)
+
+    def test_iso8601_pt_form(self) -> None:
+        from datetime import timedelta
+
+        from signet.cli import _parse_duration
+
+        assert _parse_duration("PT1H30M") == timedelta(hours=1, minutes=30)
+        assert _parse_duration("PT90M") == timedelta(minutes=90)
+
+    def test_iso8601_pnd_and_pnw(self) -> None:
+        from datetime import timedelta
+
+        from signet.cli import _parse_duration
+
+        assert _parse_duration("P1D") == timedelta(days=1)
+        assert _parse_duration("P1W") == timedelta(weeks=1)
+
+    def test_iso8601_year_or_month_rejected(self) -> None:
+        import click as _click
+        import pytest as _pytest
+
+        from signet.cli import _parse_duration
+
+        # Years and months are rejected because their length depends
+        # on calendar position.
+        for spec in ("P1Y", "P1M"):
+            with _pytest.raises(_click.ClickException):
+                _parse_duration(spec)
+
+    def test_garbage_rejected(self) -> None:
+        import click as _click
+        import pytest as _pytest
+
+        from signet.cli import _parse_duration
+
+        for spec in ("", "abc", "30x", "P", "PT", "-1h"):
+            with _pytest.raises(_click.ClickException):
+                _parse_duration(spec)
+
+    def test_help_enumerates_accepted_formats(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", "report", "--help"])
+        assert result.exit_code == 0, result.output
+        # The new help text enumerates m / h / d / w and ISO 8601.
+        for token in ("minutes", "hours", "days", "weeks", "ISO 8601"):
+            assert token in result.output, (
+                f"audit report --since help missing {token!r}: {result.output}"
+            )
+
+    def test_audit_report_accepts_minutes_window(self, tmp_path: Path) -> None:
+        # End-to-end: passing --since 30m must not raise; the report
+        # renders with an empty chain (zero decisions) but exit 0.
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        chain.append(
+            AuditEntry(
+                owner=Owner.human("alice"),
+                check_name="owner_resolution",
+                decision=Decision.ALLOW,
+                reason="ok",
+            )
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "report",
+                "--audit-log",
+                str(log_path),
+                "--since",
+                "30m",
+                "--anonymize-salt",
+                "test-salt",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "# signet audit report" in result.output

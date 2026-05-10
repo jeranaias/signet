@@ -33,6 +33,8 @@ from __future__ import annotations
 
 from typing import TypeVar
 
+from signet.adapters.openai import _warn_if_unprefixed_owner
+
 ClientT = TypeVar("ClientT")
 
 
@@ -60,6 +62,8 @@ def wrap_anthropic(
             "wrap_anthropic requires one of `owner`, `agent_id`, or `policy` "
             "(signet refuses requests without a resolvable commit owner)"
         )
+
+    _warn_if_unprefixed_owner(owner, adapter_name="wrap_anthropic")
 
     # Tested against anthropic>=0.30. The SDK exposes ``base_url`` and
     # ``default_headers`` as mutable attributes; refuse to wrap a

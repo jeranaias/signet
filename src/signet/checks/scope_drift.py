@@ -19,10 +19,16 @@ Three drift dimensions are checked out of the box:
    ``max_tokens * (1 + tolerance)``.
 2. **Length drift** (character-level): output character count exceeds
    ``hard_char_cap`` (default 4x the per-token-2-char rule of thumb on
-   ``max_tokens``).
+   ``max_tokens``). **Requires ``max_tokens`` to be a positive integer
+   in the request body** — without it the character cap has no
+   anchor and length drift is not enforced (C7.3). Callers that need
+   length drift detection MUST set ``max_tokens`` on every request.
 3. **Content drift via classification re-scan**: output contains marker
    strings (e.g. ``"SECRET//NOFORN"``) above the request's declared
-   classification.
+   classification. Cross-chunk markers are detected: a marker split
+   across two streamed chunks (``"(S//"`` then ``"NF)"``) is caught
+   on the second chunk because the matcher scans
+   ``ctx.accumulated_text`` (C7.2).
 
 Marker false-positive surface: matching is literal-substring. A model
 explaining "the SECRET//NOFORN handling rules are…" in legitimately

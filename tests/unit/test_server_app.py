@@ -1695,3 +1695,435 @@ class TestBoolEnvParser:
         assert cfg.shadow is False
         cfg = ServerConfig.from_env({"SIGNET_SHADOW": "no"})
         assert cfg.shadow is False
+
+
+class TestFromEnvErrorMessages:
+    """v0.1.7 L8: ``from_env`` errors name the SIGNET_* var that failed.
+
+    Bare ``int(value)`` / ``bytes.fromhex(value)`` raise ValueError with
+    no context about which env var was bad. The wrapped parsers in
+    ``config.py`` re-raise with the var name so misconfigurations are
+    immediately attributable.
+    """
+
+    def test_bad_port_names_var(self) -> None:
+        with pytest.raises(ValueError, match="SIGNET_PORT"):
+            ServerConfig.from_env({"SIGNET_PORT": "abc"})
+
+    def test_bad_request_timeout_names_var(self) -> None:
+        with pytest.raises(ValueError, match="SIGNET_REQUEST_TIMEOUT_S"):
+            ServerConfig.from_env({"SIGNET_REQUEST_TIMEOUT_S": "not-a-float"})
+
+    def test_bad_max_request_body_bytes_names_var(self) -> None:
+        with pytest.raises(ValueError, match="SIGNET_MAX_REQUEST_BODY_BYTES"):
+            ServerConfig.from_env({"SIGNET_MAX_REQUEST_BODY_BYTES": "huge"})
+
+    def test_bad_hmac_secret_names_var(self) -> None:
+        # Non-hex characters fail with a SIGNET_HMAC_SECRET-named error.
+        with pytest.raises(ValueError, match="SIGNET_HMAC_SECRET"):
+            ServerConfig.from_env({"SIGNET_HMAC_SECRET": "not-hex-zzz"})
+
+    def test_good_int_still_parses(self) -> None:
+        cfg = ServerConfig.from_env({"SIGNET_PORT": "9999"})
+        assert cfg.port == 9999
+
+
+class TestFromEnvCliOnlyVarsIgnored:
+    """v0.1.7 M1: ``SIGNET_LOG_FORMAT`` and ``SIGNET_ANONYMIZE_SALT`` are
+    CLI-time vars; ``from_env`` does not touch them. The docstring says
+    so explicitly; this test pins the behavior so a future refactor
+    that decides to read them must also update the doc.
+    """
+
+    def test_log_format_is_not_a_serverconfig_field(self) -> None:
+        cfg = ServerConfig.from_env({"SIGNET_LOG_FORMAT": "json"})
+        # No field named ``log_format``; the env var is silently
+        # ignored by ServerConfig (it's consumed at the CLI surface).
+        assert not hasattr(cfg, "log_format")
+
+    def test_anonymize_salt_is_not_a_serverconfig_field(self) -> None:
+        cfg = ServerConfig.from_env({"SIGNET_ANONYMIZE_SALT": "deadbeef"})
+        assert not hasattr(cfg, "anonymize_salt")
+
+
+class TestInspectAllSseLines:
+    """v0.1.7 S6: opt-in scanning of non-``data:`` SSE lines.
+
+    By default INSPECTION only sees ``data:`` payloads — an upstream can
+    smuggle content through ``event:`` / ``id:`` / ``retry:`` / ``:``
+    lines. Flipping ``inspect_all_sse_lines=True`` feeds those payloads
+    into ``ResponseContext.accumulated_text`` so checks like
+    ScopeDriftCheck can scan them.
+    """
+
+    def test_default_does_not_extract_event_line(self) -> None:
+        from signet.server.app import _extract_sse_content
+
+        chunk = "event: foo\ndata: bar\n\n"
+        # Default: only ``data:`` payloads contribute. ``bar`` is not
+        # JSON so the JSON-parse path returns empty; ``foo`` is also
+        # ignored.
+        assert _extract_sse_content(chunk) == ""
+
+    def test_inspect_all_lines_extracts_event_payload(self) -> None:
+        from signet.server.app import _extract_sse_content
+
+        chunk = "event: classified-marker (S//NF)\ndata: bar\n\n"
+        out = _extract_sse_content(chunk, inspect_all_lines=True)
+        # Event-line payload surfaces verbatim so scanners can match it.
+        assert "(S//NF)" in out
+
+    def test_inspect_all_lines_extracts_id_and_comment(self) -> None:
+        from signet.server.app import _extract_sse_content
+
+        chunk = (
+            "id: 42-secret\n"
+            ": comment-line (S//NF)\n"
+            "retry: 5000\n"
+            "data: {}\n"
+            "\n"
+        )
+        out = _extract_sse_content(chunk, inspect_all_lines=True)
+        assert "42-secret" in out
+        assert "(S//NF)" in out
+        assert "5000" in out
+
+    def test_config_default_is_false(self) -> None:
+        cfg = ServerConfig()
+        assert cfg.inspect_all_sse_lines is False
+
+    def test_config_env_parses(self) -> None:
+        cfg = ServerConfig.from_env({"SIGNET_INSPECT_ALL_SSE_LINES": "1"})
+        assert cfg.inspect_all_sse_lines is True
+
+    def test_streaming_inspection_catches_event_line_marker(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """End-to-end: with the flag on, ScopeDriftCheck catches a
+        marker that lives only on an ``event:`` line."""
+        from signet.audit.backend import JsonlBackend
+        from signet.checks.scope_drift import ScopeDriftCheck
+
+        # Smuggled marker on the event line; the data: line is empty JSON.
+        smuggled = (
+            b"event: leak (S//NF) classified marker\n"
+            b'data: {"choices":[{"delta":{"content":""}}]}\n'
+            b"\n"
+        )
+
+        class _FakeResp:
+            status_code = 200
+            headers: ClassVar[dict[str, str]] = {"content-type": "text/event-stream"}
+
+            async def aiter_bytes(self):
+                yield smuggled
+
+        class _FakeCM:
+            async def __aenter__(self):
+                return _FakeResp()
+
+            async def __aexit__(self, *_a):
+                return None
+
+        def fake_stream(_self, _method, _url, **_kwargs):
+            return _FakeCM()
+
+        monkeypatch.setattr(httpx.AsyncClient, "stream", fake_stream)
+
+        log = tmp_path / "audit.jsonl"
+        cfg = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=log,
+            inspect_all_sse_lines=True,
+            strict_error_redaction=False,
+        )
+        signet_app = SignetApp(
+            config=cfg,
+            pipeline=Pipeline(checks=[ScopeDriftCheck()]),
+        )
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "stream": True,
+                "model": "test",
+                "messages": [{"role": "user", "content": "go"}],
+            },
+            headers={"X-Classification": "UNCLASS"},
+        )
+        assert r.status_code == 200
+        # An inspection abort row was written.
+        entries = list(JsonlBackend(log).iter_entries())
+        names = {e.check_name for e in entries}
+        assert "pipeline.inspection" in names
+
+    def test_streaming_default_does_not_catch_event_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        """Control: with the flag OFF, the same smuggled marker is NOT
+        inspected — confirms the side-channel exists in default mode and
+        the flag is the only gate against it."""
+        from signet.audit.backend import JsonlBackend
+        from signet.checks.scope_drift import ScopeDriftCheck
+
+        smuggled = (
+            b"event: leak (S//NF) classified marker\n"
+            b'data: {"choices":[{"delta":{"content":""}}]}\n'
+            b"\n"
+        )
+
+        class _FakeResp:
+            status_code = 200
+            headers: ClassVar[dict[str, str]] = {"content-type": "text/event-stream"}
+
+            async def aiter_bytes(self):
+                yield smuggled
+
+        class _FakeCM:
+            async def __aenter__(self):
+                return _FakeResp()
+
+            async def __aexit__(self, *_a):
+                return None
+
+        def fake_stream(_self, _method, _url, **_kwargs):
+            return _FakeCM()
+
+        monkeypatch.setattr(httpx.AsyncClient, "stream", fake_stream)
+
+        log = tmp_path / "audit.jsonl"
+        cfg = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=log,
+            inspect_all_sse_lines=False,  # default
+            strict_error_redaction=False,
+        )
+        signet_app = SignetApp(
+            config=cfg,
+            pipeline=Pipeline(checks=[ScopeDriftCheck()]),
+        )
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "stream": True,
+                "model": "test",
+                "messages": [{"role": "user", "content": "go"}],
+            },
+            headers={"X-Classification": "UNCLASS"},
+        )
+        assert r.status_code == 200
+        # No inspection row was written — the marker on the event-line
+        # was never seen by INSPECTION.
+        entries = list(JsonlBackend(log).iter_entries())
+        names = {e.check_name for e in entries}
+        assert "pipeline.inspection" not in names
+
+
+class TestAbortFrameKeyOrder:
+    """v0.1.7 M4: abort frame field order matches the documented contract.
+
+    docs/streaming.md documents ``signet_abort, reason, correlation_id,
+    stage, check`` (in that order). SDKs parse JSON dicts unordered, but
+    operators reading streamed log frames match by visual scan; the
+    wire payload should match the doc.
+    """
+
+    @staticmethod
+    def _build_app(strict: bool) -> Any:
+        cfg = ServerConfig(
+            upstream_url="http://m/v1",
+            allow_ephemeral_key=True,
+            strict_error_redaction=strict,
+        )
+        return SignetApp(config=cfg, pipeline=Pipeline(checks=[]))
+
+    def test_strict_policy_block_key_order(self) -> None:
+        from signet.audit.chain import HmacChain
+        from signet.audit.keyring import Key, KeyRing
+        from signet.core.audit import AuditEntry, Decision
+        from signet.core.owner import Owner
+
+        ring = KeyRing(active=Key(key_id="k1", secret=b"x" * 32))
+        chain = HmacChain(
+            backend=type(
+                "B",
+                (),
+                {
+                    "append": lambda self, e: None,
+                    "iter_entries": lambda self: iter([]),
+                    "last_entry": lambda self: None,
+                },
+            )(),
+            keyring=ring,
+        )
+        entry = chain.append(
+            AuditEntry(
+                owner=Owner.human("a"),
+                check_name="x",
+                decision=Decision.BLOCK,
+                reason="r",
+            )
+        )
+
+        app = self._build_app(strict=True)
+        frames = app._build_abort_frames(
+            reason="some policy reason",
+            stage="inspection",
+            check_name="scope_drift",
+            entry=entry,
+        )
+        # The first frame is the abort payload; insertion order matches
+        # the documented ordering. We use list(payload.keys()) because
+        # Python 3.7+ preserves dict insertion order on the wire.
+        body = frames[0].decode("utf-8").lstrip("data: ").strip()
+        import json as _json
+
+        payload = _json.loads(body)
+        keys = list(payload.keys())
+        # Strict drops ``check`` so the prefix is the documented first
+        # four keys; nothing follows.
+        assert keys == ["signet_abort", "reason", "correlation_id", "stage"]
+
+    def test_verbose_policy_block_key_order(self) -> None:
+        app = self._build_app(strict=False)
+        frames = app._build_abort_frames(
+            reason="some policy reason",
+            stage="inspection",
+            check_name="scope_drift",
+            entry=None,
+        )
+        body = frames[0].decode("utf-8").lstrip("data: ").strip()
+        import json as _json
+
+        payload = _json.loads(body)
+        keys = list(payload.keys())
+        # Verbose: full documented order including ``check``.
+        assert keys == [
+            "signet_abort",
+            "reason",
+            "correlation_id",
+            "stage",
+            "check",
+        ]
+
+    def test_transport_reason_strict_key_order(self) -> None:
+        app = self._build_app(strict=True)
+        frames = app._build_abort_frames(
+            reason="upstream_protocol_violation",
+            stage="inspection",
+            check_name=None,
+            entry=None,
+        )
+        import json as _json
+
+        payload = _json.loads(frames[0].decode("utf-8").lstrip("data: ").strip())
+        keys = list(payload.keys())
+        # Transport reason preserves order; check is omitted (no firing
+        # check on a wire-state failure).
+        assert keys == ["signet_abort", "reason", "correlation_id", "stage"]
+
+
+class TestMethodNotAllowed:
+    """v0.1.7 M8 / L5: wrong-method requests share a single signet shape.
+
+    Pre-fix: GET on a registered POST endpoint hit the ``unsupported_v1``
+    catch-all and returned a 404 ``{"error": "endpoint not implemented..."}``;
+    HEAD returned 405 with empty body; OPTIONS returned 405 with the
+    Starlette default ``{"detail": "Method Not Allowed"}``. Three
+    different shapes for the same client error class.
+
+    Post-fix: a single 405 exception handler emits
+    ``{"error": "method not allowed", "endpoint": "<path>",
+    "allowed_methods": [...]}`` for every wrong-method request to a
+    registered endpoint.
+    """
+
+    @pytest.fixture
+    def client(self, app_factory) -> TestClient:
+        _, c = app_factory(Pipeline(checks=[]))
+        return c
+
+    def test_get_on_chat_completions_returns_405_signet_shape(
+        self, client: TestClient
+    ) -> None:
+        r = client.get("/v1/chat/completions")
+        assert r.status_code == 405
+        body = r.json()
+        assert body["error"] == "method not allowed"
+        assert body["endpoint"] == "/v1/chat/completions"
+        # The endpoint accepts POST.
+        assert "POST" in body["allowed_methods"]
+        # Allow header carries the same set so HTTP-RFC-aware clients
+        # see the legal verbs.
+        allow = r.headers.get("Allow", "")
+        assert "POST" in allow
+
+    def test_options_on_chat_completions_returns_405_signet_shape(
+        self, client: TestClient
+    ) -> None:
+        r = client.options("/v1/chat/completions")
+        assert r.status_code == 405
+        body = r.json()
+        # OPTIONS does not return Starlette's ``{"detail": ...}`` —
+        # the unified shape preempts it.
+        assert body["error"] == "method not allowed"
+        assert "POST" in body["allowed_methods"]
+
+    def test_put_on_completions_returns_405(self, client: TestClient) -> None:
+        r = client.put("/v1/completions")
+        assert r.status_code == 405
+        body = r.json()
+        assert body["error"] == "method not allowed"
+
+    def test_head_on_chat_completions_returns_405(self, client: TestClient) -> None:
+        # HEAD is a distinct method; framework returns 405 + Allow.
+        r = client.head("/v1/chat/completions")
+        assert r.status_code == 405
+        # HEAD response body MAY be empty per RFC, but the Allow header
+        # must still be set.
+        allow = r.headers.get("Allow", "")
+        assert "POST" in allow
+
+    def test_post_on_unimplemented_endpoint_still_404s_with_legacy_shape(
+        self, client: TestClient
+    ) -> None:
+        """The 405 unification does NOT swallow the legacy 404 catch-all
+        for genuinely unimplemented endpoints — that's M8's contract."""
+        r = client.post("/v1/audio/transcriptions", json={})
+        assert r.status_code == 404
+        body = r.json()
+        assert "not implemented" in body["error"]
+
+
+class TestRealtimeDisabledStub:
+    """v0.1.7 R3: ``realtime_enabled=False`` registers a stub that closes
+    1011 with a structured reason, instead of an empty disconnect.
+    """
+
+    def test_disabled_realtime_closes_with_1011_and_reason(self, tmp_path) -> None:
+        from starlette.websockets import WebSocketDisconnect
+
+        cfg = ServerConfig(
+            upstream_url="http://m/v1",
+            allow_ephemeral_key=True,
+            realtime_enabled=False,
+        )
+        signet_app = SignetApp(config=cfg, pipeline=Pipeline(checks=[]))
+        client = TestClient(signet_app.app)
+
+        with (
+            pytest.raises(WebSocketDisconnect) as excinfo,
+            client.websocket_connect("/v1/realtime") as ws,
+        ):
+            # Server closes immediately with 1011; the receive call
+            # surfaces the disconnect with the configured code.
+            ws.receive_text()
+        assert excinfo.value.code == 1011
+        # The reason field is documented and stable so operators can
+        # grep for it in client logs.
+        # WebSocket close.reason is exposed via the disconnect payload.
+        # Starlette TestClient exposes it on the exception when set.
+        assert "realtime endpoint disabled" in (excinfo.value.reason or "")

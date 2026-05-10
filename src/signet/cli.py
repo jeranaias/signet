@@ -305,7 +305,9 @@ def keys() -> None:
     "--key-id",
     default=None,
     help="Optional key identifier to print alongside the public key for "
-    "convenience. Not embedded in the key files themselves.",
+    "convenience. Not embedded in the key files themselves. If --key-id "
+    "is provided, a sidecar <out>.meta.json is written so the binding "
+    "survives terminal close.",
 )
 @click.option(
     "--force",
@@ -370,7 +372,25 @@ def keys_generate_ed25519(
 
     click.secho(f"  wrote private key:  {out_path} (chmod 0600 attempted)", fg="green")
     click.secho(f"  wrote public key:   {public_out_path}", fg="green")
+    # C9 (v0.1.7): when --key-id is supplied, write a sidecar
+    # ``<out>.meta.json`` so the operator does not lose the
+    # key-id-to-key binding the moment they close their terminal.
+    # The PEM file itself stays bit-identical to a no-key-id run —
+    # the sidecar is purely metadata.
     if key_id:
+        from datetime import UTC, datetime
+
+        meta_path = out_path.with_suffix(out_path.suffix + ".meta.json")
+        meta = {
+            "key_id": key_id,
+            "generated_at": datetime.now(tz=UTC).isoformat(timespec="seconds"),
+            "signet_version": __version__,
+        }
+        meta_path.write_text(
+            json.dumps(meta, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        click.secho(f"  wrote key metadata: {meta_path}", fg="green")
         click.echo(f"\nkey_id (record this; verifiers need it): {key_id}")
     click.echo("\nNext: configure signet with this key for asymmetric receipts.")
     # C4 (v0.1.7): emit Python's safe ``repr()`` of the path so Windows
@@ -766,11 +786,17 @@ def audit_verify(
         sys.exit(0 if report.ok else 2)
 
     if report.ok:
-        click.secho(
-            f"OK: {report.total_entries} entries, chain intact "
-            f"(last hmac={report.last_known_good_hmac[:16]}...)",
-            fg="green",
-        )
+        # A15 (v0.1.7): drop the dangling ``(last hmac=)`` parenthesis
+        # when the chain is empty. There's no head HMAC on a zero-entry
+        # chain, so the empty parens just looked like a render bug.
+        if report.total_entries == 0:
+            click.secho("OK: 0 entries (chain is empty)", fg="green")
+        else:
+            click.secho(
+                f"OK: {report.total_entries} entries, chain intact "
+                f"(last hmac={report.last_known_good_hmac[:16]}...)",
+                fg="green",
+            )
         return
 
     click.secho(
@@ -1169,7 +1195,12 @@ def audit_compact(
     "--since",
     default="24h",
     show_default=True,
-    help="Duration of the report window. Accepts 1h, 24h, 7d, 30d.",
+    help=(
+        "Duration of the report window. Accepts: <int>m (minutes), "
+        "<int>h (hours), <int>d (days), <int>w (weeks), or an ISO 8601 "
+        "duration like PT1H30M, P1D, P1W. Examples: 30m, 1h, 24h, 7d, "
+        "1w, PT90M."
+    ),
 )
 @click.option(
     "--format",
@@ -1323,12 +1354,20 @@ def audit_report(
 
 
 def _parse_duration(spec: str) -> Any:
-    """Parse one of ``Nh`` / ``Nd`` to a :class:`datetime.timedelta`.
+    """Parse a duration spec to a :class:`datetime.timedelta`.
 
-    Accepts the four documented shorthands ``1h`` / ``24h`` / ``7d`` /
-    ``30d``, and any other ``<int>h`` or ``<int>d`` form for forward
-    compatibility. Raises :class:`click.ClickException` on bad input
-    so the operator gets a clear error rather than a ValueError.
+    Accepted formats:
+
+    * ``<int>m`` — N minutes
+    * ``<int>h`` — N hours
+    * ``<int>d`` — N days
+    * ``<int>w`` — N weeks
+    * ISO 8601 duration with a ``P`` prefix — ``P1D``, ``P1W``,
+      ``PT1H30M``, ``PT90M``, etc. Years and months are rejected
+      because their length depends on the calendar position.
+
+    Raises :class:`click.ClickException` on bad input so the operator
+    gets a clear error rather than a ValueError.
 
     Returns a :class:`datetime.timedelta`; typed as :class:`Any` only
     because importing ``datetime`` at module top would force every
@@ -1337,17 +1376,71 @@ def _parse_duration(spec: str) -> Any:
     import re
     from datetime import timedelta
 
-    m = re.fullmatch(r"\s*(\d+)\s*([hd])\s*", spec)
-    if not m:
+    raw = spec.strip()
+    if not raw:
         raise click.ClickException(
-            f"--since {spec!r} is not a valid duration; expected '1h', "
-            "'24h', '7d', '30d' or another <int>h/<int>d form."
+            "--since cannot be empty; expected e.g. '30m', '1h', "
+            "'24h', '7d', '1w', or an ISO 8601 duration like 'PT1H30M'."
         )
-    n = int(m.group(1))
-    unit = m.group(2)
-    if unit == "h":
-        return timedelta(hours=n)
-    return timedelta(days=n)
+
+    # Suffix forms first — the original v0.1.6 surface plus minutes
+    # and weeks. Reject negatives and overflow before they reach
+    # timedelta() (which would raise OverflowError on huge values).
+    suffix_match = re.fullmatch(
+        r"(\d+)\s*([mhdw])", raw, flags=re.IGNORECASE
+    )
+    if suffix_match:
+        n = int(suffix_match.group(1))
+        unit = suffix_match.group(2).lower()
+        factor_seconds = {
+            "m": 60,
+            "h": 3600,
+            "d": 86400,
+            "w": 604800,
+        }[unit]
+        try:
+            return timedelta(seconds=n * factor_seconds)
+        except OverflowError as exc:
+            raise click.ClickException(
+                f"--since {spec!r} overflows timedelta: {exc}"
+            ) from exc
+
+    # ISO 8601 duration — accept ``PnW`` or ``PnDTnHnMnS`` shapes.
+    # Years/months are intentionally rejected because their length is
+    # ambiguous (a "1 month" report window is meaningless without a
+    # calendar anchor). isodate is a third-party dep; rather than
+    # adding it just for a fallback, parse the subset we actually
+    # care about with a regex.
+    iso_match = re.fullmatch(
+        r"P(?:(\d+)W"
+        r"|(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?)",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if iso_match and any(g is not None for g in iso_match.groups()):
+        weeks_grp, days_grp, hours_grp, minutes_grp, seconds_grp = (
+            iso_match.groups()
+        )
+        try:
+            if weeks_grp is not None:
+                return timedelta(weeks=int(weeks_grp))
+            return timedelta(
+                days=int(days_grp) if days_grp else 0,
+                hours=int(hours_grp) if hours_grp else 0,
+                minutes=int(minutes_grp) if minutes_grp else 0,
+                seconds=float(seconds_grp) if seconds_grp else 0,
+            )
+        except OverflowError as exc:
+            raise click.ClickException(
+                f"--since {spec!r} overflows timedelta: {exc}"
+            ) from exc
+
+    raise click.ClickException(
+        f"--since {spec!r} is not a valid duration; expected forms: "
+        "30m, 1h, 24h, 7d, 1w, or an ISO 8601 duration like PT1H30M, "
+        "P1D, P1W. Years/months (P1Y, P1M) are rejected — use weeks "
+        "or days for an unambiguous window."
+    )
 
 
 def _aggregate_audit_window(
@@ -1646,7 +1739,27 @@ def lint(config_path: Path, strict: bool) -> None:
 
 @main.group()
 def plugins() -> None:
-    """Plugin discovery and management."""
+    """Plugin discovery and management.
+
+    signet discovers third-party plugins via Python entry points under
+    these groups:
+
+    \b
+    - signet.checks: full Check subclasses
+    - signet.adapters: HTTP adapter shims
+    - signet.anchors: external anchor backends
+
+    Each discovered plugin is reported with one of four statuses:
+
+    \b
+    - loaded: ABI-compatible, ready to use
+    - incompatible_abi: declares a CHECK_ABI_VERSION signet doesn't know
+    - load_error: import/instantiation failed
+    - duplicate_name: another package registers the same (group, name)
+
+    Use 'signet plugins list' to see what's installed and 'signet plugins
+    doctor' to gate CI on plugin health.
+    """
 
 
 @plugins.command("list")
@@ -2066,16 +2179,38 @@ def _replay_pretty_print(
 def init(target_dir: Path) -> None:
     """Scaffold a starter signet project (config + sample pipeline).
 
-    Partial-write semantics: each scaffolded file is written only if it
-    does not already exist. Pre-existing files are skipped with a
-    ``skipped (already exists)`` line so an operator who deleted just
-    ``pipeline.py`` (the most common "let me regenerate this one"
-    workflow) can re-run ``signet init`` and get exactly that file
-    back without losing edits to ``client_example.py`` or
-    ``.env.example``. ``pipeline.py`` is treated as the load-bearing
-    file: if every file is already present, the command refuses with
-    exit code 1 — this preserves the original "do not overwrite an
-    existing project" guard.
+    Writes four files into TARGET_DIR (current directory by default):
+
+    \b
+    - pipeline.py: a four-check pipeline (OwnerResolutionCheck,
+      ClassificationGateCheck, RateLimitCheck, ScopeDriftCheck) you
+      hand to ``signet serve --config``.
+    - client_example.py: a minimal OpenAI-Python client that points
+      at the local proxy and sends ``X-Commit-Owner`` so the gate
+      has an attributable identity to record.
+    - .env.example: the environment variables ``signet serve``
+      reads (upstream URL, audit-log path, HMAC secret).
+    - .gitignore: keeps ``.env`` and ``*.jsonl`` audit logs out of
+      version control on first ``git add``.
+
+    Per-file overwrite policy: each file is written only if it does
+    not already exist. Pre-existing files are skipped with a
+    ``skipped (already exists)`` line so an operator who deleted
+    just ``pipeline.py`` (the most common "let me regenerate this
+    one" workflow) can re-run ``signet init`` and get exactly that
+    file back without losing edits to ``client_example.py`` or
+    ``.env.example``. If every file is already present, the command
+    refuses with exit code 1 — this preserves the original "do not
+    overwrite an existing project" guard.
+
+    Post-init checklist:
+
+    \b
+    1. Review the four scaffolded files and edit them for your env.
+    2. ``signet serve --upstream <URL> --dev`` (the ``--dev`` shorthand
+       wires up an ephemeral HMAC key, an in-tmp audit log, and
+       ``--config pipeline.py`` for local iteration).
+    3. In another terminal, ``python client_example.py``.
     """
     target_dir.mkdir(parents=True, exist_ok=True)
 

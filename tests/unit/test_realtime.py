@@ -522,3 +522,63 @@ class TestPeriodicFlush:
         assert meta.get("interim") is True
         assert "elapsed_seconds" in meta
         assert "client_event_count" in meta
+
+
+class TestRealtimeDisabledStub:
+    """v0.1.7 R3: ``realtime_enabled=False`` registers a stub that
+    closes 1011 with a structured reason instead of an empty disconnect.
+
+    Operators flipping the flag off get a clear "I refused on purpose"
+    signal that callers can grep for, rather than the prior generic
+    WebSocketDisconnect with no reason.
+    """
+
+    def test_disabled_realtime_close_code_and_reason(self, tmp_path) -> None:
+        from starlette.websockets import WebSocketDisconnect
+
+        log = tmp_path / "audit.jsonl"
+        config = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=log,
+            realtime_enabled=False,
+        )
+        app = SignetApp(config=config, pipeline=Pipeline(checks=[]))
+        client = TestClient(app.app)
+
+        with (
+            pytest.raises(WebSocketDisconnect) as excinfo,
+            client.websocket_connect("/v1/realtime") as ws,
+        ):
+            # Server closes immediately after accept; reading raises.
+            ws.receive_text()
+
+        # Code 1011 = internal error per RFC 6455. We use it instead of
+        # 1008 (policy violation) because "endpoint disabled" is a
+        # server-side configuration condition, not a per-request policy
+        # decision.
+        assert excinfo.value.code == 1011
+        # Reason field is documented and stable so operators can grep
+        # for it in client logs to disambiguate from network errors.
+        assert "realtime endpoint disabled" in (excinfo.value.reason or "")
+
+    def test_enabled_realtime_still_works(self, tmp_path) -> None:
+        """Control: with the flag on (default), the route accepts
+        connections and runs ADMISSION as documented."""
+        log = tmp_path / "audit.jsonl"
+        config = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            audit_log_path=log,
+            realtime_enabled=True,
+        )
+        app = SignetApp(config=config, pipeline=Pipeline(checks=[]))
+        client = TestClient(app.app)
+
+        # Connect with a valid owner; ADMISSION allows; loopback echoes.
+        with client.websocket_connect(
+            "/v1/realtime", headers={"X-Commit-Owner": "human:alice"}
+        ) as ws:
+            ws.send_json({"type": "session.update", "session": {}})
+            event = ws.receive_json()
+            assert event["type"] == "session.update"

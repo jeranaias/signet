@@ -76,11 +76,18 @@ class _FakeStreamResponse:
         status_code: int = 200,
         raise_mid_stream: type[BaseException] | None = None,
         raise_after_chunks: int = 0,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.status_code = status_code
         self._chunks = chunks
         self._raise_mid_stream = raise_mid_stream
         self._raise_after_chunks = raise_after_chunks
+        # Default content-type: SSE. The S7 content-type guard rejects
+        # non-SSE upstream responses; tests that exercise that guard
+        # pass a different type (e.g. application/octet-stream).
+        self.headers: dict[str, str] = headers if headers is not None else {
+            "content-type": "text/event-stream"
+        }
 
     async def aiter_bytes(self) -> AsyncIterator[bytes]:
         for i, chunk in enumerate(self._chunks):
@@ -123,6 +130,7 @@ def _patch_upstream_stream(
     status_code: int = 200,
     raise_mid_stream: type[BaseException] | None = None,
     raise_after_chunks: int = 0,
+    headers: dict[str, str] | None = None,
 ) -> None:
     """Patch ``httpx.AsyncClient.stream`` to return a configurable fake.
 
@@ -136,6 +144,7 @@ def _patch_upstream_stream(
                 status_code=status_code,
                 raise_mid_stream=raise_mid_stream,
                 raise_after_chunks=raise_after_chunks,
+                headers=headers,
             )
         )
 
@@ -718,3 +727,146 @@ class TestClassificationLeakAfterPad:
         assert not any("must not appear" in p for p in content_frames)
         # Abort frame fired.
         assert _find_abort_frame(payloads) is not None
+
+
+class TestUpstreamContentTypeGuard:
+    """v0.1.7 S7: upstream returning non-SSE content-type aborts cleanly.
+
+    Pre-fix: 200 OK with ``Content-Type: application/octet-stream`` and
+    binary garbage flowed straight through to the client. INSPECTION
+    saw nothing parseable so ScopeDriftCheck couldn't fire; the SDK
+    saw an opaque blob.
+
+    Post-fix: a content-type other than ``text/event-stream`` /
+    ``text/plain`` triggers an ``upstream_content_type_invalid`` abort
+    frame. The reason token is in the transport-reason allowlist so
+    strict mode preserves it.
+    """
+
+    def test_octet_stream_aborts_with_transport_reason(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        # 90KB of binary garbage on a 200 + octet-stream content-type.
+        garbage = [b"\x00\x01\x02\x03" * 1024 for _ in range(20)]
+        _patch_upstream_stream(
+            monkeypatch,
+            chunks=garbage,
+            status_code=200,
+            headers={"content-type": "application/octet-stream"},
+        )
+
+        log = tmp_path / "audit.jsonl"
+        _app, client = _make_app(Pipeline(checks=[]), audit_log_path=log)
+        r = _post_stream(client, {"model": "test", "messages": []})
+        assert r.status_code == 200  # SSE handshake already sent
+
+        payloads = _split_sse(r.text)
+        frame = _find_abort_frame(payloads)
+        assert frame is not None
+        # The new transport-reason token names the failure mode so SDKs
+        # can branch on it (different from upstream_protocol_violation,
+        # which is mid-stream framing breakage).
+        assert frame["reason"] == "upstream_content_type_invalid"
+        assert frame["stage"] == "inspection"
+        assert payloads[-1] == "[DONE]"
+
+        # The audit row records the upstream attribution so operators
+        # can pivot from the abort to the misconfigured backend.
+        entries = list(JsonlBackend(log).iter_entries())
+        upstream_rows = [
+            e for e in entries if e.check_name == "pipeline.upstream"
+        ]
+        assert len(upstream_rows) == 1
+        assert "application/octet-stream" in upstream_rows[0].reason
+
+    def test_strict_mode_preserves_content_type_invalid_reason(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Strict redaction would normally coarsen reasons, but the new
+        token is in ``_TRANSPORT_ABORT_REASONS`` so it survives — SDKs
+        need to distinguish "retry against a different upstream" from
+        "policy refusal, do not retry"."""
+        _patch_upstream_stream(
+            monkeypatch,
+            chunks=[b"\x00" * 32],
+            status_code=200,
+            headers={"content-type": "application/json"},
+        )
+
+        _app, client = _make_app(
+            Pipeline(checks=[]),
+            audit_log_path=tmp_path / "audit.jsonl",
+            strict_error_redaction=True,
+        )
+        r = _post_stream(client, {"model": "test", "messages": []})
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        frame = _find_abort_frame(payloads)
+        assert frame is not None
+        assert frame["reason"] == "upstream_content_type_invalid"
+        assert "check" not in frame  # strict still drops check field
+
+    def test_text_plain_content_type_passes_through(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """Some upstreams ship SSE with ``text/plain`` content-type
+        (notably older OpenAI-compatible proxies); the guard accepts
+        it so we don't break legitimate traffic."""
+        chunks = [_content_chunk("hello"), b"data: [DONE]\n\n"]
+        _patch_upstream_stream(
+            monkeypatch,
+            chunks=chunks,
+            headers={"content-type": "text/plain; charset=utf-8"},
+        )
+        _app, client = _make_app(
+            Pipeline(checks=[]),
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        r = _post_stream(client, {"model": "test", "messages": []})
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        # No abort frame.
+        assert _find_abort_frame(payloads) is None
+        assert any("hello" in p for p in payloads)
+
+    def test_event_stream_content_type_passes_through(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """The canonical SSE content type is the default fixture; this
+        test pins the explicit positive case."""
+        chunks = [_content_chunk("hello"), b"data: [DONE]\n\n"]
+        _patch_upstream_stream(
+            monkeypatch,
+            chunks=chunks,
+            headers={"content-type": "text/event-stream; charset=utf-8"},
+        )
+        _app, client = _make_app(
+            Pipeline(checks=[]),
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        r = _post_stream(client, {"model": "test", "messages": []})
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        assert _find_abort_frame(payloads) is None
+        assert any("hello" in p for p in payloads)
+
+    def test_missing_content_type_passes_through(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """An upstream that omits Content-Type (older mocks, tests with
+        bare-bones stubs) gets the historical pass-through. The guard
+        only fires on an *explicit* non-SSE declaration."""
+        chunks = [_content_chunk("hello"), b"data: [DONE]\n\n"]
+        _patch_upstream_stream(
+            monkeypatch,
+            chunks=chunks,
+            headers={},  # explicitly empty — no content-type
+        )
+        _app, client = _make_app(
+            Pipeline(checks=[]),
+            audit_log_path=tmp_path / "audit.jsonl",
+        )
+        r = _post_stream(client, {"model": "test", "messages": []})
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        assert _find_abort_frame(payloads) is None

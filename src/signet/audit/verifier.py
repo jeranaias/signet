@@ -37,9 +37,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
+from signet import __version__ as _SIGNET_VERSION
 from signet.audit.backend import AuditBackend, MalformedAuditEntry
 from signet.audit.chain import KEY_ID_FIELD, _serialize_for_signing
 from signet.audit.keyring import KeyRing
@@ -124,15 +126,30 @@ class VerificationReport:
         total_entries: Number of entries walked.
         breaks: Per-entry integrity failures, in chain order.
         last_known_good_index: Index of the last entry that verified
-            cleanly. ``-1`` if no entry verified.
+            cleanly. ``-1`` is a **sentinel** meaning "no entry
+            verified cleanly" — most commonly seen when the chain was
+            verified under the wrong HMAC secret (every entry then
+            self-mismatches and there is no last-good index to point
+            at). Do NOT interpret as an offset into the chain (A14).
         last_known_good_hmac: HMAC of the last entry that verified
-            cleanly. Empty string if no entry verified.
+            cleanly. Empty string is the matching sentinel for
+            ``last_known_good_index = -1`` (A14).
+        signet_version: signet version that produced this report
+            (A13). Useful for long-term forensics where a stored
+            verify report needs to be tied to the binary that
+            produced it.
+        verified_at: Wall-clock timestamp (UTC, ISO 8601) when
+            verification ran (A13).
     """
 
     total_entries: int
     breaks: tuple[ChainBreak, ...] = field(default_factory=tuple)
     last_known_good_index: int = -1
     last_known_good_hmac: str = ""
+    signet_version: str = _SIGNET_VERSION
+    verified_at: str = field(
+        default_factory=lambda: datetime.now(UTC).isoformat()
+    )
 
     @property
     def ok(self) -> bool:
@@ -168,7 +185,15 @@ class ChainVerifier:
         self._compact_breaks = compact_breaks
 
     def verify(self) -> VerificationReport:
-        """Walk every entry in order and return a structured report."""
+        """Walk every entry in order and return a structured report.
+
+        The returned :class:`VerificationReport` carries
+        ``signet_version`` and ``verified_at`` (A13) for long-term
+        forensics. ``last_known_good_index = -1`` is a SENTINEL
+        meaning "no entry verified cleanly" — typically the wrong
+        HMAC secret was supplied — and is not a valid chain offset
+        (A14).
+        """
         breaks: list[ChainBreak] = []
         prev_hmac = ""
         last_good_idx = -1
@@ -464,6 +489,16 @@ def verify_with_archives(
     cascade_active = False
     cascade_count = 0
     cascade_first_idx = -1
+    # A10 (v0.1.7): when an archive is unreadable
+    # (ARCHIVE_FORMAT_INVALID), the verifier loses the bridge hmac
+    # and the *next* live entry would otherwise emit a synthetic
+    # LINK_MISMATCH against the marker's hmac. That's noisy
+    # (forensically: two breaks for one corruption) and unhelpful
+    # (the link genuinely cannot be checked). When this flag is set,
+    # we suppress exactly one downstream link_mismatch and re-anchor
+    # ``expected_prev`` to that entry's hmac so subsequent entries
+    # link normally against it.
+    suppress_one_link_mismatch_after_archive = False
 
     def _flush_cascade() -> None:
         nonlocal cascade_active, cascade_count, cascade_first_idx
@@ -490,8 +525,16 @@ def verify_with_archives(
                 # Plain live entry: standard self + link checks.
                 link_break_at_this_index = False
                 if entry.prev_hmac != expected_prev:
-                    if compact_breaks and cascade_active:
+                    if suppress_one_link_mismatch_after_archive:
+                        # A10: archive was unreadable; suppress this
+                        # synthetic break and re-anchor on this entry.
+                        # Subsequent entries chain off this one
+                        # normally.
+                        suppress_one_link_mismatch_after_archive = False
+                        link_break_at_this_index = True
+                    elif compact_breaks and cascade_active:
                         cascade_count += 1
+                        link_break_at_this_index = True
                     else:
                         breaks.append(
                             ChainBreak(
@@ -508,9 +551,12 @@ def verify_with_archives(
                             cascade_active = True
                             cascade_count = 0
                             cascade_first_idx = logical_index + 1
-                    link_break_at_this_index = True
+                        link_break_at_this_index = True
                 else:
                     _flush_cascade()
+                    # Any clean link clears a pending archive-suppress
+                    # flag — we recovered without needing it.
+                    suppress_one_link_mismatch_after_archive = False
                 ok = _verify_entry_self(
                     index=logical_index,
                     entry=entry,
@@ -596,6 +642,10 @@ def verify_with_archives(
                 total_entries += 1
                 logical_index += 1
                 expected_prev = entry.hmac
+                # A10: archive was unreadable; the bridge hmac is lost.
+                # Suppress the synthetic LINK_MISMATCH on the next live
+                # entry — one corruption, one break.
+                suppress_one_link_mismatch_after_archive = True
                 continue
 
             # Walk the archived entries first, in their own logical-index

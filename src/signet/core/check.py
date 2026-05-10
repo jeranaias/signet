@@ -67,13 +67,31 @@ class CheckResult:
             this result is recorded. Use sparingly.
         replacement_content: When ``decision`` is :attr:`Decision.REDACT`,
             the content that should replace the original. ``None`` for any
-            other decision.
+            other decision. Setting ``replacement_content`` on a non-REDACT
+            decision raises :class:`ValueError` at construction (F2): the
+            field is meaningful only for redacts and a stray value on a
+            BLOCK / ESCALATE / ALLOW would otherwise silently flow into
+            audit metadata or a 4xx response body.
     """
 
     decision: Decision
     reason: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
     replacement_content: str | None = None
+
+    def __post_init__(self) -> None:
+        # F2 (v0.1.7): ``replacement_content`` is meaningful only on a
+        # REDACT decision. A BLOCK or ALLOW result that carries
+        # ``replacement_content`` is operator-authored confusion — the
+        # field would land in audit metadata or a 4xx response body,
+        # leaking the would-be replacement payload to consumers that
+        # never asked for it. Refuse at construction so the bug shows
+        # up in the writer, not in production observability.
+        if self.replacement_content is not None and self.decision is not Decision.REDACT:
+            raise ValueError(
+                f"replacement_content set on a {self.decision.value} CheckResult; "
+                "only REDACT decisions may carry replacement_content."
+            )
 
     @classmethod
     def allow(cls, reason: str = "", **metadata: Any) -> CheckResult:

@@ -130,6 +130,21 @@ class TokenBudgetCheck(Check):
         if ctx.owner.owner_type is OwnerType.UNRESOLVED:
             return CheckResult.allow()
 
+        # C8.3 (v0.1.7): a negative ``max_tokens`` used to silently fall
+        # back to ``request_estimate_default``. That hides operator
+        # mistakes (off-by-one signs, env-var typos) until the budget
+        # actually trips. Refuse at admission with a clear reason so
+        # the caller learns immediately. We only check the configured
+        # request_estimate_field (caller-controlled name); other
+        # numeric fields are not in scope.
+        v = ctx.body.get(self.request_estimate_field)
+        if isinstance(v, int) and v < 0:
+            return CheckResult.block(
+                f"{self.request_estimate_field} must be non-negative, got {v}",
+                request_estimate_field=self.request_estimate_field,
+                received_value=v,
+            )
+
         key = self._key_for(ctx.owner)
         window = self._current_window(key)
         estimate = self._request_estimate(ctx)
@@ -224,10 +239,15 @@ class TokenBudgetCheck(Check):
     def _request_estimate(self, ctx: RequestContext) -> int:
         """Best-effort estimate of this request's output token count.
 
-        ``max_tokens=0`` and missing / negative values both fall back to
-        a positive floor so the cap can't be bypassed by claiming
-        "I'll use zero tokens" — even a refused or empty completion
-        costs the upstream a non-zero pre-fill.
+        ``max_tokens=0`` and missing values fall back to a positive
+        floor so the cap can't be bypassed by claiming "I'll use zero
+        tokens" — even a refused or empty completion costs the upstream
+        a non-zero pre-fill.
+
+        Negative values are refused at :meth:`pre_request` before we
+        ever get here (C8.3), so the negative branch in this method is
+        unreachable in production. It remains a defensive fallback for
+        callers that bypass ``pre_request``.
         """
         v = ctx.body.get(self.request_estimate_field)
         # Floor for the missing / zero / negative cases. Clamps to at
@@ -241,8 +261,8 @@ class TokenBudgetCheck(Check):
             # A request that asks for zero output still consumes input
             # tokens upstream; refuse the "no estimate at all" bypass.
             return floor
-        # Negative, missing, or non-int: use the configured default,
-        # but clamped to at least the floor.
+        # Missing or non-int: use the configured default, clamped to
+        # at least the floor. (Negative ints are filtered upstream.)
         return max(floor, self.request_estimate_default)
 
     @staticmethod

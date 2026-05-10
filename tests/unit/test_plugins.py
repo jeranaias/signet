@@ -609,3 +609,41 @@ class TestSandboxDispatch:
             "irreversible": True,
             "dryrun_supported": True,
         }
+
+
+# ---------------------------------------------------------------------------
+# v0.1.7 P2 plugin polish
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverPluginsCacheIdentity:
+    """C11: ``discover_plugins`` returns the same list object on
+    consecutive cached calls but a NEW list object after
+    ``refresh=True``. This is documented in the function's docstring;
+    the tests pin the contract so a future refactor that, say, returns
+    ``list(cache)`` defensively would surface as a docstring mismatch.
+    """
+
+    def test_cached_calls_return_same_object(self) -> None:
+        reset_cache()
+        first = discover_plugins(refresh=True)
+        second = discover_plugins()
+        # ``is`` — identity, not equality. The cache hands back the
+        # exact same list it stashed on the first call.
+        assert first is second
+
+    def test_refresh_returns_new_list_object(self) -> None:
+        reset_cache()
+        first = discover_plugins(refresh=True)
+        second = discover_plugins(refresh=True)
+        # Contents are equal (same plugins discovered) but the second
+        # call rebuilt the cache, so the list object is fresh.
+        assert first == second
+        assert first is not second
+
+    def test_docstring_mentions_identity_caveat(self) -> None:
+        # The doc note this finding adds must actually be in the
+        # docstring; otherwise the contract is undocumented.
+        doc = discover_plugins.__doc__ or ""
+        assert "Identity stability" in doc
+        assert "refresh=True" in doc

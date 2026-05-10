@@ -39,6 +39,51 @@ def _parse_bool_env(value: str) -> bool:
     return value.strip().lower() in _TRUTHY_ENV_VALUES
 
 
+def _parse_int_env(name: str, value: str) -> int:
+    """Parse an int env var, re-raising with the var name on failure.
+
+    Bare ``int(value)`` raises ``ValueError: invalid literal for int()
+    with base 10: 'abc'`` which doesn't tell the operator *which*
+    SIGNET_* variable was bad (L8). Wrap the conversion so the message
+    names the variable.
+    """
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be an integer; got {value!r} ({exc})"
+        ) from exc
+
+
+def _parse_float_env(name: str, value: str) -> float:
+    """Parse a float env var, re-raising with the var name on failure.
+
+    Same rationale as :func:`_parse_int_env` (L8) but for float fields.
+    """
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be a number; got {value!r} ({exc})"
+        ) from exc
+
+
+def _parse_hex_env(name: str, value: str) -> bytes:
+    """Parse a hex-encoded bytes env var, naming the var on failure.
+
+    ``bytes.fromhex`` raises ``ValueError: non-hexadecimal number
+    found...`` with no var-name context (L8). Wrap so misconfigurations
+    of e.g. SIGNET_HMAC_SECRET are immediately attributable.
+    """
+    try:
+        return bytes.fromhex(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{name} must be hex-encoded bytes (e.g. `openssl rand -hex 32`); "
+            f"got value of length {len(value)} ({exc})"
+        ) from exc
+
+
 @dataclass
 class ServerConfig:
     """Runtime configuration for :class:`signet.server.app.SignetApp`.
@@ -161,7 +206,22 @@ class ServerConfig:
     realtime traffic incur no cost. Set ``False`` to skip route
     registration entirely; deployments that want a hard guarantee
     against an opened WebSocket can flip this off. The HTTP routes
-    are unaffected either way."""
+    are unaffected either way. When disabled, the route is still
+    registered as a stub that immediately closes any incoming
+    connection with code 1011 + reason ``"realtime endpoint disabled
+    in config"`` so operators can distinguish "endpoint disabled" from
+    "endpoint never registered" / network errors (R3)."""
+    inspect_all_sse_lines: bool = False
+    """Opt-in: feed ``event:``, ``id:``, ``retry:``, and ``:`` (comment)
+    lines from upstream SSE frames into INSPECTION's accumulated text
+    (S6). The SSE spec lets non-``data:`` lines smuggle text past
+    classification scanners that only look at ``data:`` payloads —
+    e.g. ``event: foo\\ndata: bar\\n\\n`` could carry a classification
+    marker on the ``event:`` line that ScopeDriftCheck never sees.
+    Default ``False`` preserves 0.1.6 behavior. Set ``True`` to harden
+    against this side-channel; the tradeoff is slightly higher
+    false-positive rate on legitimate event/id metadata that may
+    coincide with sensitive substrings."""
 
     # Forwarded fields the user can tune via env-var: see _ENV_KEYS below.
     extra_forward_headers: tuple[str, ...] = field(
@@ -175,21 +235,57 @@ class ServerConfig:
     def from_env(cls, env: dict[str, str] | None = None) -> ServerConfig:
         """Construct a config populated from environment variables.
 
-        Recognized variables (all prefixed ``SIGNET_``):
+        Recognized variables (all prefixed ``SIGNET_``). The list below
+        matches the implementation 1:1 — every variable parsed here is
+        documented; nothing is silently swallowed. See the dataclass
+        attribute docstrings for the meaning of each field.
 
-        * ``SIGNET_UPSTREAM_URL``
-        * ``SIGNET_UPSTREAM_API_KEY``
-        * ``SIGNET_HOST``
-        * ``SIGNET_PORT``
-        * ``SIGNET_REQUEST_TIMEOUT_S``
-        * ``SIGNET_AUDIT_LOG_PATH``
-        * ``SIGNET_HMAC_KEY_ID``
-        * ``SIGNET_HMAC_SECRET`` (hex-encoded; e.g. ``openssl rand -hex 32``)
-        * ``SIGNET_ALLOW_EPHEMERAL_KEY`` (``"true"`` / ``"false"``)
-        * ``SIGNET_RECEIPT_HEADER_NAME``
-        * ``SIGNET_EMIT_RECEIPTS`` (``"true"`` / ``"false"``)
+        * ``SIGNET_UPSTREAM_URL`` → ``upstream_url`` (str)
+        * ``SIGNET_UPSTREAM_API_KEY`` → ``upstream_api_key`` (str)
+        * ``SIGNET_UPSTREAM_LABEL`` → ``upstream_label`` (str)
+        * ``SIGNET_HOST`` → ``host`` (str)
+        * ``SIGNET_PORT`` → ``port`` (int)
+        * ``SIGNET_REQUEST_TIMEOUT_S`` → ``request_timeout_s`` (float)
+        * ``SIGNET_AUDIT_LOG_PATH`` → ``audit_log_path`` (Path)
+        * ``SIGNET_HMAC_KEY_ID`` → ``hmac_key_id`` (str)
+        * ``SIGNET_HMAC_SECRET`` → ``hmac_secret`` (hex-encoded bytes;
+          e.g. ``openssl rand -hex 32``)
+        * ``SIGNET_ALLOW_EPHEMERAL_KEY`` → ``allow_ephemeral_key``
+          (bool; see :func:`_parse_bool_env` for accepted spellings)
+        * ``SIGNET_RECEIPT_HEADER_NAME`` → ``receipt_header_name`` (str)
+        * ``SIGNET_EMIT_RECEIPTS`` → ``emit_receipts`` (bool)
+        * ``SIGNET_MAX_REQUEST_BODY_BYTES`` → ``max_request_body_bytes``
+          (int)
+        * ``SIGNET_STRICT_ERROR_REDACTION`` → ``strict_error_redaction``
+          (bool)
+        * ``SIGNET_SHADOW`` → ``shadow`` (bool)
+        * ``SIGNET_INSPECT_ALL_SSE_LINES`` → ``inspect_all_sse_lines``
+          (bool; opt-in to feed non-``data:`` SSE lines into INSPECTION
+          per S6)
 
-        Variables not set fall back to dataclass defaults.
+        CLI-only env vars (NOT parsed here, deliberately):
+
+        * ``SIGNET_LOG_FORMAT`` — drives JSON-vs-text log formatting at
+          process start in ``signet serve``. It configures the root
+          logger before a ServerConfig is built, so it is not a
+          ``ServerConfig`` field. Read it from your launcher; do not
+          expect setting it here to take effect.
+        * ``SIGNET_ANONYMIZE_SALT`` — used by ``signet audit report``
+          to salt owner pseudonymization. The audit-report CLI is a
+          read-only tool that never instantiates ServerConfig, so this
+          var is consumed at the CLI surface, not here.
+
+        Both CLI-only vars are ignored by :meth:`from_env`. Promoting
+        either to a ServerConfig field is roadmap (would require
+        threading them through to the consuming surfaces); for now,
+        document them in the deployment guide rather than silently
+        drop them on a ServerConfig-shaped configuration. Variables
+        not set fall back to dataclass defaults.
+
+        Raises:
+            ValueError: If a value present in ``env`` cannot be parsed
+                into the field's type. Errors include the offending env
+                var name so misconfigurations are easy to locate (L8).
         """
         e = env if env is not None else dict(os.environ)
         cfg = cls()
@@ -201,15 +297,15 @@ class ServerConfig:
         if v := e.get("SIGNET_HOST"):
             cfg.host = v
         if v := e.get("SIGNET_PORT"):
-            cfg.port = int(v)
+            cfg.port = _parse_int_env("SIGNET_PORT", v)
         if v := e.get("SIGNET_REQUEST_TIMEOUT_S"):
-            cfg.request_timeout_s = float(v)
+            cfg.request_timeout_s = _parse_float_env("SIGNET_REQUEST_TIMEOUT_S", v)
         if v := e.get("SIGNET_AUDIT_LOG_PATH"):
             cfg.audit_log_path = Path(v)
         if v := e.get("SIGNET_HMAC_KEY_ID"):
             cfg.hmac_key_id = v
         if v := e.get("SIGNET_HMAC_SECRET"):
-            cfg.hmac_secret = bytes.fromhex(v)
+            cfg.hmac_secret = _parse_hex_env("SIGNET_HMAC_SECRET", v)
         if v := e.get("SIGNET_ALLOW_EPHEMERAL_KEY"):
             cfg.allow_ephemeral_key = _parse_bool_env(v)
         if v := e.get("SIGNET_RECEIPT_HEADER_NAME"):
@@ -217,12 +313,16 @@ class ServerConfig:
         if v := e.get("SIGNET_EMIT_RECEIPTS"):
             cfg.emit_receipts = _parse_bool_env(v)
         if v := e.get("SIGNET_MAX_REQUEST_BODY_BYTES"):
-            cfg.max_request_body_bytes = int(v)
+            cfg.max_request_body_bytes = _parse_int_env(
+                "SIGNET_MAX_REQUEST_BODY_BYTES", v
+            )
         if v := e.get("SIGNET_UPSTREAM_LABEL"):
             cfg.upstream_label = v
         if v := e.get("SIGNET_STRICT_ERROR_REDACTION"):
             cfg.strict_error_redaction = _parse_bool_env(v)
         if v := e.get("SIGNET_SHADOW"):
             cfg.shadow = _parse_bool_env(v)
+        if v := e.get("SIGNET_INSPECT_ALL_SSE_LINES"):
+            cfg.inspect_all_sse_lines = _parse_bool_env(v)
 
         return cfg

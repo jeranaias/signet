@@ -59,6 +59,16 @@ class ContinuingConsentCheck(Check):
             chunks 1, 1+N, 1+2N, ... where N is this value. Defaults
             to 5; lower means tighter detection at higher cost; higher
             means cheaper at the cost of detection latency.
+
+            **C10.1 throttle semantics.** ``check_every_chunks=2``
+            means "fire on chunks 1, 3, 5, …" — every Nth chunk
+            counted from the first, NOT "every other chunk". Chunks
+            2, 4, 6, … never trigger the predicate. The latency cost
+            is one chunk: when the upstream policy flips on chunk 4,
+            the next predicate call is chunk 5, so chunk 4 of revoked-
+            state content can pass through before the abort fires. A
+            tighter throttle (``check_every_chunks=1``) closes the
+            window at the cost of running the predicate every chunk.
         revocation_reason: Human-readable reason recorded when consent
             is withdrawn. Defaults to a generic message; supply your
             own for context-specific guidance.

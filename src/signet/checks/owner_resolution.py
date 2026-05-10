@@ -27,6 +27,21 @@ Header lookup is case-insensitive (HTTP headers are case-insensitive
 on the wire; many ASGI servers preserve incoming case). All values are
 stripped of leading/trailing whitespace before matching.
 
+C1.4 (v0.1.7): the *value prefix* (``human:`` / ``agent:``) is **case-
+sensitive**. ``HUMAN:alice`` and ``Human:alice`` are NOT recognized
+and the check will refuse them. The header *name* itself is
+case-insensitive — ``x-commit-owner`` and ``X-Commit-Owner`` both
+match — but the literal lowercase ``human:`` prefix on the value is
+load-bearing. Operators integrating with mixed-case environments
+should normalize at the reverse proxy layer.
+
+C1.5 (v0.1.7): when ``X-Policy-Name`` itself contains a literal
+``@`` and ``X-Policy-Version`` is also set, the joined form is
+``policy:p@ackme@v3`` (double ``@``). This is documented behavior;
+the resulting policy ID is ambiguous on round-trip. If your policy
+name contains ``@``, supply the joined form yourself in
+``X-Policy-Name`` and leave ``X-Policy-Version`` unset.
+
 Caveat: signet does NOT authenticate these headers. The audit row
 records "the caller said X"; it does not prove X is the caller. See
 ``SECURITY.md`` and ``docs/architecture.md`` trust-model section.
@@ -144,10 +159,16 @@ class OwnerResolutionCheck(Check):
             return CheckResult.block(
                 "no commit owner could be resolved",
                 hint=(
-                    "Send one of these headers (the prefix is required):\n"
+                    "Send one of these headers. The lowercase prefix is REQUIRED "
+                    "and case-sensitive — `HUMAN:alice` and `Human:alice` are NOT "
+                    "recognized (C1.4):\n"
                     "  X-Commit-Owner: human:alice@example.com\n"
                     "  X-Agent-Id: agent:nightly-syncer\n"
                     "  X-Policy-Name: acme-default   (with optional X-Policy-Version: v3)\n"
+                    "Note: if X-Policy-Name itself contains '@' AND you also set "
+                    "X-Policy-Version, the joined form becomes 'policy:name@ver' "
+                    "which yields a double-'@' and an ambiguous ID — supply the "
+                    "joined form yourself in X-Policy-Name in that case (C1.5).\n"
                     "Headers are caller-asserted attribution, not authentication — "
                     "see SECURITY.md trust model."
                 ),

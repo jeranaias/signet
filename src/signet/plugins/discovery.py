@@ -122,6 +122,15 @@ def discover_plugins(*, refresh: bool = False) -> list[DiscoveredPlugin]:
 
     Cached after first call; pass ``refresh=True`` to re-scan (useful
     in tests and for the future hot-reload feature).
+
+    .. note::
+        Identity stability: consecutive calls with ``refresh=False``
+        return the SAME list object (Python ``is`` comparison succeeds).
+        A call with ``refresh=True`` rebuilds the cache and returns a
+        NEW list object, so callers that captured a reference from a
+        prior call will continue to see the stale snapshot. Do not rely
+        on identity for change-detection — compare the contents
+        explicitly, or call :func:`reset_cache` and re-fetch.
     """
     global _DISCOVERED_PLUGINS_CACHE, _DISCOVERED_CHECKS_CACHE
     if _DISCOVERED_PLUGINS_CACHE is not None and not refresh:

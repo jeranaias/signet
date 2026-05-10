@@ -148,3 +148,85 @@ class TestSignetCallbackHandler:
         h.on_llm_error(FakeError(), run_id=uuid4())
         assert h.last_refusal is not None
         assert h.last_refusal["reason"] == "no commit owner"
+
+
+class TestOwnerPrefixWarning:
+    """v0.1.7 L2: warn (don't reject) when ``owner`` lacks a known
+    attribution prefix.
+
+    Audit chain still records whatever the caller passed; the warning
+    catches misconfiguration at wrap time so dev consoles surface it
+    before production traffic flows.
+    """
+
+    def test_unprefixed_owner_warns_openai(self) -> None:
+        client = _DummyClient()
+        with pytest.warns(UserWarning, match="known prefix"):
+            wrap_openai(client, signet_url="http://x", owner="alice@example.com")
+        # The wrap still succeeds — it's a warning, not an error —
+        # so the audit chain receives whatever was passed.
+        assert client.default_headers["X-Commit-Owner"] == "alice@example.com"
+
+    def test_human_prefix_no_warning_openai(self) -> None:
+        import warnings
+
+        client = _DummyClient()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # raise on any warning
+            wrap_openai(
+                client, signet_url="http://x", owner="human:alice@example.com"
+            )
+
+    def test_agent_prefix_no_warning_openai(self) -> None:
+        import warnings
+
+        client = _DummyClient()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            wrap_openai(client, signet_url="http://x", owner="agent:bot-7")
+
+    def test_policy_prefix_no_warning_openai(self) -> None:
+        import warnings
+
+        client = _DummyClient()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            wrap_openai(client, signet_url="http://x", owner="policy:acme.v3")
+
+    def test_no_owner_no_warning_openai(self) -> None:
+        """When ``owner`` is None (caller used ``agent_id`` / ``policy``
+        instead), no warning fires — the soft validator only triggers
+        on a present-but-unprefixed owner."""
+        import warnings
+
+        client = _DummyClient()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            wrap_openai(client, signet_url="http://x", agent_id="bot")
+
+    def test_unprefixed_owner_warns_anthropic(self) -> None:
+        client = _DummyClient()
+        with pytest.warns(UserWarning, match="known prefix"):
+            wrap_anthropic(client, signet_url="http://x", owner="bob")
+        # Still set the header — soft warn, not a hard reject.
+        assert client.default_headers["X-Commit-Owner"] == "bob"
+
+    def test_human_prefix_no_warning_anthropic(self) -> None:
+        import warnings
+
+        client = _DummyClient()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            wrap_anthropic(
+                client, signet_url="http://x", owner="human:bob@example.com"
+            )
+
+    def test_warning_message_suggests_fix(self) -> None:
+        client = _DummyClient()
+        with pytest.warns(UserWarning) as record:
+            wrap_openai(client, signet_url="http://x", owner="raw-string")
+        # The warning text mentions a suggested form so callers can
+        # self-correct without consulting the docs.
+        msg = str(record[0].message)
+        assert "human:" in msg
+        assert "agent:" in msg

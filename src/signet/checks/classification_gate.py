@@ -31,11 +31,14 @@ own ordered tuple.
 from __future__ import annotations
 
 import enum
+import logging
 from dataclasses import dataclass
 
 from signet.core.check import Check, CheckResult
 from signet.core.context import RequestContext, get_header_ci
 from signet.core.stage import Stage
+
+logger = logging.getLogger("signet.checks.classification_gate")
 
 
 class ClassificationLevel(enum.IntEnum):
@@ -106,6 +109,29 @@ class ClassificationGateCheck(Check):
         cls_value = get_header_ci(h, self.classification_header)
         clr_value = get_header_ci(h, self.clearance_header)
 
+        # C2.1 (v0.1.7): an empty / whitespace-only classification header
+        # silently maps to the default (UNCLASS). When the caller
+        # asserts a non-default clearance, that asymmetry is worth the
+        # operator's attention — an investigator asking "why was this
+        # allowed?" should see the trail. We emit INFO (not WARN)
+        # because a misconfigured caller is a real but recoverable case:
+        # leave a breadcrumb without alarming. Detection looks at the
+        # raw header dict because ``get_header_ci`` strips whitespace
+        # and collapses absent / whitespace-only into the same ``""``.
+        clr_level_for_log = _parse_level(clr_value, self.default_clearance)
+        if (
+            clr_level_for_log is not None
+            and clr_level_for_log != self.default_classification
+            and self._raw_header_is_whitespace_only(h)
+        ):
+            logger.info(
+                "%s header present but whitespace-only; mapping to default %s "
+                "(clearance=%s)",
+                self.classification_header,
+                self.default_classification.name,
+                clr_level_for_log.name,
+            )
+
         cls_level = _parse_level(cls_value, self.default_classification)
         clr_level = _parse_level(clr_value, self.default_clearance)
 
@@ -133,3 +159,19 @@ class ClassificationGateCheck(Check):
             classification=cls_level.name,
             clearance=clr_level.name,
         )
+
+    def _raw_header_is_whitespace_only(self, headers: dict[str, str]) -> bool:
+        """Return True when the classification header is present but
+        contains only whitespace.
+
+        Distinguishes the "header literally absent" case (ASGI dropped
+        it / caller never sent it) from the "header sent but empty /
+        ``   ``" case that operators want a breadcrumb for. ``get_header_ci``
+        strips whitespace and collapses both into ``""`` so this helper
+        walks the raw dict.
+        """
+        target = self.classification_header.lower()
+        for k, v in headers.items():
+            if k.lower() == target:
+                return isinstance(v, str) and v != "" and v.strip() == ""
+        return False
