@@ -179,8 +179,9 @@ addopts = [
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
-    "integration: tests that hit a live LLM endpoint (slow)",
+    "integration: tests that hit a live LLM endpoint OR exercise the integration test gate (slow)",
     "adversarial: deliberate bypass attempts; must all be blocked",
+    "slow: tests that take more than 5 seconds (compaction at 10k entries, fuzz sweeps, etc.)",
 ]
 
 [tool.coverage.run]
