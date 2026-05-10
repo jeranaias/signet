@@ -37,6 +37,10 @@ Subcommands:
 * ``signet keys generate-ed25519`` -- fresh keypair for asymmetric
   receipt signing.
 * ``signet lint`` -- static analysis on a pipeline file.
+* ``signet bench`` (v0.1.8+) -- measure per-request pipeline
+  overhead, decomposed by stage and check. Supports markdown / JSON /
+  CSV output and a ``--gate p95=10ms`` flag for CI regression
+  detection.
 
 Built on click. Entry point ``signet`` is registered in
 ``pyproject.toml`` under ``[project.scripts]``.
@@ -2300,6 +2304,146 @@ def init(target_dir: Path) -> None:
     click.echo("  signet serve --upstream http://localhost:11434/v1 --dev")
     click.echo("\nthen, in another terminal:")
     click.echo("  python client_example.py")
+
+
+@main.command()
+@click.option(
+    "--upstream",
+    "upstream_url",
+    default="http://localhost:11434/v1",
+    show_default=True,
+    envvar="SIGNET_UPSTREAM_URL",
+    help="OpenAI-compatible upstream URL used for the baseline measurement.",
+)
+@click.option(
+    "--requests",
+    "request_count",
+    default=1000,
+    type=int,
+    show_default=True,
+    help="Total number of synthetic requests to drive through the pipeline.",
+)
+@click.option(
+    "--concurrency",
+    default=10,
+    type=int,
+    show_default=True,
+    help="Maximum in-flight requests at once.",
+)
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to a pipeline.py defining ``pipeline``. Without this, the "
+    "bench runs against a tiny mock pipeline -- useful to measure signet's "
+    "orchestration overhead in isolation.",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["markdown", "json", "csv"]),
+    default="markdown",
+    show_default=True,
+    help="Report format. ``json`` is suitable for CI gating and dashboards; "
+    "``csv`` is for spreadsheet ingestion.",
+)
+@click.option(
+    "--no-baseline",
+    "no_baseline",
+    is_flag=True,
+    help="Skip the direct-to-upstream baseline. Use when the upstream is "
+    "mocked or unreachable; only signet's pipeline overhead is reported.",
+)
+@click.option(
+    "--mock-upstream",
+    "mock_upstream",
+    is_flag=True,
+    help="Don't talk to the upstream at all. Use for CI gating where you "
+    "want to catch signet code regressions independent of upstream variance.",
+)
+@click.option(
+    "--gate",
+    "gate_spec",
+    default=None,
+    help="Comma-separated percentile=threshold rules. Exit non-zero if any "
+    "rule fails. Example: --gate p95=10ms,p99=20ms. Units: ms (default), s, us.",
+)
+def bench(
+    upstream_url: str,
+    request_count: int,
+    concurrency: int,
+    config_path: Path | None,
+    output_format: str,
+    no_baseline: bool,
+    mock_upstream: bool,
+    gate_spec: str | None,
+) -> None:
+    """Measure signet's per-request overhead.
+
+    Drives synthetic requests through the configured (or default mock)
+    pipeline, recording per-stage and per-check timings. Optionally runs
+    a direct-to-upstream baseline so the report can show the delta.
+
+    Output is suitable for blog posts, Grafana dashboards (JSON), CI
+    gating (JSON + ``--gate``), and spreadsheets (CSV).
+
+    \b
+    Three modes:
+      --mock-upstream    skip upstream entirely (CI gating)
+      --no-baseline      pipeline-only, no upstream baseline
+      (default)          full report with upstream delta
+
+    \b
+    Example:
+      signet bench --mock-upstream --requests 1000 --gate p95=10ms
+
+    See docs/bench.md for interpretation.
+    """
+    import asyncio
+
+    from signet.bench import (
+        apply_gate,
+        format_gate_outcome,
+        load_pipeline_or_default,
+        parse_gate_spec,
+        run_bench,
+    )
+
+    # Parse the gate spec up front so a malformed --gate fails fast,
+    # before we spend a minute driving 1000 synthetic requests.
+    try:
+        gate_rules = parse_gate_spec(gate_spec or "")
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    pipeline = load_pipeline_or_default(config_path)
+
+    report = asyncio.run(
+        run_bench(
+            pipeline,
+            upstream_url=upstream_url,
+            requests=request_count,
+            concurrency=concurrency,
+            baseline=not no_baseline,
+            mock_upstream=mock_upstream,
+        )
+    )
+
+    if output_format == "markdown":
+        click.echo(report.render_markdown(), nl=False)
+    elif output_format == "json":
+        click.echo(report.render_json())
+    elif output_format == "csv":
+        click.echo(report.render_csv(), nl=False)
+
+    if gate_rules:
+        outcome = apply_gate(report, gate_rules)
+        # Gate output goes to stderr so a JSON consumer piping stdout
+        # to ``jq`` doesn't get gate banner text mixed in. The non-zero
+        # exit still surfaces "this failed".
+        click.echo(format_gate_outcome(outcome), err=True, nl=False)
+        if not outcome.passed:
+            sys.exit(1)
 
 
 def _configure_structlog_json() -> None:
