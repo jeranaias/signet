@@ -1,4 +1,4 @@
-"""OwnerResolutionCheck — refuse if no commit owner can be resolved.
+"""OwnerResolutionCheck -- refuse if no commit owner can be resolved.
 
 This is the load-bearing check. signet's whole architectural premise is
 that every action must be attributable to an accountable owner. If a
@@ -11,9 +11,9 @@ header order on the wire):
 1. Already-resolved :class:`Owner` on the context (e.g. populated by
    :class:`signet.checks.loopback_trust.LoopbackTrustCheck` or another
    resolver running earlier in the pipeline). Skips header parsing.
-2. ``X-Commit-Owner: human:<principal>`` — direct human assertion.
-3. ``X-Agent-Id: agent:<id>`` — autonomous-agent assertion.
-4. ``X-Policy-Name`` + optional ``X-Policy-Version`` — a named
+2. ``X-Commit-Owner: human:<principal>`` -- direct human assertion.
+3. ``X-Agent-Id: agent:<id>`` -- autonomous-agent assertion.
+4. ``X-Policy-Name`` + optional ``X-Policy-Version`` -- a named
    organizational policy delegating authority.
 
 When all four miss, the check returns ``Decision.BLOCK`` with reason
@@ -30,8 +30,8 @@ stripped of leading/trailing whitespace before matching.
 C1.4 (v0.1.7): the *value prefix* (``human:`` / ``agent:``) is **case-
 sensitive**. ``HUMAN:alice`` and ``Human:alice`` are NOT recognized
 and the check will refuse them. The header *name* itself is
-case-insensitive — ``x-commit-owner`` and ``X-Commit-Owner`` both
-match — but the literal lowercase ``human:`` prefix on the value is
+case-insensitive -- ``x-commit-owner`` and ``X-Commit-Owner`` both
+match -- but the literal lowercase ``human:`` prefix on the value is
 load-bearing. Operators integrating with mixed-case environments
 should normalize at the reverse proxy layer.
 
@@ -48,14 +48,14 @@ records "the caller said X"; it does not prove X is the caller. See
 
 Strict mode is the default and recommended setting. Permissive mode
 (``require_owner=False``) instead resolves the unresolved case to
-``policy:unattributed`` — useful only for non-production observability
+``policy:unattributed`` -- useful only for non-production observability
 shakedowns where you want to see traffic patterns before turning
 enforcement on.
 
 The resolved :class:`Owner`'s ``approval_chain`` flows through the
 pipeline and is surfaced by the COMMITMENT-stage tool-call inspector
 as ``requires_approval_from`` / ``current_approver`` in escalation
-audit metadata — see ``docs/escalation.md`` for the routing contract.
+audit metadata -- see ``docs/escalation.md`` for the routing contract.
 
 The ``require_owner=True`` ↔ :attr:`OwnerType.UNRESOLVED` flow,
 end-to-end::
@@ -79,7 +79,7 @@ from signet.core.context import RequestContext, get_header_ci
 from signet.core.owner import Owner
 from signet.core.stage import Stage
 
-# Canonical header names. Lookup is case-insensitive — see get_header_ci.
+# Canonical header names. Lookup is case-insensitive -- see get_header_ci.
 _HEADER_COMMIT_OWNER = "X-Commit-Owner"
 _HEADER_AGENT_ID = "X-Agent-Id"
 _HEADER_POLICY_NAME = "X-Policy-Name"
@@ -105,7 +105,7 @@ def _sanitize_principal(value: str) -> str | None:
     * contains CR / LF / NUL (audit-line forgery)
     * contains any other ASCII control character below ``\\x20``
       (regular ASCII space is preserved only in the interior of the
-      principal — leading / trailing whitespace is stripped first)
+      principal -- leading / trailing whitespace is stripped first)
     * exceeds :data:`_MAX_PRINCIPAL_LEN` characters
     """
     if not value:
@@ -160,16 +160,16 @@ class OwnerResolutionCheck(Check):
                 "no commit owner could be resolved",
                 hint=(
                     "Send one of these headers. The lowercase prefix is REQUIRED "
-                    "and case-sensitive — `HUMAN:alice` and `Human:alice` are NOT "
+                    "and case-sensitive -- `HUMAN:alice` and `Human:alice` are NOT "
                     "recognized (C1.4):\n"
                     "  X-Commit-Owner: human:alice@example.com\n"
                     "  X-Agent-Id: agent:nightly-syncer\n"
                     "  X-Policy-Name: acme-default   (with optional X-Policy-Version: v3)\n"
                     "Note: if X-Policy-Name itself contains '@' AND you also set "
                     "X-Policy-Version, the joined form becomes 'policy:name@ver' "
-                    "which yields a double-'@' and an ambiguous ID — supply the "
+                    "which yields a double-'@' and an ambiguous ID -- supply the "
                     "joined form yourself in X-Policy-Name in that case (C1.5).\n"
-                    "Headers are caller-asserted attribution, not authentication — "
+                    "Headers are caller-asserted attribution, not authentication -- "
                     "see SECURITY.md trust model."
                 ),
                 examples=[
@@ -186,13 +186,13 @@ class OwnerResolutionCheck(Check):
     @staticmethod
     def _resolve_from_headers(headers: dict[str, str]) -> Owner | None:
         # Precedence: human > agent > policy. If two are sent the human
-        # claim wins and the others are silently dropped — documented in
+        # claim wins and the others are silently dropped -- documented in
         # the module docstring.
         #
         # All extracted principals are routed through ``_sanitize_principal``
         # to reject CR/LF/NUL, other control chars, and over-length values.
         # On rejection we return None so the ``require_owner=True`` path
-        # produces the standard refusal — a forged owner_id never reaches
+        # produces the standard refusal -- a forged owner_id never reaches
         # the audit row.
         co = get_header_ci(headers, _HEADER_COMMIT_OWNER)
         if co.startswith("human:"):

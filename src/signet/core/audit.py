@@ -1,6 +1,6 @@
-"""AuditEntry — the immutable record of one decision.
+"""AuditEntry -- the immutable record of one decision.
 
-Every decision the pipeline makes — *allow*, *block*, *redact*, *escalate* —
+Every decision the pipeline makes -- *allow*, *block*, *redact*, *escalate* --
 becomes one :class:`AuditEntry`. Entries are append-only; once written to the
 audit chain they are never modified. Tampering is detected by the HMAC chain
 in :mod:`signet.audit`.

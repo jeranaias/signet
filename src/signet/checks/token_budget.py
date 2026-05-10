@@ -1,7 +1,7 @@
-"""TokenBudgetCheck — per-owner output token quotas.
+"""TokenBudgetCheck -- per-owner output token quotas.
 
 Distinct from :class:`signet.checks.rate_limit.RateLimitCheck` (request
-count) — this caps the *output volume* an owner can consume per window.
+count) -- this caps the *output volume* an owner can consume per window.
 Useful where each request is cheap to send but expensive to fulfill,
 e.g. long-context completions or video generation.
 
@@ -11,7 +11,7 @@ Two-mode operation:
   output size. We can only check what's been used so far in the window
   vs the cap, plus the *requested* ``max_tokens`` parameter as a
   pessimistic estimate. v0.1.7 reserves the estimate against the
-  bucket — concurrent admissions see each other's reservations and
+  bucket -- concurrent admissions see each other's reservations and
   the burst-race window closes. Refuse if (used + reserved + requested)
   exceeds cap.
 * **RECORD-stage check**: after the response completes, we refund the
@@ -19,7 +19,7 @@ Two-mode operation:
   from upstream usage so the next ADMISSION call sees accurate state.
 
 The check class is registered under ADMISSION and runs at both hooks
-internally — :meth:`pre_request` does the budget check;
+internally -- :meth:`pre_request` does the budget check;
 :meth:`post_complete` reconciles reservation + actual usage.
 
 Window granularity is configurable: per-minute, per-hour, per-day.
@@ -27,7 +27,7 @@ Defaults to per-day matching how most LLM cost budgets are framed.
 
 The per-owner ``_windows`` map is bounded by ``max_owners`` (LRU
 eviction). Without that bound, an attacker rotating identities would
-inflate memory unboundedly — same fix surface as
+inflate memory unboundedly -- same fix surface as
 :class:`signet.checks.rate_limit.InMemoryRateLimitState`.
 """
 
@@ -166,7 +166,7 @@ class TokenBudgetCheck(Check):
 
         window.reserved += estimate
         # Track the reservation on per-request scratch so post_complete
-        # refunds exactly what was reserved — not whatever the request
+        # refunds exactly what was reserved -- not whatever the request
         # body claims at completion time (the caller may not see the
         # request body again, and concurrent estimates would otherwise
         # drift the counter). We also keep the legacy
@@ -193,7 +193,7 @@ class TokenBudgetCheck(Check):
         # Refund whatever this request reserved at admission. If we
         # never reserved (e.g. the request was blocked downstream
         # before this hook ran, or the scratch entry was rotated away
-        # by a window rollover), the refund is zero — never negative,
+        # by a window rollover), the refund is zero -- never negative,
         # never speculative.
         reserved = ctx.request.scratch.pop(_SCRATCH_RESERVED_KEY, 0)
         if isinstance(reserved, int) and reserved > 0:
@@ -222,7 +222,7 @@ class TokenBudgetCheck(Check):
     def _current_window(self, key: str) -> _Window:
         """Return the active window, rolling over if expired.
 
-        Also enforces the ``max_owners`` LRU bound — the least-recently
+        Also enforces the ``max_owners`` LRU bound -- the least-recently
         touched window is evicted on overflow, matching the semantics
         of :class:`signet.checks.rate_limit.InMemoryRateLimitState`.
         """
@@ -241,7 +241,7 @@ class TokenBudgetCheck(Check):
 
         ``max_tokens=0`` and missing values fall back to a positive
         floor so the cap can't be bypassed by claiming "I'll use zero
-        tokens" — even a refused or empty completion costs the upstream
+        tokens" -- even a refused or empty completion costs the upstream
         a non-zero pre-fill.
 
         Negative values are refused at :meth:`pre_request` before we

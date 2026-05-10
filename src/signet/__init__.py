@@ -1,4 +1,4 @@
-"""signet — capability-based safety gates for LLM agents.
+"""signet -- capability-based safety gates for LLM agents.
 
 The model proposes; signet authorizes. signet sits between an LLM and any
 system that can execute its outputs, providing programmatic checks (owner

@@ -1,4 +1,4 @@
-"""Metrics — in-process Prometheus-format counters for /metrics.
+"""Metrics -- in-process Prometheus-format counters for /metrics.
 
 Minimal-by-design: every signet decision is tracked as a labeled
 counter in memory and exposed at ``/metrics`` in the Prometheus
@@ -13,42 +13,42 @@ This is sufficient for:
 For deployments needing the full Prometheus feature surface
 (histograms with bucket configuration, summaries, advanced labels),
 plug in the official ``prometheus-client`` library against
-:class:`Metrics` — it implements the same interface but with richer
+:class:`Metrics` -- it implements the same interface but with richer
 backends.
 
 Counters surfaced:
 
-* ``signet_requests_total{path}`` — every request that reached
+* ``signet_requests_total{path}`` -- every request that reached
   :class:`signet.server.app.SignetApp`. The label set is intentionally
   small: the counter increments at handler entry before the pipeline
   has classified the request, so ``decision`` and ``status`` aren't
   yet known. Use :data:`signet_pipeline_decisions_total` for
   decision-shaped roll-ups.
-* ``signet_pipeline_decisions_total{check, stage, decision}`` — every
+* ``signet_pipeline_decisions_total{check, stage, decision}`` -- every
   result returned by a check in the pipeline. ``stage`` is the
   ADMISSION/INSPECTION/COMMITMENT/RECORD lifecycle stage from the
   result metadata; an empty ``stage`` label denotes stageless
   synthetic rows (the per-request ``pipeline.complete`` row, etc.).
-* ``signet_audit_chain_appends_total`` — total entries written to the
+* ``signet_audit_chain_appends_total`` -- total entries written to the
   audit chain
-* ``signet_audit_anchor_failures_total{backend}`` — anchor backend
+* ``signet_audit_anchor_failures_total{backend}`` -- anchor backend
   failures (when external anchoring is configured)
-* ``signet_check_duration_seconds{check, stage, decision}`` —
+* ``signet_check_duration_seconds{check, stage, decision}`` --
   histogram of per-check hook latency in seconds (v0.1.6)
-* ``signet_shadow_would_have_blocked_total{check, stage, decision}`` —
+* ``signet_shadow_would_have_blocked_total{check, stage, decision}`` --
   counter of non-allow decisions neutralized by shadow mode (v0.1.6).
   Mirrors the ``signet_pipeline_decisions_total`` label set so dashboards
   can join the two on (check, stage, decision).
-* ``signet_response_text_truncated_total{cap_bytes}`` — counter of
+* ``signet_response_text_truncated_total{cap_bytes}`` -- counter of
   responses whose ``ResponseContext.accumulated_text`` saturated the
   per-response cap (v0.1.6 N2). Fires once per affected response.
   ``cap_bytes`` is the configured cap so dashboards can attribute spikes
   to a specific cap-policy setting.
-* ``signet_uptime_seconds`` — gauge: seconds since the process started
+* ``signet_uptime_seconds`` -- gauge: seconds since the process started
 
 Counters reset on process restart. For persistent metrics across
 restarts, scrape into a long-term store (Prometheus, VictoriaMetrics,
-etc.) — that's the standard pattern.
+etc.) -- that's the standard pattern.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-#: Default histogram buckets (seconds). Tuned for sub-second checks —
+#: Default histogram buckets (seconds). Tuned for sub-second checks --
 #: most signet checks run in single-digit-millisecond budgets, with
 #: outliers (LLM judges, sandboxed tools) potentially bleeding into
 #: the seconds range. Buckets follow the Prometheus convention: each
@@ -111,7 +111,7 @@ class _Histogram:
     """A single labeled histogram with cumulative buckets.
 
     Each label combination owns its own per-bucket counter array, sum,
-    and total count — the standard Prometheus histogram shape. Buckets
+    and total count -- the standard Prometheus histogram shape. Buckets
     are cumulative (each bucket counts observations ``<=`` its upper
     bound); a synthetic ``+Inf`` bucket equal to the total count is
     appended at render time so the histogram is always well-formed.
@@ -251,7 +251,7 @@ class Metrics:
     def inc(self, name: str, labels: dict[str, str] | None = None, by: float = 1.0) -> None:
         """Bump the counter with the given labels.
 
-        Unknown counter names are silently ignored — callers should not
+        Unknown counter names are silently ignored -- callers should not
         be able to crash the request path by mistyping a metric name.
         """
         with self._lock:

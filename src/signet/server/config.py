@@ -1,4 +1,4 @@
-"""ServerConfig — runtime configuration for the signet proxy.
+"""ServerConfig -- runtime configuration for the signet proxy.
 
 A single dataclass that holds every dial the server exposes. Construct
 explicitly or via :meth:`from_env` to populate from environment variables
@@ -30,7 +30,7 @@ def _parse_bool_env(value: str) -> bool:
 
     Accepts ``1``/``true``/``yes``/``on``/``enabled`` as truthy
     (case-insensitive, surrounding whitespace stripped). Anything else
-    — including the empty string and ``"0"``/``"false"``/``"no"`` —
+    -- including the empty string and ``"0"``/``"false"``/``"no"`` --
     is falsy. Centralized so every bool-flag env var has identical
     parsing semantics; previously each call site spelled
     ``v.lower() == "true"`` inline, which silently rejected ``"1"``
@@ -96,7 +96,7 @@ class ServerConfig:
             ``"http://localhost:8000/v1"`` (vLLM).
         upstream_api_key: Bearer token forwarded to the upstream.
             ``None`` to forward the caller's own ``Authorization`` header.
-        host: Bind interface for the proxy. Defaults to ``127.0.0.1`` —
+        host: Bind interface for the proxy. Defaults to ``127.0.0.1`` --
             change to ``0.0.0.0`` for non-loopback exposure (after
             considering the trust model in
             :doc:`docs/architecture`).
@@ -185,7 +185,7 @@ class ServerConfig:
     ``{"error": "refused", "correlation_id": "<entry_id>"}`` so the
     public response does not name the firing check, its reason, or the
     rule that tripped. The full detail still lands in the audit chain
-    and the ``X-Signet-Receipt`` header — incident response correlates
+    and the ``X-Signet-Receipt`` header -- incident response correlates
     via the entry ID. Turn off (``--no-strict-error-redaction`` or set
     ``False``) only for development, debugging integration issues, or
     deployments behind a fully-trusted client. ``signet serve --dev``
@@ -201,7 +201,7 @@ class ServerConfig:
     enforcement on."""
     realtime_enabled: bool = True
     """Whether to register the ``/v1/realtime`` WebSocket route.
-    Defaults to ``True`` — the route is always registered and FastAPI
+    Defaults to ``True`` -- the route is always registered and FastAPI
     does not pre-allocate handlers, so deployments that never receive
     realtime traffic incur no cost. Set ``False`` to skip route
     registration entirely; deployments that want a hard guarantee
@@ -215,7 +215,7 @@ class ServerConfig:
     """Opt-in: feed ``event:``, ``id:``, ``retry:``, and ``:`` (comment)
     lines from upstream SSE frames into INSPECTION's accumulated text
     (S6). The SSE spec lets non-``data:`` lines smuggle text past
-    classification scanners that only look at ``data:`` payloads —
+    classification scanners that only look at ``data:`` payloads --
     e.g. ``event: foo\\ndata: bar\\n\\n`` could carry a classification
     marker on the ``event:`` line that ScopeDriftCheck never sees.
     Default ``False`` preserves 0.1.6 behavior. Set ``True`` to harden
@@ -236,7 +236,7 @@ class ServerConfig:
         """Construct a config populated from environment variables.
 
         Recognized variables (all prefixed ``SIGNET_``). The list below
-        matches the implementation 1:1 — every variable parsed here is
+        matches the implementation 1:1 -- every variable parsed here is
         documented; nothing is silently swallowed. See the dataclass
         attribute docstrings for the meaning of each field.
 
@@ -265,12 +265,12 @@ class ServerConfig:
 
         CLI-only env vars (NOT parsed here, deliberately):
 
-        * ``SIGNET_LOG_FORMAT`` — drives JSON-vs-text log formatting at
+        * ``SIGNET_LOG_FORMAT`` -- drives JSON-vs-text log formatting at
           process start in ``signet serve``. It configures the root
           logger before a ServerConfig is built, so it is not a
           ``ServerConfig`` field. Read it from your launcher; do not
           expect setting it here to take effect.
-        * ``SIGNET_ANONYMIZE_SALT`` — used by ``signet audit report``
+        * ``SIGNET_ANONYMIZE_SALT`` -- used by ``signet audit report``
           to salt owner pseudonymization. The audit-report CLI is a
           read-only tool that never instantiates ServerConfig, so this
           var is consumed at the CLI surface, not here.

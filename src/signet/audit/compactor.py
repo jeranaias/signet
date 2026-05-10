@@ -17,7 +17,7 @@ the protocol:
    entry retained as-is.
 
 After compaction the live log is short again, but the chain plus archive
-together still verify as one logical sequence — :func:`verify_with_archives`
+together still verify as one logical sequence -- :func:`verify_with_archives`
 in :mod:`signet.audit.verifier` walks the live log and on each marker
 re-opens the matching archive, recomputes the Merkle root, and compares.
 
@@ -77,7 +77,7 @@ class ArchiveHeader:
         archive_format_version: Integer version of the archive byte
             format. 0.1.6 emits version 1.
         signet_version: ``signet.__version__`` of the writer. Recorded
-            for forensic traceability — diagnosing format drift across
+            for forensic traceability -- diagnosing format drift across
             releases is much easier when the file says who made it.
         range_start: ISO 8601 UTC timestamp of the OLDEST archived
             entry.
@@ -158,7 +158,7 @@ class MerkleTree:
 
     For an odd number of nodes at any level the last hash is duplicated
     (the "fill" approach used in Certificate Transparency RFC 6962 §2.1
-    — strictly speaking CT uses a different odd-handling rule, but the
+    -- strictly speaking CT uses a different odd-handling rule, but the
     duplicate-last-hash variant is widely deployed in practice and
     produces a deterministic, single-rooted tree without extra
     encoding).
@@ -174,7 +174,7 @@ class MerkleTree:
     def from_entries(cls, entries: Iterable[AuditEntry]) -> MerkleTree:
         """Build a tree over an iterable of entries.
 
-        Empty input is rejected — there's no meaningful Merkle root over
+        Empty input is rejected -- there's no meaningful Merkle root over
         zero leaves, and callers should be filtering before they reach
         the compactor.
         """
@@ -198,7 +198,7 @@ class MerkleTree:
             <u32 root_byte_len>
             <root bytes (hex string)>
 
-        The intermediate levels are NOT serialized — they are
+        The intermediate levels are NOT serialized -- they are
         deterministically recomputable from the leaves, and storing them
         would be both redundant and a footgun for any drift between
         writer and reader. Verifiers rebuild the tree on load.
@@ -225,7 +225,7 @@ class MerkleTree:
     @classmethod
     def deserialize(cls, data: bytes) -> MerkleTree:
         """Inverse of :meth:`serialize`. Recomputes the root from the
-        leaves and asserts it matches the stored root — any mismatch
+        leaves and asserts it matches the stored root -- any mismatch
         means the archive is corrupt or written by a buggy peer.
         """
         prefix = b"MERKLE-V1\n"
@@ -356,7 +356,7 @@ def _write_archive(
     output.parent.mkdir(parents=True, exist_ok=True)
 
     # Compose the archive payload in memory. Archive sizes are O(entries
-    # being compacted) — for a 100k-entry archive that's a few tens of
+    # being compacted) -- for a 100k-entry archive that's a few tens of
     # megabytes, well under the threshold where streaming would matter.
     body = bytearray()
     body += _MAGIC_PREFIX + str(header.archive_format_version).encode("ascii") + b"\n"
@@ -415,7 +415,7 @@ def _read_archive(path: Path) -> tuple[ArchiveHeader, MerkleTree, list[AuditEntr
 
     Returns the header, the deserialized Merkle tree (with verified
     root), and the decompressed list of entries. Raises
-    :class:`ValueError` on any structural violation — verifiers
+    :class:`ValueError` on any structural violation -- verifiers
     translate that into ``ARCHIVE_FORMAT_INVALID`` breaks.
     """
     raw = path.read_bytes()
@@ -533,7 +533,7 @@ def compact_audit_log(
         chain: The live :class:`HmacChain` writer. The marker is
             appended through this so chain integrity is preserved.
         backend: The :class:`JsonlBackend` underlying ``chain``. Needed
-            because compaction has to atomically rewrite the file —
+            because compaction has to atomically rewrite the file --
             a chain-only API would be too narrow.
         before: Cutoff datetime. Entries whose ``ts_ns`` represents a
             wall-clock instant strictly less than this are archived.
@@ -543,7 +543,7 @@ def compact_audit_log(
             created if it doesn't exist.
         archive_format_version: Version stamp recorded in the archive
             header. Must equal :data:`ARCHIVE_FORMAT_VERSION`.
-        quiesce_required: Marker for the contract — the chain must be
+        quiesce_required: Marker for the contract -- the chain must be
             quiesced (no concurrent writers) before this is called.
             Reserved for a future runtime check; currently always True.
         force: When True, overwrite an existing archive at ``output``.
@@ -571,7 +571,7 @@ def compact_audit_log(
     call. The compactor takes a cross-process exclusive lock on the
     live log's sidecar (``<path>.lock``) so
     :class:`FileLockingJsonlBackend` writers block on the same lock
-    for the duration of the rewrite — but other backends (or external
+    for the duration of the rewrite -- but other backends (or external
     processes writing the file directly) are not constrained. See
     ``docs/audit-archive-format.md`` for the operator playbook.
     """
@@ -602,7 +602,7 @@ def compact_audit_log(
     # Convert to ns since epoch via integer microseconds rather than
     # the float seconds path. ``datetime.timestamp()`` returns a float
     # that loses sub-microsecond precision and can drift the boundary
-    # by a handful of nanoseconds — enough to pull a neighboring
+    # by a handful of nanoseconds -- enough to pull a neighboring
     # entry over the cutoff in tests with closely-spaced ``ts_ns``.
     epoch = datetime(1970, 1, 1, tzinfo=UTC)
     delta = before_utc - epoch
@@ -614,7 +614,7 @@ def compact_audit_log(
     # the silent-data-loss footgun where a concurrent appender's open
     # handle on the live log would race with the compactor's
     # ``os.replace`` on Windows. Plain ``JsonlBackend`` (single-writer)
-    # is unconstrained — but it isn't multi-writer safe to begin
+    # is unconstrained -- but it isn't multi-writer safe to begin
     # with.
     with exclusive_log_lock(backend.path):
         # Read the entire chain. We need every entry both to identify
@@ -681,7 +681,7 @@ def compact_audit_log(
 
         # Build the compaction-marker entry. We need to sign it manually
         # here rather than calling :meth:`HmacChain.append` because the
-        # marker MUST link to the LAST eligible entry's hmac — and at the
+        # marker MUST link to the LAST eligible entry's hmac -- and at the
         # moment we're calling, the backend file still contains every
         # entry, so the chain's normal "what's the latest entry" lookup
         # would return the wrong predecessor whenever there are retained
@@ -717,7 +717,7 @@ def compact_audit_log(
             new_entries=[appended_marker, *retained],
         )
 
-        # The chain's prev cache (if active) is now stale — the next
+        # The chain's prev cache (if active) is now stale -- the next
         # append should link to whatever the *new* last entry is in the
         # rewritten file, not whatever the chain happened to cache from a
         # previous append. Invalidate it.
@@ -856,7 +856,7 @@ def trim_before_index(backend: JsonlBackend, index: int) -> int:
 
     Returns the new entry count. This is provided as a free function
     rather than a :class:`JsonlBackend` method because trimming is a
-    compaction-only concern — the rest of the chain treats the backend
+    compaction-only concern -- the rest of the chain treats the backend
     as strictly append-only, and adding a delete method to the public
     backend protocol would invite misuse.
 

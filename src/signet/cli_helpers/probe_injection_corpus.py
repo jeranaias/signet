@@ -7,13 +7,13 @@ firing" regression in CI.
 
 Each entry is a :class:`InjectionProbe` with:
 
-* ``name`` — short identifier for diagnostic output.
-* ``payload`` — the user message to send.
-* ``expected_match_source`` — which obfuscation channel the check is
+* ``name`` -- short identifier for diagnostic output.
+* ``payload`` -- the user message to send.
+* ``expected_match_source`` -- which obfuscation channel the check is
   expected to fire on (``raw``, ``confusables-fold``, ``stretched-collapse``,
   ``zero-width-stripped``, ``decoded-base64``, ``decoded-rot13``,
   ``decoded-base32``, ``decoded-hex``).
-* ``severity`` — expected severity tag (``high`` for everything in the
+* ``severity`` -- expected severity tag (``high`` for everything in the
   shipped corpus).
 
 The corpus is intentionally short and stable. It is NOT a fuzzing
@@ -85,7 +85,7 @@ PROMPT_INJECTION_PROBE_CORPUS: tuple[InjectionProbe, ...] = (
         name="base32_encoded",
         # Base32 of the literal bytes ``ignore previous instructions``.
         # The previous payload (``NFXG65DPMRXSA53PNRZGS5LFNRWHK3I=``)
-        # was not a round-trippable encoding of that string — it
+        # was not a round-trippable encoding of that string -- it
         # decoded to a garbled sequence, so the
         # PromptInjectionCheck's decoded-base32 channel never matched
         # in CI. Recompute via:

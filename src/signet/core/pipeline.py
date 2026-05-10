@@ -1,4 +1,4 @@
-"""Pipeline — the executor that runs checks against a request.
+"""Pipeline -- the executor that runs checks against a request.
 
 A :class:`Pipeline` holds an ordered list of :class:`Check` objects and
 exposes one method per hook timing. Checks are sorted by
@@ -14,7 +14,7 @@ points in request handling.
 
 Per-check timeouts: any check whose ``timeout_seconds`` attribute is set
 gets its hook calls wrapped in :func:`asyncio.wait_for`. A timeout is
-translated to ``CheckResult.block(...)`` with a timeout reason —
+translated to ``CheckResult.block(...)`` with a timeout reason --
 fail-closed, so a stuck external dependency (LLM judge, sandbox runner,
 oracle) cannot halt the proxy.
 """
@@ -36,7 +36,7 @@ class _HistogramObserver(Protocol):
 
     Matches :meth:`signet.server.metrics.Metrics.observe_histogram`.
     Defined as a Protocol (rather than importing ``Metrics`` directly)
-    so ``signet.core`` keeps no hard dependency on ``signet.server`` —
+    so ``signet.core`` keeps no hard dependency on ``signet.server`` --
     the pipeline must be usable in CLI tools, tests, and embedded apps
     without dragging the whole HTTP stack in.
     """
@@ -86,7 +86,7 @@ class Pipeline:
         # ``metrics`` is optional so Pipeline stays usable in tests,
         # CLI tools, and embedded contexts that don't run the HTTP
         # server. When unset, the per-check duration histogram simply
-        # isn't emitted — observers see nothing rather than a partial
+        # isn't emitted -- observers see nothing rather than a partial
         # signal that could mislead alerting.
         self._metrics: _HistogramObserver | None = metrics
 
@@ -143,7 +143,7 @@ class Pipeline:
 
         Unlike the other hooks, RECORD is *non-short-circuiting*: every
         check runs and every result is returned. RECORD checks are
-        audit-only — they cannot modify the already-delivered response —
+        audit-only -- they cannot modify the already-delivered response --
         so the pipeline collects all of them for the audit chain.
         """
         results: list[CheckResult] = []
@@ -209,7 +209,7 @@ def _decision_label(result: CheckResult) -> str:
     Mirrors the four-way Decision split used elsewhere (allow / block /
     redact / escalate). Anything unrecognized is mapped to ``block`` so
     a future Decision variant doesn't quietly disappear from the
-    histogram — fail-closed labelling, same posture as
+    histogram -- fail-closed labelling, same posture as
     :func:`signet.server.app._result_to_decision`.
     """
     if result.is_allow:

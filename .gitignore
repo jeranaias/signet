@@ -58,3 +58,4 @@ docs/_build/
 *.audit.jsonl
 .signet-audit/
 growth/
+SIGNET-CLAUDE-HANDOFF.txt

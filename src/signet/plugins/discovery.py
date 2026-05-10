@@ -1,4 +1,4 @@
-"""Plugin discovery — read the standard signet entry-point groups.
+"""Plugin discovery -- read the standard signet entry-point groups.
 
 The discovery layer is intentionally thin. It enumerates entry points,
 loads them on demand, validates them against the ABI contract and the
@@ -7,10 +7,10 @@ structured form the CLI can render.
 
 Three entry-point groups are walked:
 
-* ``signet.checks`` — full :class:`Check` subclasses (the common case;
+* ``signet.checks`` -- full :class:`Check` subclasses (the common case;
   ABI-version checked).
-* ``signet.adapters`` — drop-in HTTP adapters.
-* ``signet.anchors`` — external anchor backends.
+* ``signet.adapters`` -- drop-in HTTP adapters.
+* ``signet.anchors`` -- external anchor backends.
 
 Caching: results from :func:`discover_plugins` are cached for the
 process lifetime, since entry points don't change between Python
@@ -54,7 +54,7 @@ class DiscoveredPlugin:
     """One entry point discovered at startup.
 
     Attributes:
-        group: Entry-point group name —
+        group: Entry-point group name --
             ``"signet.checks"``, ``"signet.adapters"`` or
             ``"signet.anchors"``.
         name: The entry-point name (the key on the left in
@@ -63,7 +63,7 @@ class DiscoveredPlugin:
             ``""`` if the distribution metadata could not be resolved.
         package_version: The distribution version, or ``""`` when
             unknown.
-        target: ``"module.path:Symbol"`` — the entry point's value.
+        target: ``"module.path:Symbol"`` -- the entry point's value.
         status: ``"loaded"`` for a successfully loaded plugin,
             ``"incompatible_abi"`` when the plugin declares an ABI
             version signet does not accept, ``"load_error"`` when
@@ -115,7 +115,7 @@ def discover_plugins(*, refresh: bool = False) -> list[DiscoveredPlugin]:
         refresh: If ``True``, ignore any cached discovery and rebuild.
 
     Returns:
-        List of :class:`DiscoveredPlugin` entries — one per discovered
+        List of :class:`DiscoveredPlugin` entries -- one per discovered
         entry point across :data:`ENTRY_POINT_GROUPS`. Includes failed
         loads and ABI mismatches so the CLI can surface misconfiguration
         instead of dropping it on the floor.
@@ -129,7 +129,7 @@ def discover_plugins(*, refresh: bool = False) -> list[DiscoveredPlugin]:
         A call with ``refresh=True`` rebuilds the cache and returns a
         NEW list object, so callers that captured a reference from a
         prior call will continue to see the stale snapshot. Do not rely
-        on identity for change-detection — compare the contents
+        on identity for change-detection -- compare the contents
         explicitly, or call :func:`reset_cache` and re-fetch.
     """
     global _DISCOVERED_PLUGINS_CACHE, _DISCOVERED_CHECKS_CACHE
@@ -254,7 +254,7 @@ def discover_plugins(*, refresh: bool = False) -> list[DiscoveredPlugin]:
 
     # Detect duplicate (group, name) registrations. importlib.metadata
     # happily returns multiple entry points with the same name when two
-    # packages both register one — the first by install order wins
+    # packages both register one -- the first by install order wins
     # silently. Plugin upgrades that retain the name but change the
     # import path therefore appear successful while still running the
     # old class. We refuse the ambiguity at discovery time and let the

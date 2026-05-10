@@ -1,42 +1,42 @@
-"""signet CLI — operations interface.
+"""signet CLI -- operations interface.
 
 Subcommands:
 
-* ``signet init`` — scaffold a starter project (pipeline.py,
+* ``signet init`` -- scaffold a starter project (pipeline.py,
   client_example.py, .env.example, .gitignore).
-* ``signet serve`` — run the FastAPI proxy. ``--dev`` bundles the
+* ``signet serve`` -- run the FastAPI proxy. ``--dev`` bundles the
   three usual local-development flags into one.
-* ``signet doctor`` — preflight check: prints versions, probes
+* ``signet doctor`` -- preflight check: prints versions, probes
   ``--upstream`` reachability, probes a running ``--self`` for
   /health, /version, and a no-owner refusal round-trip. With
   ``--probe-injection`` (v0.1.6+), runs the static obfuscated-
   injection corpus against ``--self`` and asserts every probe
   refuses.
-* ``signet audit verify`` — walk an HMAC-chained log and report any
+* ``signet audit verify`` -- walk an HMAC-chained log and report any
   tampering. With ``--including-archives <dir>`` (v0.1.6+), also
   walks every referenced compaction archive end-to-end.
-* ``signet audit show`` — pretty-print one entry by ID.
-* ``signet audit count`` / ``audit tail`` — quick group-by counts
+* ``signet audit show`` -- pretty-print one entry by ID.
+* ``signet audit count`` / ``audit tail`` -- quick group-by counts
   and tail with field filters.
-* ``signet audit compact`` (v0.1.6+) — Merkle-archive a prefix of
+* ``signet audit compact`` (v0.1.6+) -- Merkle-archive a prefix of
   the chain and replace it with a compaction marker. Operator MUST
   quiesce the chain first (``--quiesce-confirm``).
-* ``signet audit report`` (v0.1.6+) — periodic decision summary:
+* ``signet audit report`` (v0.1.6+) -- periodic decision summary:
   decision distribution, top firing checks, top blocked owners
   (anonymized by default), deltas vs the prior period, chain-
   integrity attestation. Markdown or JSON.
-* ``signet replay <id>`` — first-class shorthand for
+* ``signet replay <id>`` -- first-class shorthand for
   ``signet audit show <id>``. Promoted to first-class in v0.1.6;
   the v0.1.0 deprecation note has been retired since the name
   applies just fine to "replay this audit row to my eyeballs"
   even though true pipeline re-execution remains roadmap.
-* ``signet plugins list`` (v0.1.6+) — discover installed
+* ``signet plugins list`` (v0.1.6+) -- discover installed
   ``signet.checks`` / ``signet.adapters`` / ``signet.anchors``
   entry points and report load status (``loaded``,
   ``incompatible_abi``, ``load_error``).
-* ``signet keys generate-ed25519`` — fresh keypair for asymmetric
+* ``signet keys generate-ed25519`` -- fresh keypair for asymmetric
   receipt signing.
-* ``signet lint`` — static analysis on a pipeline file.
+* ``signet lint`` -- static analysis on a pipeline file.
 
 Built on click. Entry point ``signet`` is registered in
 ``pyproject.toml`` under ``[project.scripts]``.
@@ -64,7 +64,7 @@ logger = logging.getLogger("signet.cli")
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, prog_name="signet")
 def main() -> None:
-    """signet — capability-based safety gates for LLM agents."""
+    """signet -- capability-based safety gates for LLM agents."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s [%(levelname)s] %(message)s",
@@ -145,7 +145,7 @@ def main() -> None:
     envvar="SIGNET_STRICT_ERROR_REDACTION",
     help="Coarsen 4xx refusal bodies so they expose only "
     "{error, correlation_id} (default in production). Full detail "
-    "remains in the audit chain — incident response correlates via the "
+    "remains in the audit chain -- incident response correlates via the "
     "ID. Disable to surface check name + reason in the response body, "
     "useful while integrating. --dev disables automatically.",
 )
@@ -168,7 +168,7 @@ def main() -> None:
     envvar="SIGNET_LOG_FORMAT",
     help="Output format for application logs. 'text' (default) is the "
     "human-readable plain logging format. 'json' emits one JSON object "
-    "per line via structlog — wire to your log aggregator (Loki, "
+    "per line via structlog -- wire to your log aggregator (Loki, "
     "Datadog, ELK, etc.) for searchable structured logs.",
 )
 def serve(
@@ -325,7 +325,7 @@ def keys_generate_ed25519(
     The private key goes to ``--out`` (chmod 0600). The matching public
     key goes to ``<--out>.pub`` by default, or to ``--public-out`` if
     you want them in different locations. The public key is what you
-    share with verifiers — they cannot forge receipts with it.
+    share with verifiers -- they cannot forge receipts with it.
 
     Requires ``pip install signet-sign[ed25519]``.
     """
@@ -361,7 +361,7 @@ def keys_generate_ed25519(
     out_path.write_bytes(priv_pem)
     public_out_path.write_bytes(pub_pem)
 
-    # Best-effort 0600 on POSIX. Windows ACLs differ — operator should
+    # Best-effort 0600 on POSIX. Windows ACLs differ -- operator should
     # configure permissions through their normal IAM tooling.
     import contextlib
     import os
@@ -375,7 +375,7 @@ def keys_generate_ed25519(
     # C9 (v0.1.7): when --key-id is supplied, write a sidecar
     # ``<out>.meta.json`` so the operator does not lose the
     # key-id-to-key binding the moment they close their terminal.
-    # The PEM file itself stays bit-identical to a no-key-id run —
+    # The PEM file itself stays bit-identical to a no-key-id run --
     # the sidecar is purely metadata.
     if key_id:
         from datetime import UTC, datetime
@@ -396,7 +396,7 @@ def keys_generate_ed25519(
     # C4 (v0.1.7): emit Python's safe ``repr()`` of the path so Windows
     # backslashes (``D:\tmp\priv.pem``) are properly escaped. Previously
     # we wrapped the path in double quotes and let click format it,
-    # which produced ``"D:\tmp\priv.pem"`` — pasting that into Python
+    # which produced ``"D:\tmp\priv.pem"`` -- pasting that into Python
     # interprets ``\t`` as a tab and ``\p`` as an invalid escape.
     # ``repr(str(path))`` produces ``'D:\\tmp\\priv.pem'`` (or just
     # ``'/tmp/priv.pem'`` on POSIX), which always parses cleanly.
@@ -450,7 +450,7 @@ def doctor(
     signet_url: str | None,
     probe_injection: bool,
 ) -> None:
-    """Preflight check — is everything wired the way you think?
+    """Preflight check -- is everything wired the way you think?
 
     Always prints versions and dependency status. With ``--upstream``,
     probes the upstream LLM endpoint. With ``--self``, probes a running
@@ -483,7 +483,7 @@ def doctor(
         import fastapi
 
         click.echo(f"fastapi        {fastapi.__version__}")
-    except ImportError:  # pragma: no cover — installed by core deps
+    except ImportError:  # pragma: no cover -- installed by core deps
         click.secho("fastapi        MISSING (broken install)", fg="red")
         failed = True
 
@@ -514,7 +514,7 @@ def doctor(
         except httpx.HTTPError as exc:
             click.secho(f"  /health         unreachable: {exc}", fg="red")
             failed = True
-            # Fall through to the rest of the doctor flow — each
+            # Fall through to the rest of the doctor flow -- each
             # subsequent probe will surface its own failure and the
             # final ``sys.exit(1 if failed else 0)`` reports the
             # overall status. Previously a stray ``return`` here exited
@@ -548,7 +548,7 @@ def doctor(
                 )
             else:
                 click.secho(
-                    f"  no-owner probe  HTTP {no_owner.status_code} — gate is "
+                    f"  no-owner probe  HTTP {no_owner.status_code} -- gate is "
                     "OPEN (no owner enforcement). Add OwnerResolutionCheck "
                     "to your pipeline.",
                     fg="yellow",
@@ -587,10 +587,10 @@ def _run_probe_injection_corpus(signet_url: str) -> bool:
     ``X-Commit-Owner: human:doctor-probe`` header so OwnerResolutionCheck
     doesn't fire first. A successful probe sees one of:
 
-    * HTTP 403 — strict-error-redaction default refusal.
-    * HTTP 202 — escalation path (still a refusal at the response
+    * HTTP 403 -- strict-error-redaction default refusal.
+    * HTTP 202 -- escalation path (still a refusal at the response
       layer).
-    * HTTP 200 with ``X-Signet-Shadow-Decision: block`` — shadow mode
+    * HTTP 200 with ``X-Signet-Shadow-Decision: block`` -- shadow mode
       on the target.
 
     Any 200 without a shadow-block header counts as a leak.
@@ -926,7 +926,7 @@ def audit_tail(log_path: Path, n_lines: int, filter_expr: str | None, as_json: b
     from signet.audit.backend import JsonlBackend, MalformedAuditEntry
 
     # C7 (v0.1.7): validate filter field names up-front. Previously an
-    # unknown field (``foo=bar``) silently filtered out every entry —
+    # unknown field (``foo=bar``) silently filtered out every entry --
     # the operator saw zero output and assumed the chain was empty.
     # Allowed fields are documented in the --filter help text and
     # mirror the comparison branches below.
@@ -1033,7 +1033,7 @@ def audit_show(entry_id: str, audit_log_path: Path) -> None:
 
     Deterministic re-evaluation of ADMISSION-stage checks against an
     archived request requires the original request body to be stored
-    alongside the audit row — that's roadmap, not v0.1. For now this
+    alongside the audit row -- that's roadmap, not v0.1. For now this
     command reads the matching entry, pretty-prints it, and exits 0.
     Useful for incident response (`why did we block this entry?`) and
     for confirming receipts.
@@ -1358,11 +1358,11 @@ def _parse_duration(spec: str) -> Any:
 
     Accepted formats:
 
-    * ``<int>m`` — N minutes
-    * ``<int>h`` — N hours
-    * ``<int>d`` — N days
-    * ``<int>w`` — N weeks
-    * ISO 8601 duration with a ``P`` prefix — ``P1D``, ``P1W``,
+    * ``<int>m`` -- N minutes
+    * ``<int>h`` -- N hours
+    * ``<int>d`` -- N days
+    * ``<int>w`` -- N weeks
+    * ISO 8601 duration with a ``P`` prefix -- ``P1D``, ``P1W``,
       ``PT1H30M``, ``PT90M``, etc. Years and months are rejected
       because their length depends on the calendar position.
 
@@ -1383,7 +1383,7 @@ def _parse_duration(spec: str) -> Any:
             "'24h', '7d', '1w', or an ISO 8601 duration like 'PT1H30M'."
         )
 
-    # Suffix forms first — the original v0.1.6 surface plus minutes
+    # Suffix forms first -- the original v0.1.6 surface plus minutes
     # and weeks. Reject negatives and overflow before they reach
     # timedelta() (which would raise OverflowError on huge values).
     suffix_match = re.fullmatch(
@@ -1405,7 +1405,7 @@ def _parse_duration(spec: str) -> Any:
                 f"--since {spec!r} overflows timedelta: {exc}"
             ) from exc
 
-    # ISO 8601 duration — accept ``PnW`` or ``PnDTnHnMnS`` shapes.
+    # ISO 8601 duration -- accept ``PnW`` or ``PnDTnHnMnS`` shapes.
     # Years/months are intentionally rejected because their length is
     # ambiguous (a "1 month" report window is meaningless without a
     # calendar anchor). isodate is a third-party dep; rather than
@@ -1438,7 +1438,7 @@ def _parse_duration(spec: str) -> Any:
     raise click.ClickException(
         f"--since {spec!r} is not a valid duration; expected forms: "
         "30m, 1h, 24h, 7d, 1w, or an ISO 8601 duration like PT1H30M, "
-        "P1D, P1W. Years/months (P1Y, P1M) are rejected — use weeks "
+        "P1D, P1W. Years/months (P1Y, P1M) are rejected -- use weeks "
         "or days for an unambiguous window."
     )
 
@@ -1453,7 +1453,7 @@ def _aggregate_audit_window(
 
     Memory note: this loads the entries that fall in the window into
     memory before aggregating. For chains with very large 24h windows
-    that's the cap on this command's footprint — see the report-back
+    that's the cap on this command's footprint -- see the report-back
     note about scalability.
     """
     from collections import Counter
@@ -1519,10 +1519,10 @@ def _compute_deltas(
 
     Two notable signals:
 
-    * ``check_pct_delta`` — for every name in the current top-10, what
+    * ``check_pct_delta`` -- for every name in the current top-10, what
       was its count in the prior window? Render ``inf`` when the prior
       count was zero (genuinely new firing).
-    * ``new_blocked_owners`` — owners in the current top-10 not present
+    * ``new_blocked_owners`` -- owners in the current top-10 not present
       in the prior top-10. ``len(...)`` is the headline number; the
       list of names is the supporting detail.
     """
@@ -1713,7 +1713,7 @@ def lint(config_path: Path, strict: bool) -> None:
 
     \b
     SECURITY NOTE: ``signet lint`` imports the pipeline file the same
-    way ``signet serve --config`` does — arbitrary Python execution.
+    way ``signet serve --config`` does -- arbitrary Python execution.
     Run only against files you control.
     """
     findings = _lint_pipeline(config_path)
@@ -1867,17 +1867,17 @@ def plugins_doctor(as_json: bool) -> None:
     classes of failure that ``plugins list`` would otherwise show
     only via color in the terminal:
 
-    * **Duplicate (group, name) pairs** — two plugin packages
+    * **Duplicate (group, name) pairs** -- two plugin packages
       registering the same entry-point name within one group. The
       resolver picks one and silently shadows the other; in CI you
       want the build to fail.
-    * **Plugins with non-loaded status** — ``incompatible_abi`` (the
+    * **Plugins with non-loaded status** -- ``incompatible_abi`` (the
       plugin declares a CHECK_ABI_VERSION signet does not accept) and
       ``load_error`` (import or type-validation failure during
       :meth:`EntryPoint.load`).
 
     Exit code is 0 when both classes are empty, 1 otherwise. Intended
-    to be the CI gate for plugin-heavy deployments — pair with
+    to be the CI gate for plugin-heavy deployments -- pair with
     ``signet lint --strict`` and ``signet doctor --probe-injection``.
     """
     from signet.plugins import discover_plugins
@@ -1885,8 +1885,8 @@ def plugins_doctor(as_json: bool) -> None:
     plugins_found = discover_plugins(refresh=True)
 
     # Detect duplicate (group, name) pairs. ``discover_plugins`` does
-    # not deduplicate — both entries surface as separate
-    # ``DiscoveredPlugin`` rows — so we can group them here.
+    # not deduplicate -- both entries surface as separate
+    # ``DiscoveredPlugin`` rows -- so we can group them here.
     seen: dict[tuple[str, str], list[Any]] = {}
     for p in plugins_found:
         seen.setdefault((p.group, p.name), []).append(p)
@@ -2116,7 +2116,7 @@ def _replay_pretty_print(
         try:
             payload = _serialize_for_signing(found)
             recomputed = _hmac.new(secret, payload, hashlib.sha256).hexdigest()
-        except Exception as exc:  # pragma: no cover — payload integrity issue
+        except Exception as exc:  # pragma: no cover -- payload integrity issue
             hmac_suffix = f"  (verification error: {type(exc).__name__})"
         else:
             if _hmac.compare_digest(recomputed, hmac_full):
@@ -2124,7 +2124,7 @@ def _replay_pretty_print(
             else:
                 hmac_suffix = f"  (FAILED verification against ring {entry_key_id})"
     else:
-        hmac_suffix = "  (unverified — pass --hmac-secret/SIGNET_HMAC_SECRET to check)"
+        hmac_suffix = "  (unverified -- pass --hmac-secret/SIGNET_HMAC_SECRET to check)"
 
     # Render aligned label: value rows. Width chosen to line up the
     # documented fields.
@@ -2144,7 +2144,7 @@ def _replay_pretty_print(
         click.echo(f"{(label + ':').ljust(label_width)}    {value}")
 
     # Metadata block. Skip the chain-internal fields (key id, anchor
-    # receipt) by default — they're load-bearing for the chain but
+    # receipt) by default -- they're load-bearing for the chain but
     # noisy for an operator paging through one row. Show them under a
     # collapsed "_chain" line so power users still see they exist.
     visible_meta: dict[str, Any] = {}
@@ -2200,7 +2200,7 @@ def init(target_dir: Path) -> None:
     one" workflow) can re-run ``signet init`` and get exactly that
     file back without losing edits to ``client_example.py`` or
     ``.env.example``. If every file is already present, the command
-    refuses with exit code 1 — this preserves the original "do not
+    refuses with exit code 1 -- this preserves the original "do not
     overwrite an existing project" guard.
 
     Post-init checklist:
@@ -2227,7 +2227,7 @@ def init(target_dir: Path) -> None:
     ]
 
     # If every scaffolded file already exists, the operator is calling
-    # init on an already-initialized directory — refuse so we don't
+    # init on an already-initialized directory -- refuse so we don't
     # silently no-op. Mirrors the v0.1.6 contract that an existing
     # ``pipeline.py`` is load-bearing.
     if all(path.exists() for path, _ in files):
@@ -2328,7 +2328,7 @@ class _LintFinding:
 def _lint_pipeline(config_path: Path) -> list[_LintFinding]:
     """Static-ish analysis on a configured pipeline.
 
-    Imports the file (arbitrary code execution — caller already warned)
+    Imports the file (arbitrary code execution -- caller already warned)
     and walks the loaded ``pipeline._checks`` list. Returns a list of
     findings in declaration order.
     """
@@ -2370,7 +2370,7 @@ def _lint_pipeline(config_path: Path) -> list[_LintFinding]:
             )
         )
 
-    # Rule 1 (SIG001 — v0.1.6 repurpose, v0.1.7 docstring fix):
+    # Rule 1 (SIG001 -- v0.1.6 repurpose, v0.1.7 docstring fix):
     # The original v0.1.4 SIG001 fired on declared-position misordering of
     # RateLimitCheck before content checks. v0.1.5 made that moot: the
     # check's class-level ``priority=100`` self-orders it last within
@@ -2382,8 +2382,8 @@ def _lint_pipeline(config_path: Path) -> list[_LintFinding]:
     #
     # IMPORTANT: ``RateLimitCheck.__init__`` does NOT accept a
     # ``priority=`` keyword argument. v0.1.6 of this file's docstring
-    # incorrectly suggested it did. The lint logic itself is correct —
-    # it inspects the class-level attribute exposed via ``c.priority`` —
+    # incorrectly suggested it did. The lint logic itself is correct --
+    # it inspects the class-level attribute exposed via ``c.priority`` --
     # but the only way for operators to make it fire is to subclass and
     # override the class attr. Treat the rule as catching subclass
     # overrides, not constructor arguments.
@@ -2396,7 +2396,7 @@ def _lint_pipeline(config_path: Path) -> list[_LintFinding]:
         if not isinstance(c, RateLimitCheck):
             continue
         # The class default is 100. ``c.priority`` may be a class attr
-        # (subclass override — the documented trigger) or an instance
+        # (subclass override -- the documented trigger) or an instance
         # attr (rare, but possible if an operator monkey-patches one).
         # Compare to 100 directly.
         rl_priority = getattr(c, "priority", 100)
@@ -2519,7 +2519,7 @@ def _read_env_var(path: Path, key: str) -> str | None:
 
     Strips matching surrounding quotes and inline ``#`` comments.
     Skips comment lines and lines without ``=``. Does not handle the
-    full python-dotenv grammar (no escapes, no multi-line) — those are
+    full python-dotenv grammar (no escapes, no multi-line) -- those are
     not what ``signet init`` writes.
     """
     try:
@@ -2551,7 +2551,7 @@ def _read_env_var(path: Path, key: str) -> str | None:
 def _parse_hex_secret(value: str, source: str) -> bytes:
     """Decode a hex-encoded HMAC secret with a clear error on failure.
 
-    Strips the optional ``0x`` prefix and any surrounding whitespace —
+    Strips the optional ``0x`` prefix and any surrounding whitespace --
     real users paste from terminals and copy-managers that add either.
     Re-raises with the source name (env var or flag) so the operator
     knows where to fix the input.
@@ -2592,7 +2592,7 @@ def _load_pipeline_from_path(path: Path) -> Pipeline:
     # C5 (v0.1.7): Wrap the exec so the operator sees a one-line
     # ClickException instead of a Python traceback when ``signet lint``
     # / ``signet serve --config`` is pointed at a file with a syntax or
-    # import error. The traceback is the wrong UX for a CLI surface —
+    # import error. The traceback is the wrong UX for a CLI surface --
     # they want to know which file and which line, not the Python call
     # stack. The broad catch is intentional: arbitrary user code may
     # raise anything at import time (NameError, AttributeError, ...).
@@ -2607,7 +2607,7 @@ def _load_pipeline_from_path(path: Path) -> Pipeline:
             f"failed to import {path}: {exc}"
         ) from exc
     except click.ClickException:
-        # Don't double-wrap — _load_pipeline_from_path may be called
+        # Don't double-wrap -- _load_pipeline_from_path may be called
         # transitively. Pass through.
         raise
     except Exception as exc:
@@ -2695,7 +2695,7 @@ SIGNET_PORT=8443
 
 # Generated alongside the scaffold so first-time users do not commit
 # their HMAC secret or audit-log contents on first push.
-_GITIGNORE_TEMPLATE = """# signet — keep secrets and audit logs out of version control.
+_GITIGNORE_TEMPLATE = """# signet -- keep secrets and audit logs out of version control.
 .env
 .env.*
 !.env.example
@@ -2706,11 +2706,11 @@ __pycache__/
 
 # Minimal-but-real client snippet so users do not have to read the
 # README to find out how to call signet from Python.
-_CLIENT_EXAMPLE_TEMPLATE = '''"""client_example.py — call signet from Python.
+_CLIENT_EXAMPLE_TEMPLATE = '''"""client_example.py -- call signet from Python.
 
 Two ways shown:
-1. Plain httpx — works with no extras installed.
-2. wrap_openai — drop-in replacement for the openai SDK that points
+1. Plain httpx -- works with no extras installed.
+2. wrap_openai -- drop-in replacement for the openai SDK that points
    at signet and injects the X-Commit-Owner header on every request.
    Requires the `openai` extra: `pip install signet-sign[openai]`.
 
@@ -2727,7 +2727,7 @@ SIGNET_URL = "http://localhost:8443/v1"
 
 
 def call_with_httpx() -> None:
-    """Plain HTTP — no SDK needed."""
+    """Plain HTTP -- no SDK needed."""
     resp = httpx.post(
         f"{SIGNET_URL}/chat/completions",
         headers={

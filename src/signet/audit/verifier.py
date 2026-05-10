@@ -1,4 +1,4 @@
-"""ChainVerifier — walks an audit chain and reports tampering.
+"""ChainVerifier -- walks an audit chain and reports tampering.
 
 Verification is read-only and offline: given a backend and a key ring,
 walk every entry in order, recompute its HMAC, check the recomputed value
@@ -8,23 +8,23 @@ the previous entry's ``hmac``. Any mismatch is a *break*.
 Returns a :class:`VerificationReport` with structured per-break detail.
 The report distinguishes:
 
-* **Self-mismatch** — the entry's own payload was modified (its HMAC
+* **Self-mismatch** -- the entry's own payload was modified (its HMAC
   doesn't match its content).
-* **Link-mismatch** — the entry's ``prev_hmac`` doesn't match the
+* **Link-mismatch** -- the entry's ``prev_hmac`` doesn't match the
   previous entry's ``hmac``. Indicates insertion, deletion, or
   reordering.
-* **Unknown-key** — the entry's signing key ID is not in the ring; we
+* **Unknown-key** -- the entry's signing key ID is not in the ring; we
   can't verify it. Distinct from a tamper finding: usually means the
   ring is missing a legacy key.
-* **Missing-key-id** — the entry has no signing-key-id metadata field.
+* **Missing-key-id** -- the entry has no signing-key-id metadata field.
   Either pre-dates the chain feature or was tampered to drop the marker.
-* **Merkle-mismatch** — a compaction marker's claimed Merkle root does
+* **Merkle-mismatch** -- a compaction marker's claimed Merkle root does
   not match the recomputed root over the linked archive's contents.
   Surfaced by :func:`verify_with_archives` only.
-* **Archive-missing** — a compaction marker references an archive file
+* **Archive-missing** -- a compaction marker references an archive file
   that is not present in the supplied ``archive_dir``. Surfaced by
   :func:`verify_with_archives` only.
-* **Archive-format-invalid** — an archive file exists but cannot be
+* **Archive-format-invalid** -- an archive file exists but cannot be
   parsed (truncated, wrong magic, version mismatch, internal-root
   mismatch). Surfaced by :func:`verify_with_archives` only.
 
@@ -78,13 +78,13 @@ class BreakKind(StrEnum):
     the operator pointed the verifier at the wrong directory."""
 
     ARCHIVE_FORMAT_INVALID = "archive_format_invalid"
-    """An archive file is present but malformed — bad magic prefix,
+    """An archive file is present but malformed -- bad magic prefix,
     unknown format version, or truncated payload. Treat as a tamper
     finding; archives are written deterministically so a corrupt one
     means human or hardware interference."""
 
     MALFORMED_LINE = "malformed_line"
-    """A line in the live log is not parseable JSON — mid-write
+    """A line in the live log is not parseable JSON -- mid-write
     truncation (process killed during ``fsync``), accidental editor
     save, or hostile injection of a non-JSON line. Reported with the
     1-based line number and the underlying parse error so the operator
@@ -127,7 +127,7 @@ class VerificationReport:
         breaks: Per-entry integrity failures, in chain order.
         last_known_good_index: Index of the last entry that verified
             cleanly. ``-1`` is a **sentinel** meaning "no entry
-            verified cleanly" — most commonly seen when the chain was
+            verified cleanly" -- most commonly seen when the chain was
             verified under the wrong HMAC secret (every entry then
             self-mismatches and there is no last-good index to point
             at). Do NOT interpret as an offset into the chain (A14).
@@ -190,8 +190,8 @@ class ChainVerifier:
         The returned :class:`VerificationReport` carries
         ``signet_version`` and ``verified_at`` (A13) for long-term
         forensics. ``last_known_good_index = -1`` is a SENTINEL
-        meaning "no entry verified cleanly" — typically the wrong
-        HMAC secret was supplied — and is not a valid chain offset
+        meaning "no entry verified cleanly" -- typically the wrong
+        HMAC secret was supplied -- and is not a valid chain offset
         (A14).
         """
         breaks: list[ChainBreak] = []
@@ -229,7 +229,7 @@ class ChainVerifier:
             for index, entry in enumerate(self._backend.iter_entries()):
                 total_entries = index + 1
                 # A6: track whether THIS entry already produced a
-                # link_mismatch — when it has, the self_mismatch on
+                # link_mismatch -- when it has, the self_mismatch on
                 # the same index is suppressed because both checks
                 # share an input (``prev_hmac`` is part of the signed
                 # payload), so a single-byte tamper naturally trips
@@ -314,7 +314,7 @@ class ChainVerifier:
         except MalformedAuditEntry as exc:
             # A3: turn a malformed JSONL line into a structured break
             # rather than letting JSONDecodeError propagate. Iteration
-            # stops at the bad line — the rest of the file is opaque
+            # stops at the bad line -- the rest of the file is opaque
             # until the operator repairs the line. Subsequent entries
             # are not reported.
             breaks.append(
@@ -351,11 +351,11 @@ def _verify_entry_self(
 
     Returns True if the entry's signing key was found and the HMAC
     matched, False otherwise. The link check is the caller's
-    responsibility — link semantics differ between the simple
+    responsibility -- link semantics differ between the simple
     walker and the archive-aware walker.
 
     ``suppress_self_mismatch`` (A6): when True, an HMAC mismatch is
-    NOT reported as a separate ``SELF_MISMATCH`` break — the caller
+    NOT reported as a separate ``SELF_MISMATCH`` break -- the caller
     has already reported a ``LINK_MISMATCH`` for this entry and the
     two checks share an input (``prev_hmac`` is part of the signed
     payload), so a single byte of tampering naturally trips both.
@@ -485,7 +485,7 @@ def verify_with_archives(
     expected_prev = ""
     # Logical index across the whole chain (live + archives).
     logical_index = 0
-    # A11 cascade tracking — same shape as the live-only verifier.
+    # A11 cascade tracking -- same shape as the live-only verifier.
     cascade_active = False
     cascade_count = 0
     cascade_first_idx = -1
@@ -555,7 +555,7 @@ def verify_with_archives(
                 else:
                     _flush_cascade()
                     # Any clean link clears a pending archive-suppress
-                    # flag — we recovered without needing it.
+                    # flag -- we recovered without needing it.
                     suppress_one_link_mismatch_after_archive = False
                 ok = _verify_entry_self(
                     index=logical_index,
@@ -644,7 +644,7 @@ def verify_with_archives(
                 expected_prev = entry.hmac
                 # A10: archive was unreadable; the bridge hmac is lost.
                 # Suppress the synthetic LINK_MISMATCH on the next live
-                # entry — one corruption, one break.
+                # entry -- one corruption, one break.
                 suppress_one_link_mismatch_after_archive = True
                 continue
 
@@ -698,7 +698,7 @@ def verify_with_archives(
             # Recompute the Merkle root from the archive's contents and
             # compare against the marker's claim. A mismatch can come from
             # (a) the marker being modified, (b) the archive being modified,
-            # or (c) the archive's serialized tree being modified — the
+            # or (c) the archive's serialized tree being modified -- the
             # deserialize step asserts the stored root matches the
             # recomputation, so (c) is already an ARCHIVE_FORMAT_INVALID.
             recomputed_tree = MerkleTree.from_entries(archived_entries)
@@ -767,7 +767,7 @@ def verify_with_archives(
             # Bridge from archive back to live log: the next live entry's
             # prev_hmac must equal the LAST ARCHIVED entry's hmac, NOT the
             # marker's hmac. (Both the marker and the next live entry
-            # share the same predecessor — that's the documented fork.)
+            # share the same predecessor -- that's the documented fork.)
             expected_prev = last_archived_hmac
             total_entries += len(archived_entries) + 1  # +1 for the marker
             logical_index = marker_logical_index + 1

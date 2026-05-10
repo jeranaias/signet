@@ -1,16 +1,16 @@
-"""SignetApp — the FastAPI application that ties everything together.
+"""SignetApp -- the FastAPI application that ties everything together.
 
 The proxy serves these endpoints:
 
-* ``GET /health`` (alias ``/healthz``) — liveness probe with operational
+* ``GET /health`` (alias ``/healthz``) -- liveness probe with operational
   metadata: signet version, uptime, audit-chain head HMAC tail,
   configured pipeline check count.
-* ``GET /readyz`` — readiness probe; HEADs the configured upstream with
+* ``GET /readyz`` -- readiness probe; HEADs the configured upstream with
   a 1-second timeout. 503 when upstream is unreachable so k8s sheds
   traffic. Distinct from ``/health`` so liveness restarts don't fire on
   an upstream blip.
-* ``GET /version`` — build identifier.
-* ``POST /v1/chat/completions`` — the protected forwarding endpoint.
+* ``GET /version`` -- build identifier.
+* ``POST /v1/chat/completions`` -- the protected forwarding endpoint.
 
 The chat-completions handler runs the configured pipeline at the
 appropriate hook timings:
@@ -62,7 +62,7 @@ logger = logging.getLogger("signet.server")
 #: Abort-frame ``reason`` tokens that name a network/transport failure
 #: rather than a policy decision. These survive strict-error-redaction
 #: coarsening because they describe a wire state the SDK needs to react
-#: to — retrying a ``refused`` request is wrong, retrying an
+#: to -- retrying a ``refused`` request is wrong, retrying an
 #: ``upstream_protocol_violation`` may be right. The set is closed:
 #: anything not listed here is treated as policy-revealing and coarsened
 #: to ``"refused"`` under strict mode.
@@ -149,8 +149,8 @@ class SignetApp:
         deployments incur zero CORS overhead.
 
         Spec sanity check: ``cors_allow_credentials=True`` combined
-        with a wildcard origin (``"*"``) violates the CORS spec — the
-        browser will refuse the response — so log a warning at startup
+        with a wildcard origin (``"*"``) violates the CORS spec -- the
+        browser will refuse the response -- so log a warning at startup
         rather than silently shipping a misconfigured gate. Operators
         should specify exact origins when credentials are required.
         """
@@ -323,13 +323,13 @@ class SignetApp:
             # states so monitors can disambiguate operator intent from
             # transient runtime state:
             #
-            # * ``"disabled"`` — no chain configured (``audit_log_path``
+            # * ``"disabled"`` -- no chain configured (``audit_log_path``
             #   was not set). Operator chose to run without an audit
             #   chain; not an alert condition.
-            # * ``None`` — chain is configured but currently empty. May
+            # * ``None`` -- chain is configured but currently empty. May
             #   be a startup race (no requests yet) or a failed write;
             #   monitors can flag prolonged ``None`` as suspect.
-            # * ``"<8-hex-tail>"`` — chain has at least one entry. Tail
+            # * ``"<8-hex-tail>"`` -- chain has at least one entry. Tail
             #   advances as the chain grows; a stalled tail under load
             #   means the chain stopped writing.
             if self._chain is None:
@@ -445,7 +445,7 @@ class SignetApp:
             # explicit stub handler that accepts the WebSocket and
             # immediately closes with code 1011 + a human-readable
             # reason. Without this, connecting clients see a generic
-            # ``WebSocketDisconnect`` with empty message — they cannot
+            # ``WebSocketDisconnect`` with empty message -- they cannot
             # distinguish "endpoint disabled in config" from "endpoint
             # not registered" or "transient network error". The 1011
             # close-code is RFC 6455 internal-error: a stable signal
@@ -490,7 +490,7 @@ class SignetApp:
                     "note": (
                         f"signet v{__version__} gates /v1/chat/completions, "
                         "/v1/completions, and /v1/embeddings. /v1/audio/* "
-                        "and /v1/images/* are roadmapped — their non-JSON "
+                        "and /v1/images/* are roadmapped -- their non-JSON "
                         "request shapes need their own check protocols "
                         "and aren't a copy-paste addition."
                     ),
@@ -700,7 +700,7 @@ class SignetApp:
         WebSocket logic does not bloat this module. The handler
         receives a back-reference to ``self`` so it can reuse the
         shared helpers (``_record_decision``, ``_stash_shadow_headers``,
-        ``_record_exception``, the pipeline, the keyring) — no
+        ``_record_exception``, the pipeline, the keyring) -- no
         parallel implementation, single source of truth on audit row
         shape and shadow handling.
         """
@@ -711,14 +711,14 @@ class SignetApp:
         await handler.run()
 
     async def _handle_embeddings(self, request: Request) -> Response:
-        """Embeddings endpoint — non-streaming, no INSPECTION text content.
+        """Embeddings endpoint -- non-streaming, no INSPECTION text content.
 
         ADMISSION runs (owner, classification, rate limit, regex on
         input strings) and RECORD runs (token-budget reconciliation
         from upstream usage). INSPECTION-stage checks that scan
-        accumulated output text are skipped — embeddings have no text
+        accumulated output text are skipped -- embeddings have no text
         output to scan. Tool-call-inspector (COMMITMENT) is also
-        skipped — embeddings don't emit tool calls.
+        skipped -- embeddings don't emit tool calls.
         """
         self.metrics.inc("signet_requests_total", {"path": "/v1/embeddings"})
         admitted = await self._admit(request, path="/v1/embeddings")
@@ -744,7 +744,7 @@ class SignetApp:
     async def _read_capped_body(self, request: Request) -> bytes:
         """Stream the request body, refusing once it exceeds the cap.
 
-        Trusting the ``Content-Length`` header is not sufficient — a
+        Trusting the ``Content-Length`` header is not sufficient -- a
         chunked-transfer client can send unbounded data without a length.
         We accumulate and check after each chunk.
         """
@@ -772,7 +772,7 @@ class SignetApp:
         Multimodal handling: when the last user message uses the
         OpenAI vision shape (``content`` is a list of ``{"type": ...}``
         parts), only the **text** parts are replaced. Image and audio
-        parts pass through untouched — dropping them would silently
+        parts pass through untouched -- dropping them would silently
         change request semantics far beyond what a redact decision
         promises.
         """
@@ -797,7 +797,7 @@ class SignetApp:
                         if not replaced_any:
                             new_parts.append({"type": "text", "text": replacement})
                             replaced_any = True
-                        # Subsequent text parts are dropped — the single
+                        # Subsequent text parts are dropped -- the single
                         # replacement covers all redacted text.
                     else:
                         new_parts.append(part)
@@ -807,7 +807,7 @@ class SignetApp:
                     new_parts.insert(0, {"type": "text", "text": replacement})
                 new_msg["content"] = new_parts
             else:
-                # Unknown content shape — replace wholesale rather than
+                # Unknown content shape -- replace wholesale rather than
                 # leave the offending pattern in place.
                 new_msg["content"] = replacement
             messages[i] = new_msg
@@ -940,7 +940,7 @@ class SignetApp:
                     # so the SDK sees a parseable terminal frame rather
                     # than an opaque error body or a hung stream. We
                     # deliberately don't try to forward the upstream's
-                    # error body — different upstreams shape errors
+                    # error body -- different upstreams shape errors
                     # differently and a half-mixed stream is harder for
                     # SDKs to handle than a clean signet-abort.
                     if upstream.status_code >= 400:
@@ -970,7 +970,7 @@ class SignetApp:
                     # an absent or empty content-type is treated as
                     # "trust the upstream" (the historical behavior).
                     # Hostile bytes still get inspected line-by-line
-                    # downstream — the strict block here only fires
+                    # downstream -- the strict block here only fires
                     # when the upstream explicitly declared a
                     # non-SSE / non-text content type.
                     upstream_headers = getattr(upstream, "headers", None) or {}
@@ -978,7 +978,7 @@ class SignetApp:
                         upstream_content_type = upstream_headers.get(
                             "content-type", ""
                         )
-                    except AttributeError:  # pragma: no cover — defensive
+                    except AttributeError:  # pragma: no cover -- defensive
                         upstream_content_type = ""
                     upstream_content_type = (upstream_content_type or "").lower()
                     if upstream_content_type and not upstream_content_type.startswith(
@@ -1140,7 +1140,7 @@ class SignetApp:
                 # 1. The caller disconnected mid-stream and the
                 #    StreamingResponse cancelled the generator.
                 # 2. The upstream raised after we already started
-                #    yielding (the outer 502 path is too late —
+                #    yielding (the outer 502 path is too late --
                 #    bytes were already on the wire).
                 # 3. The upstream returned a 5xx or shipped malformed
                 #    SSE; we already emitted a structured abort frame
@@ -1149,13 +1149,13 @@ class SignetApp:
                 # In all cases we still want exactly one terminal row
                 # in the chain so audit consumers can see the request
                 # ended and how. inspection_aborted/upstream_aborted
-                # already wrote their own rows — don't double-count.
+                # already wrote their own rows -- don't double-count.
                 # Avoid `return` in finally (would swallow in-flight
                 # exceptions); guard the body instead.
                 if not inspection_aborted and not upstream_aborted:
                     if not completed_normally:
                         rctx.finish_reason = rctx.finish_reason or "client_disconnect"
-                    # Run RECORD checks even on disconnect — they may flag
+                    # Run RECORD checks even on disconnect -- they may flag
                     # cumulative drift, partial-output PII, etc.
                     try:
                         record_results = await self.pipeline.post_complete(rctx)
@@ -1233,7 +1233,7 @@ class SignetApp:
         Strict-redaction rule: when
         ``self.config.strict_error_redaction`` is on, ``reason`` is
         coarsened to the literal string ``"refused"`` and the ``check``
-        field is omitted entirely — same coarsening
+        field is omitted entirely -- same coarsening
         :meth:`_refusal` applies to 4xx response bodies. Operators
         recover the full detail from the audit row via
         ``correlation_id``. ``correlation_id`` and ``stage`` always
@@ -1245,7 +1245,7 @@ class SignetApp:
         :data:`_TRANSPORT_ABORT_REASONS` (e.g.
         ``upstream_protocol_violation``, ``upstream_exception``) name
         a wire-state condition the SDK needs to differentiate from a
-        policy refusal — retrying a ``refused`` is wrong, retrying an
+        policy refusal -- retrying a ``refused`` is wrong, retrying an
         upstream blip may be right. These survive strict coarsening so
         callers can branch on the reason without parsing the audit
         chain. The ``check`` field is still omitted under strict to
@@ -1356,7 +1356,7 @@ class SignetApp:
         for frame in self._build_abort_frames(
             reason=reason_token,
             stage="inspection",
-            # No firing check — the upstream itself failed. Strict
+            # No firing check -- the upstream itself failed. Strict
             # mode would omit this anyway; verbose-mode SDKs see
             # check absent rather than misleading.
             check_name=None,
@@ -1399,11 +1399,11 @@ class SignetApp:
 
         * **Strict (default)**: ``{"error": "refused",
           "correlation_id": "<entry_id>"}``. The check name, reason,
-          stage, and rule are intentionally absent — full detail lives
+          stage, and rule are intentionally absent -- full detail lives
           in the audit chain. Incident response uses the correlation
           ID to look up the row.
         * **Verbose** (``--no-strict-error-redaction`` / ``--dev``):
-          full detail, the historical v0.1.4 shape — useful when
+          full detail, the historical v0.1.4 shape -- useful when
           integrating with signet for the first time.
         """
         status = 403
@@ -1415,7 +1415,7 @@ class SignetApp:
                 "error": "refused",
                 "correlation_id": entry.entry_id if entry is not None else None,
             }
-            # Retry-After is operational, not security-relevant — keep
+            # Retry-After is operational, not security-relevant -- keep
             # it in the strict body so well-behaved clients can back off.
             if "retry_after_seconds" in result.metadata:
                 body["retry_after_seconds"] = result.metadata["retry_after_seconds"]
@@ -1485,18 +1485,18 @@ class SignetApp:
 
         Headers emitted:
 
-        * ``X-Signet-Shadow-Decision`` — block / escalate / redact.
-        * ``X-Signet-Shadow-Reason`` — coarsened to ``"refused"`` when
+        * ``X-Signet-Shadow-Decision`` -- block / escalate / redact.
+        * ``X-Signet-Shadow-Reason`` -- coarsened to ``"refused"`` when
           ``strict_error_redaction`` is on (matches the redaction rule
           that ``_refusal``/``_escalation`` apply to body content); the
           full reason otherwise.
-        * ``X-Signet-Shadow-Stage`` — admission / inspection /
+        * ``X-Signet-Shadow-Stage`` -- admission / inspection /
           commitment / record (read from the result metadata).
-        * ``X-Signet-Shadow-Check`` — the firing check name
+        * ``X-Signet-Shadow-Check`` -- the firing check name
           (``_check_name`` from the result metadata, omitted in strict
           mode for the same reason ``_refusal`` redacts it from the
           body).
-        * ``X-Signet-Correlation-Id`` — the audit entry ID. Operators
+        * ``X-Signet-Correlation-Id`` -- the audit entry ID. Operators
           pivot from response → audit row via this ID.
         """
         headers: dict[str, str] = ctx.scratch.setdefault("_shadow_headers", {})
@@ -1525,7 +1525,7 @@ class SignetApp:
         """Persist one audit row.
 
         Maps the four CheckResult outcomes to the four Decision values
-        one-to-one — earlier versions collapsed REDACT/ESCALATE into
+        one-to-one -- earlier versions collapsed REDACT/ESCALATE into
         BLOCK, which lost information needed for incident review.
 
         Shadow mode: when ``self.config.shadow`` is True and
@@ -1535,7 +1535,7 @@ class SignetApp:
         with the same {check, stage, decision} label set as
         ``signet_pipeline_decisions_total`` so dashboards can join the
         two. The decision recorded in the chain remains the original
-        (block / escalate / redact) — shadow only changes what the
+        (block / escalate / redact) -- shadow only changes what the
         response layer does, never what the chain says.
         """
         decision = _result_to_decision(result)
@@ -1550,7 +1550,7 @@ class SignetApp:
         if result is not None:
             try:
                 stage_label = str(result.metadata.get("_stage", ""))
-            except AttributeError:  # pragma: no cover — defensive
+            except AttributeError:  # pragma: no cover -- defensive
                 stage_label = ""
         self.metrics.inc(
             "signet_pipeline_decisions_total",
@@ -1569,7 +1569,7 @@ class SignetApp:
             stage = ""
             try:
                 stage = str(result.metadata.get("_stage", ""))
-            except AttributeError:  # pragma: no cover — defensive
+            except AttributeError:  # pragma: no cover -- defensive
                 stage = ""
             self.metrics.inc(
                 "signet_shadow_would_have_blocked_total",
@@ -1699,7 +1699,7 @@ def _extract_sse_content(chunk_text: str, *, inspect_all_lines: bool = False) ->
 
     S6 hardening: when ``inspect_all_lines`` is True, payloads carried
     on ``event:``, ``id:``, ``retry:``, or ``:`` (comment) lines are
-    appended to the returned text verbatim. The default is False —
+    appended to the returned text verbatim. The default is False --
     flipping it on closes the side-channel where a hostile upstream
     could ship classified text via ``event: foo\\ndata: bar\\n\\n``
     and have INSPECTION only see ``bar``. Trade-off: legitimate event

@@ -18,21 +18,21 @@ gated request.
 
 Mapping signet's check stages onto a WebSocket session:
 
-* **ADMISSION** — runs once, at connect time, against the WebSocket
+* **ADMISSION** -- runs once, at connect time, against the WebSocket
   handshake headers. Same logic as HTTP: owner resolution,
   classification declaration, rate limit, etc. A non-allow result
   closes the WebSocket with code 1008 (POLICY_VIOLATION).
-* **INSPECTION** — runs per text-chunk, same as HTTP streaming.
+* **INSPECTION** -- runs per text-chunk, same as HTTP streaming.
   Audio frames pass through with an audit row that records
   ``audio_inspection_skipped=True``; no transcription is performed
   in 0.1.6.
-* **COMMITMENT** — runs on every function-call event the upstream
+* **COMMITMENT** -- runs on every function-call event the upstream
   emits. A BLOCK or ESCALATE result is NOT forwarded to the client;
   instead a synthetic refusal-status event is sent to the client and
   a synthetic cancellation event is sent to the upstream. This is the
-  highest-risk surface — a voice agent calling ``send_email`` is the
+  highest-risk surface -- a voice agent calling ``send_email`` is the
   same gating problem as a chat agent doing it.
-* **RECORD** — at session-end. Writes a cumulative-metrics row.
+* **RECORD** -- at session-end. Writes a cumulative-metrics row.
   Periodic flush rows are written every 30 seconds while connected so
   a crashed proxy does not lose hours of audit data.
 
@@ -111,14 +111,14 @@ FLUSH_INTERVAL_SECONDS = 30.0
 
 # OpenAI realtime API event-type constants. Kept as a small, explicit
 # allowlist of the events signet treats specially; everything else
-# passes through. The realtime API is still evolving — these names are
+# passes through. The realtime API is still evolving -- these names are
 # the v1 (October 2024) shape; future versions will add or rename events.
 EVENT_FUNCTION_CALL_DONE = "response.function_call_arguments.done"
 """Upstream emits this when the model has finished assembling a tool
 call's arguments. This is signet's COMMITMENT trigger."""
 
 EVENT_AUDIO_DELTA = "response.audio.delta"
-"""Upstream audio frame. Pass through with audit row only — no
+"""Upstream audio frame. Pass through with audit row only -- no
 inspection in 0.1.6."""
 
 EVENT_AUDIO_INPUT = "input_audio_buffer.append"
@@ -129,7 +129,7 @@ EVENT_TEXT_DELTA = "response.text.delta"
 
 EVENT_AUDIO_TRANSCRIPT_DELTA = "response.audio_transcript.delta"
 """Upstream-side ASR of its own audio. Treat as text for INSPECTION
-purposes — even though it's the model's transcription of its own audio,
+purposes -- even though it's the model's transcription of its own audio,
 the actual policy gate is ``what was emitted as text``."""
 
 
@@ -162,7 +162,7 @@ class RealtimeHandler:
         self.ctx: RequestContext | None = None
         self.rctx: ResponseContext | None = None
 
-        # Cumulative session metrics — written into the session-end
+        # Cumulative session metrics -- written into the session-end
         # audit row and the periodic flush rows.
         self.client_event_count = 0
         self.upstream_event_count = 0
@@ -184,7 +184,7 @@ class RealtimeHandler:
         OpenAI's realtime endpoint is intentionally out of v0.1.6's
         scope (and would require an integration-grade test rig that
         unit tests can't cover). Instead, this loop reads client
-        events and runs the documented stage logic against them — the
+        events and runs the documented stage logic against them -- the
         bridge to a real upstream is a thin substitution that swaps
         the per-event echo for a forward to a real
         ``websockets.connect()`` upstream. Callers who want the live
@@ -338,7 +338,7 @@ class RealtimeHandler:
                 check_name = result.metadata.get("_check_name")
                 if check_name:
                     shadow_event["check"] = check_name
-            with contextlib.suppress(Exception):  # pragma: no cover — defensive
+            with contextlib.suppress(Exception):  # pragma: no cover -- defensive
                 await self.websocket.send_json(shadow_event)
             await self.websocket.close(code=WS_CLOSE_NORMAL, reason="shadow ok")
             return
@@ -347,9 +347,9 @@ class RealtimeHandler:
         # then close 1008. Carry ``decision="block"`` for parity with
         # the COMMITMENT- and INSPECTION-stage refusal frames so SDKs
         # can branch on a single field name across stages. ADMISSION
-        # in 0.1.6/0.1.7 only ever blocks on the WebSocket path —
+        # in 0.1.6/0.1.7 only ever blocks on the WebSocket path --
         # escalate would need an out-of-band approval workflow that
-        # WS-handshake refusals can't surface — so the decision is
+        # WS-handshake refusals can't surface -- so the decision is
         # always ``block`` here.
         refusal_event: dict[str, Any] = {
             "type": "signet.refusal",
@@ -364,7 +364,7 @@ class RealtimeHandler:
             check_name = result.metadata.get("_check_name")
             if check_name:
                 refusal_event["check"] = check_name
-        with contextlib.suppress(Exception):  # pragma: no cover — defensive
+        with contextlib.suppress(Exception):  # pragma: no cover -- defensive
             await self.websocket.send_json(refusal_event)
         # WebSocket close-reason field is capped at 123 bytes by RFC
         # 6455. Coarsen unconditionally on the wire; the audit row has
@@ -407,7 +407,7 @@ class RealtimeHandler:
             self.client_event_count += 1
             event = self._parse_message(message)
             if event is None:
-                # Non-JSON, non-text payload — pass through silently
+                # Non-JSON, non-text payload -- pass through silently
                 # (the test echo doesn't synthesize a response).
                 continue
 
@@ -765,7 +765,7 @@ class RealtimeHandler:
         """Write the session-end audit row.
 
         Carries cumulative session metrics. Fires from the ``finally``
-        in :meth:`run` so it always runs — clean close, exception, or
+        in :meth:`run` so it always runs -- clean close, exception, or
         cancellation. The shape matches what dashboards summarize
         per-session: counts of each event type and refusal class.
         """

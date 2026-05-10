@@ -1,4 +1,4 @@
-"""SandboxPreviewCheck — preview tool calls before they commit.
+"""SandboxPreviewCheck -- preview tool calls before they commit.
 
 For irreversible tools (file deletion, payments, external API mutations),
 running the call in a sandbox first to *preview* the effect lets the
@@ -6,9 +6,9 @@ gate audit the simulated outcome and decide whether to commit the real
 call.
 
 This reference plugin defers the actual sandboxing to a caller-supplied
-async runner. signet's value here is the *gating discipline* — when to
+async runner. signet's value here is the *gating discipline* -- when to
 preview, what to do with the preview output, how to chain into a real
-commit — not the sandbox implementation itself. Bring your own.
+commit -- not the sandbox implementation itself. Bring your own.
 
 Typical runner shape::
 

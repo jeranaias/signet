@@ -6,10 +6,10 @@ across calls within a single request.
 
 The context split mirrors the four hook timings:
 
-* :class:`RequestContext` — :meth:`Check.pre_request`
-* :class:`ResponseContext` — :meth:`Check.inspect_response_chunk` and
+* :class:`RequestContext` -- :meth:`Check.pre_request`
+* :class:`ResponseContext` -- :meth:`Check.inspect_response_chunk` and
   :meth:`Check.post_complete`
-* :class:`ToolCallContext` — :meth:`Check.inspect_tool_call`
+* :class:`ToolCallContext` -- :meth:`Check.inspect_tool_call`
 
 These are deliberately simple: dataclasses, mutable, single-request-scoped.
 A check that needs richer state should attach it to ``scratch`` or use
@@ -49,7 +49,7 @@ def set_truncation_observer(callback: Callable[[int], None] | None) -> None:
     :class:`signet.server.metrics.Metrics` calls this with a counter-
     incrementing function at construction; tests that don't want metrics
     emission pass ``None``. The observer fires once per
-    :class:`ResponseContext` the *first* time its cap is hit — repeated
+    :class:`ResponseContext` the *first* time its cap is hit -- repeated
     extensions on a saturated context don't double-count.
     """
     global _truncation_observer
@@ -129,7 +129,7 @@ class ResponseContext:
             directly so the cap is enforced without callers having to
             think about it.
         accumulated_text_cap: Maximum size of ``accumulated_text``.
-            Default is 1 MiB — enough for INSPECTION-stage checks on
+            Default is 1 MiB -- enough for INSPECTION-stage checks on
             long completions, while bounded against O(N²) string growth
             on multi-megabyte streams. Adjust if your INSPECTION checks
             need more context, but understand the cost.
@@ -158,7 +158,7 @@ class ResponseContext:
     def extend_text(self, more: str) -> None:
         """Append to ``accumulated_text``, enforcing the byte cap.
 
-        Strings, not bytes — the cap is a soft byte budget computed
+        Strings, not bytes -- the cap is a soft byte budget computed
         against the current length. Once exceeded, additional content
         is dropped and the truncated flag is set; subsequent calls
         become no-ops on the text but still flip the flag for any new
@@ -167,7 +167,7 @@ class ResponseContext:
         The first time the cap is hit on this context, the module-level
         :data:`_truncation_observer` is fired (if installed) so metrics
         backends can count truncation events. Subsequent extensions on
-        the same saturated context do *not* re-fire the observer — one
+        the same saturated context do *not* re-fire the observer -- one
         emission per response, regardless of how many overflow chunks
         arrive.
         """

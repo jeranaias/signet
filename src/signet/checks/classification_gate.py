@@ -1,4 +1,4 @@
-"""ClassificationGateCheck — 5-level architectural enforcement.
+"""ClassificationGateCheck -- 5-level architectural enforcement.
 
 Models the standard US-government classification ladder (UNCLASS / CUI /
 SECRET / TS / TS/SCI). Every request declares the data classification
@@ -12,10 +12,10 @@ prompt that the model could ignore.
 
 Headers:
 
-* ``X-Classification: UNCLASS|CUI|SECRET|TS|TS/SCI`` — required if any
+* ``X-Classification: UNCLASS|CUI|SECRET|TS|TS/SCI`` -- required if any
   classification is intended for the request. Defaults to UNCLASS when
   absent.
-* ``X-Caller-Clearance: UNCLASS|CUI|SECRET|TS|TS/SCI`` — required when
+* ``X-Caller-Clearance: UNCLASS|CUI|SECRET|TS|TS/SCI`` -- required when
   the request's classification is non-UNCLASS. Defaults to UNCLASS when
   absent.
 
@@ -112,7 +112,7 @@ class ClassificationGateCheck(Check):
         # C2.1 (v0.1.7): an empty / whitespace-only classification header
         # silently maps to the default (UNCLASS). When the caller
         # asserts a non-default clearance, that asymmetry is worth the
-        # operator's attention — an investigator asking "why was this
+        # operator's attention -- an investigator asking "why was this
         # allowed?" should see the trail. We emit INFO (not WARN)
         # because a misconfigured caller is a real but recoverable case:
         # leave a breadcrumb without alarming. Detection looks at the

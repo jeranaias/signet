@@ -1,4 +1,4 @@
-"""HmacChain — the writer that signs audit entries and links them.
+"""HmacChain -- the writer that signs audit entries and links them.
 
 Each appended entry's HMAC depends on:
 
@@ -82,7 +82,7 @@ class HmacChain:
         # When True (default, single-process), cache the last entry's
         # HMAC so we don't scan the backend on every append. Set False
         # when running multiple writers against a FileLockingJsonlBackend
-        # — each append then re-reads the chain head under the
+        # -- each append then re-reads the chain head under the
         # cross-process lock so workers stay consistent.
         self._cache_prev = cache_prev
         self._cached_prev: str | None = None
@@ -112,7 +112,7 @@ class HmacChain:
 
             # First pass: compute a tentative HMAC over the payload
             # WITHOUT the anchor receipt. The tentative HMAC is what we
-            # submit to the anchor backend — anchoring the input to the
+            # submit to the anchor backend -- anchoring the input to the
             # signing function, not the output, keeps the order of
             # operations clean (anchor commits to the entry's identity,
             # the chain HMAC commits to the anchor receipt + payload).
@@ -194,23 +194,23 @@ def _serialize_for_signing(entry: AuditEntry) -> bytes:
     Includes everything else, including ``prev_hmac``, so chain breaks
     are detected.
 
-    Canonicalization rules — these are deliberately narrow because the
+    Canonicalization rules -- these are deliberately narrow because the
     payload shape is constrained (see :class:`AuditEntry.to_dict`):
 
-    * ``sort_keys=True`` — deterministic key order across runs.
-    * ``separators=(",", ":")`` — no whitespace.
-    * ``allow_nan=False`` — reject ``NaN`` / ``Infinity`` outright;
+    * ``sort_keys=True`` -- deterministic key order across runs.
+    * ``separators=(",", ":")`` -- no whitespace.
+    * ``allow_nan=False`` -- reject ``NaN`` / ``Infinity`` outright;
       they have no JSON literal and produce non-canonical output in
       Python's ``json`` (it emits ``NaN`` which strict parsers reject).
       A check that puts a NaN into metadata will fail loudly here
       rather than silently produce an unverifiable entry.
-    * ``ensure_ascii=False`` — UTF-8 throughout. Callers that mix
+    * ``ensure_ascii=False`` -- UTF-8 throughout. Callers that mix
       Unicode-normalization forms (NFC vs NFD) in metadata strings
       will produce different signatures for visually-identical text;
       normalize at the application layer if that matters.
 
     For richer canonicalization (RFC 8785 JCS, CBOR-deterministic),
-    swap this function out — :class:`HmacChain` and
+    swap this function out -- :class:`HmacChain` and
     :class:`ChainVerifier` import it as a module-level callable.
     """
     d: dict[str, Any] = entry.to_dict()

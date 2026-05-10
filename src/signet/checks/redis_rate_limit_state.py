@@ -1,4 +1,4 @@
-"""Redis-backed RateLimitState — multi-replica per-owner rate limiting.
+"""Redis-backed RateLimitState -- multi-replica per-owner rate limiting.
 
 Drop-in replacement for :class:`signet.checks.rate_limit.InMemoryRateLimitState`
 when you run multiple signet replicas and need rate-limit state to be

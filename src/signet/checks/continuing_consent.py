@@ -1,4 +1,4 @@
-"""ContinuingConsentCheck — re-evaluate owner authority mid-stream.
+"""ContinuingConsentCheck -- re-evaluate owner authority mid-stream.
 
 Authority granted at the start of a request is not a blank check for
 the entire stream. Conditions can change while the model is generating:
@@ -61,7 +61,7 @@ class ContinuingConsentCheck(Check):
             means cheaper at the cost of detection latency.
 
             **C10.1 throttle semantics.** ``check_every_chunks=2``
-            means "fire on chunks 1, 3, 5, …" — every Nth chunk
+            means "fire on chunks 1, 3, 5, …" -- every Nth chunk
             counted from the first, NOT "every other chunk". Chunks
             2, 4, 6, … never trigger the predicate. The latency cost
             is one chunk: when the upstream policy flips on chunk 4,

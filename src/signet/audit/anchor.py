@@ -1,4 +1,4 @@
-"""Anchor backends — externalize tamper-evidence to a third party.
+"""Anchor backends -- externalize tamper-evidence to a third party.
 
 The HMAC chain alone is tamper-*evident* but not tamper-*proof*: an
 attacker with file-write access AND the HMAC secret can replace the
@@ -8,8 +8,8 @@ service that returns a receipt the operator cannot retroactively forge.
 
 v0.1.3 ships:
 
-* :class:`NoopAnchor` (default) — backward-compatible, no anchoring.
-* :class:`Rfc3161Anchor` — submits to any free RFC 3161 Time Stamp
+* :class:`NoopAnchor` (default) -- backward-compatible, no anchoring.
+* :class:`Rfc3161Anchor` -- submits to any free RFC 3161 Time Stamp
   Authority (FreeTSA, DigiCert public TSA, etc.). Returns a CMS-signed
   TimeStampToken binding the HMAC to the TSA's authoritative timestamp.
   Independently verifiable against the TSA's public certificate.
@@ -17,7 +17,7 @@ v0.1.3 ships:
 
 Roadmap:
 
-* :class:`RekorAnchor` — sigstore.dev transparency log. Adapter is
+* :class:`RekorAnchor` -- sigstore.dev transparency log. Adapter is
   drafted but the public Rekor instance requires signing material the
   OSS reference does not yet supply on its own. Pair with an
   :class:`Ed25519ReceiptSigner` once the integration lands in v0.1.4,
@@ -30,7 +30,7 @@ Anchoring is synchronous within :meth:`HmacChain.append`. The anchor
 receipt is embedded in the entry's metadata under ``_anchor`` BEFORE
 the HMAC is computed, so the chain HMAC binds the anchor receipt to
 the entry. This means a slow or unreachable anchor service blocks
-audit writes — configure a tight timeout (default 5s) and pick a
+audit writes -- configure a tight timeout (default 5s) and pick a
 sensible failure mode:
 
 * ``require_success=False`` (default): on failure, the entry is still
@@ -114,7 +114,7 @@ class AnchorBackend(Protocol):
 
         Implementations should respect their own timeout and return an
         :class:`AnchorReceipt` with ``success=False`` rather than
-        raising — :meth:`HmacChain.append` translates that into a
+        raising -- :meth:`HmacChain.append` translates that into a
         warning-tagged entry. Implementations MAY raise if the chain's
         ``require_anchor=True`` fail-loud mode is desired.
         """
@@ -128,7 +128,7 @@ class AnchorBackend(Protocol):
 
 @dataclass
 class NoopAnchor:
-    """Default backend — does nothing, returns a success receipt with no proof.
+    """Default backend -- does nothing, returns a success receipt with no proof.
 
     Backward-compatible behavior for v0.1.0/0.1.1/0.1.2 chains. Use
     when external anchoring is not needed or feasible (air-gapped
@@ -145,12 +145,12 @@ class NoopAnchor:
 class Rfc3161Anchor:
     """Submit each HMAC to a free RFC 3161 Time Stamp Authority.
 
-    RFC 3161 TSAs return a TimeStampToken (TST) — a CMS-signed
+    RFC 3161 TSAs return a TimeStampToken (TST) -- a CMS-signed
     structure binding the input hash to the TSA's authoritative
     timestamp. The TST is independently verifiable against the TSA's
     public certificate without contacting the TSA again.
 
-    Default TSA URL is FreeTSA (https://freetsa.org/tsr) — a no-cost,
+    Default TSA URL is FreeTSA (https://freetsa.org/tsr) -- a no-cost,
     no-account public TSA suitable for low-volume use. For production
     or compliance-critical deployments, point at an enterprise TSA
     you have a contract with.

@@ -1,4 +1,4 @@
-"""Stage — the four-tier check hierarchy.
+"""Stage -- the four-tier check hierarchy.
 
 Every :class:`signet.core.check.Check` declares which stage it runs in. The
 :class:`signet.core.pipeline.Pipeline` orders execution by stage, then by
@@ -17,7 +17,7 @@ Stage         When it runs
 
 :attr:`INSPECTION`  As streamed chunks arrive from the model. Output
                     spillage scanners, scope-drift checks (the "continuing
-                    consent" pattern — the model still has authority to
+                    consent" pattern -- the model still has authority to
                     keep generating what it's now generating), live
                     redactors. Block here aborts the stream mid-flight.
 
@@ -29,7 +29,7 @@ Stage         When it runs
 :attr:`RECORD`      After the response completes. Audit-only checks: drift
                     detection, behavioral baseline updates, metrics. A
                     block here does NOT modify the already-delivered
-                    response — it is recorded in the audit chain only,
+                    response -- it is recorded in the audit chain only,
                     typically for incident response and trend analysis.
 ============= =============================================================
 
@@ -48,7 +48,7 @@ Why a four-stage hierarchy and not a flat list:
    action per stage.
 
 3. **Re-evaluation.** The "continuing consent" pattern lives at
-   INSPECTION — even though the request was admitted, the gate
+   INSPECTION -- even though the request was admitted, the gate
    re-checks authority on what the model is actually producing.
 """
 

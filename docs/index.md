@@ -27,12 +27,12 @@ pip install signet-sign
 ## Quickstart — three commands to a working gate
 
 ```bash
-signet init my-gate           # scaffold pipeline.py + client_example.py + .env + .gitignore
+signet init my-gate           # scaffold pipeline.py + client_example.py + .env.example + .gitignore
 cd my-gate
 signet serve --upstream http://localhost:11434/v1 --dev
 ```
 
-`--dev` bundles `--allow-ephemeral-key`, `--audit-log audit.jsonl`, and `--config pipeline.py` so local development is one flag instead of three.
+`--dev` bundles `--allow-ephemeral-key`, `--audit-log audit.jsonl`, `--config pipeline.py`, and `--no-strict-error-redaction` so local development is one flag instead of four.
 
 Then point any OpenAI-compatible client at `http://localhost:8443/v1` with an `X-Commit-Owner: human:<your-id>` header. A complete example client lives in the scaffold:
 

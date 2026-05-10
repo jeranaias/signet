@@ -1,4 +1,4 @@
-"""ToolCallInspectorCheck — risk-tier gating for proposed tool invocations.
+"""ToolCallInspectorCheck -- risk-tier gating for proposed tool invocations.
 
 Runs at the COMMITMENT stage. Every tool call the model proposes is
 inspected before the tool actually runs. Decisions:
@@ -18,12 +18,12 @@ Tool metadata comes from a registry passed at construction time. Each
 entry minimally has:
 
 * ``risk_tier``: ``"low" | "medium" | "high" | "critical"``
-* ``irreversible``: bool — true for actions like file deletion, payment,
+* ``irreversible``: bool -- true for actions like file deletion, payment,
   external API mutations.
-* ``dryrun_supported``: bool — whether the tool can be invoked in
+* ``dryrun_supported``: bool -- whether the tool can be invoked in
   preview-only mode by the sandbox plugin (out of this check's scope).
 
-Tools missing from the registry are *blocked by default* — register an
+Tools missing from the registry are *blocked by default* -- register an
 empty entry to allow without restrictions.
 """
 

@@ -1,4 +1,4 @@
-"""Owner — who is accountable for a commit.
+"""Owner -- who is accountable for a commit.
 
 Every request that reaches signet must be attributable to an :class:`Owner`.
 If no owner can be resolved (no header, no agent ID, no policy mapping, no
@@ -7,7 +7,7 @@ trusted-network fallback), the request is refused before any model call.
 The owner travels with the audit row. ``owner_type`` answers *what kind of
 actor* (human, agent, policy, unresolved). ``owner_id`` is the principal
 identifier within that type. ``approval_chain`` records who/what authorized
-the request along the way — useful when an agent action was approved by a
+the request along the way -- useful when an agent action was approved by a
 human, or when a policy bundle delegated authority through several layers.
 
 This module is data-only; resolution logic lives in
@@ -24,10 +24,10 @@ class OwnerType(enum.StrEnum):
     """Discriminator for the kind of actor responsible for a commit."""
 
     HUMAN = "human"
-    """A human principal — typically an email or username asserted via header."""
+    """A human principal -- typically an email or username asserted via header."""
 
     AGENT = "agent"
-    """An autonomous agent — identified by its registered agent ID."""
+    """An autonomous agent -- identified by its registered agent ID."""
 
     POLICY = "policy"
     """An organizational policy or rule that authorized the request without a
@@ -86,7 +86,7 @@ class Owner:
     for backwards compatibility, but ``Owner(type=..., id=...)`` is also
     accepted for symmetry with most other libraries' conventions. The
     classmethods :meth:`human`, :meth:`agent`, :meth:`policy`, and
-    :meth:`unresolved` remain the recommended path — they handle the
+    :meth:`unresolved` remain the recommended path -- they handle the
     ``approval_chain`` for you.
     """
 

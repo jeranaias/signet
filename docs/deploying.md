@@ -175,7 +175,7 @@ if you'd rather have it engineered.
 
 | Endpoint | Use for | Returns |
 |---|---|---|
-| `/health` (alias `/healthz`) | k8s liveness | 200 with `{status, version, uptime_seconds, audit_chain_head_hmac, pipeline_check_count}`. Always 200 if the process is alive. |
+| `/health` (alias `/healthz`) | k8s liveness | 200 with `{status, service, version, uptime_seconds, audit_chain_head_hmac, pipeline_check_count, shadow}`. `audit_chain_head_hmac` is `"disabled"` (no audit configured), `null` (configured but empty), or the last 8 hex chars of the head HMAC. `shadow` is `true` when shadow mode is active. Always 200 if the process is alive. |
 | `/readyz` | k8s readiness | 200 if upstream answered within 1s; 503 with `{status, reason, upstream}` otherwise. |
 | `/version` | build-time identification | `{version, service}`. |
 | `/metrics` | Prometheus scrape | Prometheus exposition format. See the metrics module for the counter set. |

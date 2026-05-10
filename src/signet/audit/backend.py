@@ -40,7 +40,7 @@ if sys.platform == "win32":
 
     class _MsvcrtLock:
         """Windows byte-range lock. Some file modes don't permit byte-range
-        locks on append-mode files — single-process safety still holds via
+        locks on append-mode files -- single-process safety still holds via
         threading.Lock in HmacChain. Failures are suppressed."""
 
         def acquire(self, fileno: int) -> None:
@@ -75,20 +75,20 @@ def exclusive_log_lock(path: Path) -> Iterator[None]:
     writers for the duration of an atomic rewrite. We lock a sidecar
     file (``<path>.lock``) rather than the live log itself because on
     Windows holding any handle on the live log would prevent the
-    compactor's own ``os.replace`` from succeeding — and the whole
+    compactor's own ``os.replace`` from succeeding -- and the whole
     point here is that the compactor can rewrite the log atomically
     while concurrent writers either block or get a clean error.
 
     Lock primitive: ``fcntl.flock`` on POSIX (blocking by default),
     ``msvcrt.locking`` on Windows (retries internally ~10 s, then
-    raises ``OSError`` — the caller turns that into a useful message).
+    raises ``OSError`` -- the caller turns that into a useful message).
 
     The :class:`FileLockingJsonlBackend` already takes a byte-range
     lock on the log itself for serialization between worker
     processes; the compactor's sidecar lock is a *coordination* lock
     one rung above. Appenders that observe the sidecar lock cooperate;
     appenders that don't (e.g. the plain :class:`JsonlBackend`) are
-    not constrained — but those backends are not multi-writer safe to
+    not constrained -- but those backends are not multi-writer safe to
     begin with.
     """
     lock_path = Path(str(path) + ".lock")
@@ -187,7 +187,7 @@ class JsonlBackend:
     writing so a crash between request handling and disk flush still
     leaves the chain consistent. Disable with ``fsync_after_append=False``
     if you need throughput and accept the post-crash audit-tail-loss
-    window. There is no rotation, compression, or indexing — those
+    window. There is no rotation, compression, or indexing -- those
     belong in a dedicated backend.
     """
 
@@ -264,7 +264,7 @@ class JsonlBackend:
 class FileLockingJsonlBackend(JsonlBackend):
     """JsonlBackend with cross-process file locking for multi-worker deployments.
 
-    The base :class:`JsonlBackend` is safe for single-process use only —
+    The base :class:`JsonlBackend` is safe for single-process use only --
     :class:`signet.audit.chain.HmacChain`'s in-process lock prevents
     coroutine-level forks but does nothing across uvicorn workers. This
     subclass acquires an exclusive OS-level lock on the audit file
@@ -272,7 +272,7 @@ class FileLockingJsonlBackend(JsonlBackend):
     safely share one log file.
 
     Locking primitive: ``fcntl.flock`` on POSIX, ``msvcrt.locking`` on
-    Windows. Both are advisory locks — they only constrain processes
+    Windows. Both are advisory locks -- they only constrain processes
     that themselves call into this backend. External processes that
     write to the audit file directly are not constrained (and should
     not be doing that anyway).
@@ -303,7 +303,7 @@ class FileLockingJsonlBackend(JsonlBackend):
         Coordination with the compactor (A7): we acquire the sidecar
         ``<path>.lock`` lock first (the same lock the compactor holds
         for the duration of an atomic rewrite). If a compaction is in
-        progress, this blocks here — instead of opening the live log
+        progress, this blocks here -- instead of opening the live log
         and racing with the compactor's ``os.replace``. The byte-range
         lock on the log itself is still held during the actual write
         to keep multi-process appenders serialized between

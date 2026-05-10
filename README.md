@@ -91,14 +91,26 @@ pip install signet-sign
 signet init my-gate
 cd my-gate
 
-# --dev bundles --allow-ephemeral-key, --audit-log audit.jsonl, --config pipeline.py
+# --dev bundles --allow-ephemeral-key, --audit-log audit.jsonl,
+# --config pipeline.py, and --no-strict-error-redaction
 signet serve --upstream http://localhost:11434/v1 --dev
 
 # In another terminal — point any OpenAI-compatible client at signet
 python client_example.py
 ```
 
-Refusal payload when you forget the owner header:
+Refusal payload when you forget the owner header (production default — strict redaction on):
+
+```json
+{
+  "error": "refused",
+  "correlation_id": "9f1c0a3d-3a52-4f1c-bd2a-2bb3f5b6c0a8"
+}
+```
+
+Production responses carry the correlation ID only; full detail (which check fired, the reason, the stage) lands in the audit chain. Look the entry up with `signet audit show <correlation_id>` for incident response.
+
+`signet serve --dev` flips on `--no-strict-error-redaction`, so during local development the 4xx body surfaces the firing check + reason + stage:
 
 ```json
 {
@@ -109,7 +121,7 @@ Refusal payload when you forget the owner header:
 }
 ```
 
-The 403 response also carries `X-Signet-Receipt` (signed proof of the refusal) and `X-Signet-Upstream` (so you can finger-point upstream errors vs. signet errors).
+Either way the 403 response also carries `X-Signet-Receipt` (signed proof of the refusal) and `X-Signet-Upstream` (so you can finger-point upstream errors vs. signet errors). Strict redaction has been the production default since v0.1.5.
 
 For programmatic use:
 

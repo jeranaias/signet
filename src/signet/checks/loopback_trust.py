@@ -1,4 +1,4 @@
-"""LoopbackTrustCheck — auto-resolve owner for trusted internal IPs.
+"""LoopbackTrustCheck -- auto-resolve owner for trusted internal IPs.
 
 Co-located services (background workers, internal admin tools, sidecars)
 typically don't carry a per-request commit-owner header. They should not
@@ -14,10 +14,10 @@ the trust.
 
 Configurable trust ranges:
 
-* Loopback (``127.0.0.0/8`` and ``::1``) — always trusted by default.
-* Tailscale CGNAT (``100.64.0.0/10``) — trusted by default; turn off
+* Loopback (``127.0.0.0/8`` and ``::1``) -- always trusted by default.
+* Tailscale CGNAT (``100.64.0.0/10``) -- trusted by default; turn off
   for environments not on Tailscale.
-* Custom CIDR ranges — pass ``extra_trusted_cidrs`` to extend.
+* Custom CIDR ranges -- pass ``extra_trusted_cidrs`` to extend.
 
 When trust matches, the resolved owner records the actual source IP so
 audits can still attribute to a specific machine, just under a policy

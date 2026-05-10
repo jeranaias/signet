@@ -1,4 +1,4 @@
-"""RegexContentCheck — block or redact patterns in input or output.
+"""RegexContentCheck -- block or redact patterns in input or output.
 
 A general-purpose pattern matcher with two modes:
 
@@ -9,8 +9,8 @@ A general-purpose pattern matcher with two modes:
   the matched span in subsequent chunks.
 
 Because the same logic is wanted at two different stages, we expose two
-classes — :class:`RegexContentCheck` for input and
-:class:`RegexOutputCheck` for output — both backed by the same matcher.
+classes -- :class:`RegexContentCheck` for input and
+:class:`RegexOutputCheck` for output -- both backed by the same matcher.
 This keeps the stage declaration explicit at registration time rather
 than via a constructor flag (which would defeat
 :class:`signet.core.pipeline.Pipeline`'s stage-based ordering).
@@ -31,7 +31,7 @@ they're outside this check's threat model. If you need image
 matching, layer a separate vision-aware check.
 
 **System-role messages (C4.2).** By default, every message is scanned
-regardless of role — system, user, and assistant messages all flow
+regardless of role -- system, user, and assistant messages all flow
 through the matcher. That preserves the v0.1.6 semantics. To restrict
 scanning to specific roles, pass ``roles=("user",)`` to either check
 constructor; messages with other roles are skipped entirely. The
@@ -48,7 +48,7 @@ seconds. Without ``regex`` the check falls back to ``re``; the
 timeout is best-effort and an attacker-controlled pattern can still
 hang the loop. ``pip install regex`` (or ``signet-sign[regex]``) for
 the production-grade behaviour. The same protection applies to
-:class:`RegexOutputCheck` (C5.2 — output-side regex shares the
+:class:`RegexOutputCheck` (C5.2 -- output-side regex shares the
 matcher and its per-pattern timeout).
 """
 
@@ -69,7 +69,7 @@ from signet.core.stage import Stage
 # and a pathological backtracking pattern hangs the asyncio loop.
 #
 # The ``regex`` package raises Python's built-in :class:`TimeoutError`
-# when a search exceeds the configured wall-clock budget — there is
+# when a search exceeds the configured wall-clock budget -- there is
 # no ``regex.TimeoutError`` attribute. We bind the matcher to that
 # concrete type so the fallback ``re`` path doesn't accidentally
 # swallow unrelated ``TimeoutError`` instances raised elsewhere.
@@ -149,7 +149,7 @@ def _scan(
 
     Returns one CheckResult per match. Empty if no matches. A pattern
     that times out (``regex.TimeoutError``) produces a BLOCK result
-    flagged with ``redos_timeout=True`` — fail-closed against
+    flagged with ``redos_timeout=True`` -- fail-closed against
     catastrophic-backtracking inputs that an attacker can craft against
     operator-supplied patterns.
     """
@@ -218,7 +218,7 @@ def _extract_input_text(
         body: The OpenAI-shaped request body.
         roles: When provided, only messages whose ``role`` is in this
             tuple are extracted. ``None`` (default) scans every
-            message regardless of role — preserving the v0.1.6
+            message regardless of role -- preserving the v0.1.6
             behavior. C4.2: this is the lever operators use to keep
             system-role messages out of the matcher's scope when their
             templates legitimately contain marker-shaped strings.
@@ -236,7 +236,7 @@ def _extract_input_text(
             parts.append(content)
         elif isinstance(content, list):
             # OpenAI vision-style: list of content parts. Only the
-            # ``text`` parts are scanned (C4.3 — image bytes/URLs are
+            # ``text`` parts are scanned (C4.3 -- image bytes/URLs are
             # outside this check's threat model).
             for part in content:
                 if isinstance(part, dict) and part.get("type") == "text":
@@ -253,7 +253,7 @@ class RegexContentCheck(Check):
             patterns** so a strict decision is never silently masked
             by a softer earlier match (C4.4).
         roles: Optional tuple of message roles to scan. ``None``
-            (default) scans every message — the v0.1.6 behavior. Pass
+            (default) scans every message -- the v0.1.6 behavior. Pass
             ``roles=("user",)`` to skip system / assistant messages
             (C4.2). Recipe::
 

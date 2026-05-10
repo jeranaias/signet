@@ -1,4 +1,4 @@
-"""LangChain adapter — surface signet decisions in LangChain tracing.
+"""LangChain adapter -- surface signet decisions in LangChain tracing.
 
 Usage::
 
@@ -25,7 +25,7 @@ records it on ``last_receipt``. It also surfaces signet refusals as
 LangChain ``on_llm_error`` events so chains see them as first-class
 errors rather than silent passthroughs.
 
-Pure observability — does not modify requests or responses. Wire owner
+Pure observability -- does not modify requests or responses. Wire owner
 headers via the LLM client's ``default_headers`` (as in the example
 above) or via :func:`signet.adapters.openai.wrap_openai` against the
 underlying OpenAI client.

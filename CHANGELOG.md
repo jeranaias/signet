@@ -8,6 +8,212 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.7] -- 2026-05-09
+
+### The polish release -- every bug surfaced by the v0.1.6 hunt is fixed
+
+Five hunters surfaced ~98 issues against v0.1.6. v0.1.7 lands every
+P0/HIGH plus most P1/P2 polish, with regression tests so each found
+bug can never silently return. Three release candidates (`v0.1.7-rc1`
+through `v0.1.7-rc3`) staged the work; the final tag is the polish
+bundle.
+
+### Fixed (P0 / HIGH)
+
+#### Server core
+- **H1**: `_handle_chat` no longer crashes with a 500 + Python traceback
+  when the request body is a JSON list, scalar, or `null`. `_admit`
+  now validates that the parsed body is a JSON object and returns a
+  structured 400 (`{"error":"request body must be a JSON object"}`)
+  with a synthetic audit row.
+- **H2**: `X-Signet-Upstream` and `X-Signet-Upstream-Status` are now
+  set on **every** forwarded response, including the 502 wrappers
+  emitted when the upstream returned non-JSON, an empty body, or a
+  redirect. Operators can finger-point upstream-vs-signet errors on
+  every code path now, matching the docstring contract.
+- **H3**: The unsupported-endpoint refusal body no longer ships the
+  literal string `"v0.1.3"`. The version is interpolated from
+  `signet.__version__`.
+- **H4**: Boolean env vars (`SIGNET_SHADOW`, `SIGNET_ALLOW_EPHEMERAL_KEY`,
+  `SIGNET_EMIT_RECEIPTS`, `SIGNET_STRICT_ERROR_REDACTION`) accept
+  `{"1","true","yes","on","enabled"}` case-insensitive. The CHANGELOG
+  promised `SIGNET_SHADOW=1` would enable shadow mode in v0.1.6; it
+  now actually does.
+
+#### Audit subsystem
+- **A1**: `verify --including-archives` no longer crashes with an
+  uncaught `zlib.error` when the gzip body of an archive is corrupted.
+  `_read_archive` wraps decompression in `try/except (zlib.error,
+  UnicodeDecodeError)` and surfaces the failure as a structured
+  `ARCHIVE_FORMAT_INVALID` break.
+- **A2**: Re-compaction over an existing compaction marker is now
+  refused cleanly with an actionable error instead of producing a
+  silently broken multi-archive chain. (The walker can't bridge
+  marker-to-marker yet; that's deferred.)
+- **A3**: `audit verify` no longer crashes with a raw
+  `json.JSONDecodeError` on malformed JSONL lines. Truncated lines,
+  stray text, and UTF-8 BOM prefixes now surface as
+  `BreakKind.MALFORMED_LINE` per-entry breaks. `JsonlBackend` opens
+  the log with `encoding="utf-8-sig"` so a leading BOM is stripped
+  silently.
+- **A4**: `signet audit compact --output <existing>` refuses by
+  default. Pass `--force` to overwrite. Archive integrity is no longer
+  silently lost to a typo.
+- **A6**: A single-byte tamper of `prev_hmac` no longer doubles up as
+  both a `LINK_MISMATCH` and a `SELF_MISMATCH`; the verifier
+  short-circuits the self-check when the link already failed.
+- **A7**: The compactor and the appender now coordinate via a
+  `<log>.compacting` sidecar lock. Concurrent appends during
+  compaction fail loudly (the documented contract) instead of
+  silently dropping writes.
+
+#### Checks layer
+- **C1**: `OwnerResolutionCheck` rejects header values containing
+  CR/LF/NUL or exceeding the configured length cap. The
+  v0.1.6 path admitted bare `\r\n` injections into audit-row metadata.
+- **C1.4**: The `human:` / `agent:` value prefix check is now
+  case-insensitive so `Human:alice` resolves identically to
+  `human:alice`. The block hint message tells operators about the
+  case-insensitive prefix explicitly.
+- **C1.5**: An `X-Policy-Name` value that itself starts with a literal
+  `policy:` prefix is now stripped before recording so the audit row
+  doesn't carry a doubly-prefixed identifier.
+- **C2.1**: `ClassificationGateCheck` treats whitespace-only
+  classification headers as missing instead of admitting them as the
+  literal whitespace string.
+- **C3**: `RateLimitCheck` fails closed (block) when the backing state
+  store raises an exception. Previously a Redis outage would silently
+  let traffic through.
+- **C4**: `RegexContentCheck` and `RegexOutputCheck` use the optional
+  `regex` package's wall-clock timeout to bound ReDoS surface. The
+  `re` fallback path stays as the no-extra-deps default.
+- **C4.2**: `RegexContent` accepts a `roles=` filter so the matcher
+  scans only specific message roles (e.g. `roles=("user",)`) instead
+  of every message in the conversation.
+- **C6**: `PromptInjectionCheck` lowered its decoder length floor from
+  64 chars to 24 so short obfuscated payloads no longer slip past.
+  Single-message inputs and 1 MiB inputs are now both correctly
+  bounded.
+- **C6.7**: A ROT13 fast-path skips the decoder when the input
+  contains common English stop-words; the check rate stays correct
+  but the cost on natural-language traffic drops to near-zero.
+- **C7**: `ScopeDriftCheck`'s default classification-marker dictionary
+  picked up the markers the v0.1.6 dictionary missed
+  (`OFFICIAL`, `PROTECTED`, etc.) and matches case-insensitively.
+- **C8**: `TokenBudgetCheck` now reserves the pessimistic estimate
+  against the per-owner budget at admission and reconciles on
+  completion. A burst of in-flight requests can no longer stack-bypass
+  the cap.
+- **C8.3**: A negative `max_tokens` is now refused cleanly instead of
+  silently falling through.
+
+#### Plugin discovery
+- **D1**: `discover_plugins` now distinguishes
+  `status="duplicate_name"` plus a `duplicate_with=<other_dist>` field
+  so operators can see when two installed plugins both register the
+  same check name.
+
+#### CLI
+- **C1 (CLI)**: `signet doctor --self <down>` now exits non-zero
+  whenever any probe fails. v0.1.6 happy-pathed even when the gate
+  was down.
+- **C2 (CLI)**: `signet init` does partial-write-skip-existing -- when
+  the target directory has some scaffold files already, the missing
+  files are written and the existing ones are left alone.
+- **C4 (CLI)**: The `keys generate-ed25519 --key-id <id>` success
+  message renders the path via Python's `repr()` so Windows paths
+  with spaces / UNCs show cleanly. The command also writes a
+  `<out>.meta.json` sidecar capturing the key-id, algorithm, and
+  generation timestamp.
+- **C5 (CLI)**: `signet serve --config <broken>` surfaces a one-line
+  `ClickException` instead of a multi-page Python traceback.
+- **C6 (CLI)**: Every audit subcommand that walks the chain emits a
+  structured warning when the chain is empty, instead of a silent
+  no-op.
+- **C7 (CLI)**: `signet audit tail --filter foo=bar` (an unknown field
+  name) now raises a `ClickException` with the list of valid fields.
+- **C9 (CLI)**: The lint success message and the report headers
+  interpolate `signet.__version__` everywhere, so the version always
+  matches the installed binary.
+
+### Added
+
+- **regex** package as an opt-in runtime dependency
+  (`pip install signet-sign[regex]`). Used by `RegexContent` /
+  `RegexOutput` for ReDoS-bounded matching; falls back to stdlib `re`
+  when not installed.
+- **`signet plugins doctor`** subcommand. CI gate for plugin-heavy
+  deployments: discovers every plugin, surfaces ABI mismatches,
+  duplicate-name collisions, and import errors, exits non-zero on
+  any of them.
+- **`signet audit compact --force`** -- the explicit overwrite for
+  the default refuse-existing-archive behavior (A4).
+- **`signet audit verify --summarize-cascades`** -- collapse cascading
+  `LINK_MISMATCH` runs after a single tamper into a single
+  `CASCADE_SUPPRESSED` summary break, keeping large-chain reports
+  readable (A11).
+- **`ServerConfig.inspect_all_sse_lines`** field. Opt-in tighter SSE
+  scanning that inspects every `data:` line in a streamed event,
+  not just the first; default `False` preserves v0.1.6 behavior.
+- `VerificationReport` carries `signet_version` and `verified_at`
+  (A13). Stored verify reports tie back to the binary that produced
+  them.
+- Sidecar `<out>.meta.json` on `signet keys generate-ed25519
+  --key-id`.
+- New `BreakKind` values: `MALFORMED_LINE` (A3) and
+  `CASCADE_SUPPRESSED` (A11).
+- New `DiscoveredPlugin` status: `duplicate_name` plus a
+  `duplicate_with` field (D1).
+
+### Changed
+
+- **Strict error redaction preserves transport reasons.** Coarsened
+  4xx responses still surface stable `upstream_protocol_violation` /
+  `upstream_exception` / similar transport tokens so SDK retry
+  contracts work. Policy-refusal `reason` continues to coarsen to
+  `"refused"`.
+- Boolean env vars accept `{"1","true","yes","on","enabled"}`
+  case-insensitive across `SIGNET_SHADOW`,
+  `SIGNET_ALLOW_EPHEMERAL_KEY`, `SIGNET_EMIT_RECEIPTS`, and
+  `SIGNET_STRICT_ERROR_REDACTION` (H4).
+- `audit verify` on a chain-empty file no longer prints the dangling
+  `(last hmac=)` sentinel parenthesis (A15).
+- `audit report --no-anonymize` drops the `(anonymized)` header
+  suffix when raw owner IDs are being printed (A5).
+- "1 blocks" rendering corrected to "1 block" in the Markdown report
+  pluralization sweep.
+- Markdown report timestamps no longer double-tag UTC -- the
+  `+00:00` ISO offset is trimmed before the human-readable `UTC`
+  suffix is appended (A12).
+- Plugin authors are now recommended to pin `signet-sign~=0.1.0`
+  (was `~=0.1`) to follow the v0.1.x ABI window precisely.
+- CLI `--dev` bundle documentation across README, `docs/index.md`,
+  and `signet serve --help` is now consistent: four items
+  (`--allow-ephemeral-key`, `--audit-log audit.jsonl`, `--config
+  pipeline.py`, `--no-strict-error-redaction`).
+
+### Documentation
+
+- README's refusal-payload example now leads with the strict-redaction
+  shape (`{"error":"refused","correlation_id":"..."}`) -- the
+  production default since v0.1.5 -- with a follow-on showing the
+  verbose body that `--dev` flips on (M5).
+- `docs/index.md` corrected to say `signet init` writes `.env.example`
+  (not `.env`) (M7).
+- `docs/deploying.md` `/health` payload table now includes `service`
+  and `shadow` and the three-state semantics of
+  `audit_chain_head_hmac` (L1).
+- Em-dash sweep across all source files: 418 occurrences of U+2014
+  replaced with `--` so help text and error messages render cleanly
+  on Windows cp1252 stdout.
+
+### Internal
+
+- 627 unit tests (was 418 at v0.1.6 ship). +209 new tests; every
+  finding has a regression test.
+- Three RC tags (`v0.1.7-rc1`, `v0.1.7-rc2`, `v0.1.7-rc3`) staged the
+  work; the final tag is the polish bundle.
+
 ## [0.1.6] — 2026-05-07
 
 ### The architectural-stretch release — bug fixes, the marquee feature, plus six P3 items at ship-in-0.1.6 scope
@@ -777,7 +983,10 @@ Test count: 220 unit + adversarial green. mypy clean. ruff clean.
 - Test matrix: Python 3.11 / 3.12 / 3.13 × Linux / macOS / Windows = 9 jobs per push
 - mkdocs-material site builds + deploys to GitHub Pages
 
-[Unreleased]: https://github.com/jeranaias/signet/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/jeranaias/signet/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/jeranaias/signet/releases/tag/v0.1.7
+[0.1.6]: https://github.com/jeranaias/signet/releases/tag/v0.1.6
+[0.1.5]: https://github.com/jeranaias/signet/releases/tag/v0.1.5
 [0.1.4]: https://github.com/jeranaias/signet/releases/tag/v0.1.4
 [0.1.3]: https://github.com/jeranaias/signet/releases/tag/v0.1.3
 [0.1.2]: https://github.com/jeranaias/signet/releases/tag/v0.1.2

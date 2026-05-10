@@ -1,4 +1,4 @@
-"""OpenAI SDK adapter — wrap an openai client to route through signet.
+"""OpenAI SDK adapter -- wrap an openai client to route through signet.
 
 Usage::
 
@@ -19,7 +19,7 @@ Usage::
 
 The wrapper rewrites ``base_url`` and adds default headers so every
 subsequent call carries the signet-required attribution headers. The
-underlying SDK is otherwise untouched — no patching, no monkey-business.
+underlying SDK is otherwise untouched -- no patching, no monkey-business.
 
 The :func:`wrap_openai` function works on both ``openai.OpenAI``
 (sync) and ``openai.AsyncOpenAI`` (async) clients.
@@ -34,7 +34,7 @@ ClientT = TypeVar("ClientT")
 
 #: Owner-attribution prefixes signet recognizes as well-formed (L2).
 #: A value lacking any of these is accepted (we don't reject bad
-#: owners — the audit chain still records exactly what the caller
+#: owners -- the audit chain still records exactly what the caller
 #: provided), but a ``UserWarning`` fires so the misuse is visible
 #: in test runs and dev consoles. Keep this in sync with the
 #: ``Owner`` model in :mod:`signet.core.owner`.

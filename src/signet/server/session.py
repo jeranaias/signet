@@ -1,15 +1,15 @@
-"""Session — cross-request state for multi-turn agents.
+"""Session -- cross-request state for multi-turn agents.
 
 A :class:`Session` groups multiple requests under a single shared
 context. Useful when the gate's decisions depend on history beyond
-the current request — e.g. cumulative token spend across a
+the current request -- e.g. cumulative token spend across a
 conversation, behavioral baselines per session, escalation chains
 that span multiple human approvals.
 
 Sessions are caller-driven: the caller asserts a session ID via the
 ``X-Signet-Session`` header. signet doesn't infer sessions from
 heuristics (cookies, owner identity) because that ambiguates
-attribution — the caller knows which conversation the request belongs
+attribution -- the caller knows which conversation the request belongs
 to; the gate doesn't have to guess.
 
 Storage: :class:`SessionStore` is a protocol; the bundled
@@ -54,11 +54,11 @@ class Session:
             and write here; signet itself doesn't interpret the
             contents. Common keys (by convention):
 
-            * ``token_budget.cumulative`` — running output-token total
+            * ``token_budget.cumulative`` -- running output-token total
               across the session
-            * ``escalation.pending`` — list of escalation decisions
+            * ``escalation.pending`` -- list of escalation decisions
               awaiting human approval
-            * ``classification.high_water_mark`` — highest declared
+            * ``classification.high_water_mark`` -- highest declared
               classification level seen this session
     """
 

@@ -1,12 +1,12 @@
-"""TribunalCheck — reference dual-judge dissent plugin.
+"""TribunalCheck -- reference dual-judge dissent plugin.
 
 Calls two caller-supplied LLM judge endpoints with the same audit
 prompt, parses each judge's verdict, and decides:
 
 * Both judges allow → allow.
 * Both judges block → block.
-* Judges disagree → escalate (let a third process — typically a
-  human — break the tie).
+* Judges disagree → escalate (let a third process -- typically a
+  human -- break the tie).
 
 The check is intentionally minimal:
 
@@ -22,7 +22,7 @@ weighted voting, dissent-score thresholds, RAG-augmented judges) live
 in the proprietary Pyros engine. This reference plugin is the
 publishable subset of that pattern.
 
-Runs at COMMITMENT stage by default — gating tool calls. Override the
+Runs at COMMITMENT stage by default -- gating tool calls. Override the
 ``stage`` class attribute on a subclass to run at INSPECTION (mid-stream)
 or RECORD (audit-only).
 """

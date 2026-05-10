@@ -1,4 +1,4 @@
-"""Redis-backed SessionStore — multi-replica session state.
+"""Redis-backed SessionStore -- multi-replica session state.
 
 Drop-in replacement for :class:`signet.server.session.InMemorySessionStore`
 when you run multiple signet replicas behind a load balancer and need
@@ -20,7 +20,7 @@ Usage::
     app = SignetApp(config=cfg, pipeline=pipeline, session_store=store)
 
 The ``ttl_seconds`` parameter sets each session's Redis TTL on every
-write — sessions inactive longer than that are evicted automatically
+write -- sessions inactive longer than that are evicted automatically
 without any cleanup work in signet.
 """
 

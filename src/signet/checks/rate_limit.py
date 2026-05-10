@@ -1,4 +1,4 @@
-"""RateLimitCheck — per-owner token-bucket throttling.
+"""RateLimitCheck -- per-owner token-bucket throttling.
 
 Each :class:`Owner` gets its own token bucket. Tokens refill at a steady
 rate and are consumed one per request. When the bucket is empty, the
@@ -28,7 +28,7 @@ requests that were always going to be blocked downstream.
 
 State is in-process by default. For multi-replica deployments, supply a
 ``state_backend`` that persists buckets across replicas (Redis, memcached,
-etc.) — the protocol is documented on :class:`RateLimitState`.
+etc.) -- the protocol is documented on :class:`RateLimitState`.
 
 Owners with type :attr:`OwnerType.UNRESOLVED` are deliberately *not*
 counted; they should never reach this check (owner-resolution refuses
@@ -107,7 +107,7 @@ class RateLimitCheck(Check):
         capacity: Maximum tokens a bucket can hold (the burst allowance).
         refill_per_second: Steady-state allowed request rate. The bucket
             refills at this rate, capped at ``capacity``. Pass ``0`` for
-            hard-quota mode (no refill, just cap) — the bucket drains
+            hard-quota mode (no refill, just cap) -- the bucket drains
             once and never replenishes until external state reset.
         state: Bucket-state backend. Defaults to
             :class:`InMemoryRateLimitState`.
@@ -142,7 +142,7 @@ class RateLimitCheck(Check):
 
     async def pre_request(self, ctx: RequestContext) -> CheckResult:
         if ctx.owner.owner_type is OwnerType.UNRESOLVED:
-            # Pass through — this should have been caught earlier.
+            # Pass through -- this should have been caught earlier.
             return CheckResult.allow()
 
         key = self._key_for(ctx.owner)
@@ -167,7 +167,7 @@ class RateLimitCheck(Check):
             bucket = _Bucket(tokens=float(self.capacity), last_refill_ts=now)
 
         # Refill since last check. With refill_per_second=0 (hard-quota
-        # mode), this is a no-op — elapsed * 0 is 0, so the bucket only
+        # mode), this is a no-op -- elapsed * 0 is 0, so the bucket only
         # ever drains.
         elapsed = max(0.0, now - bucket.last_refill_ts)
         bucket.tokens = min(

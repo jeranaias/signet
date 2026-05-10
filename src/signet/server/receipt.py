@@ -1,6 +1,6 @@
-"""ReceiptSigner — emit X-Signet-Receipt headers callers can verify offline.
+"""ReceiptSigner -- emit X-Signet-Receipt headers callers can verify offline.
 
-Every response signet returns carries a *decision receipt* — a short
+Every response signet returns carries a *decision receipt* -- a short
 signed summary of what the gate did with the request. Callers can:
 
 1. Hand the receipt to an auditor as proof the gate ran.
@@ -14,20 +14,20 @@ Receipt format (HTTP header value):
 
     signet=v1; alg=<alg>; entry=<entry_id>; key=<key_id>; sig=<hex_sig>
 
-* ``v1`` — wire version. Bump if the canonicalization or fields change.
-* ``alg`` — signing algorithm. ``hmac-sha256`` (default, no extra
+* ``v1`` -- wire version. Bump if the canonicalization or fields change.
+* ``alg`` -- signing algorithm. ``hmac-sha256`` (default, no extra
   deps) or ``ed25519`` (asymmetric, requires ``cryptography``).
-* ``entry`` — audit row UUID this receipt covers.
-* ``key`` — opaque signing-key ID; the verifier uses it to look up the
+* ``entry`` -- audit row UUID this receipt covers.
+* ``key`` -- opaque signing-key ID; the verifier uses it to look up the
   key on its own keyring.
-* ``sig`` — hex signature over the canonical entry payload.
+* ``sig`` -- hex signature over the canonical entry payload.
 
 **Choosing a signer:**
 
-* :class:`HmacReceiptSigner` (default) — fast, no extra deps, but
+* :class:`HmacReceiptSigner` (default) -- fast, no extra deps, but
   anyone who can verify can also forge. Use when verifier and proxy
   share a trust domain (your own auditor reads your own logs).
-* :class:`Ed25519ReceiptSigner` — asymmetric, requires
+* :class:`Ed25519ReceiptSigner` -- asymmetric, requires
   ``pip install signet-sign[ed25519]``. The proxy holds the private
   key; verifiers hold only the public key and **cannot forge**. Use
   when handing receipts to outside parties (customers, regulators).
@@ -79,7 +79,7 @@ class ReceiptSigner(Protocol):
 
     Implement this if you want to use an asymmetric primitive (ed25519,
     RSA-PSS) instead of the built-in HMAC. ``alg`` must be a stable,
-    distinct identifier — verifiers reject receipts whose ``alg`` does
+    distinct identifier -- verifiers reject receipts whose ``alg`` does
     not match what they expect.
     """
 
@@ -157,7 +157,7 @@ class Ed25519ReceiptSigner:
     Construct with an ed25519 private key (for signing) plus a stable
     ``key_id`` that goes into the receipt's ``key=`` field. Verifiers
     construct with the matching ed25519 public key and the same
-    ``key_id``. The verifier holds *only* the public key — it cannot
+    ``key_id``. The verifier holds *only* the public key -- it cannot
     forge new receipts.
 
     Use this when you want to hand receipts to outside parties as
@@ -285,7 +285,7 @@ class Ed25519ReceiptSigner:
         """
         if self._private is None:
             raise RuntimeError(
-                "this Ed25519ReceiptSigner is verify-only — no private key was loaded; cannot sign"
+                "this Ed25519ReceiptSigner is verify-only -- no private key was loaded; cannot sign"
             )
         payload = _serialize_for_signing(entry)
         sig = self._private.sign(payload).hex()
@@ -341,7 +341,7 @@ def parse_header(value: str) -> dict[str, str] | None:
 
     Backward compatibility: receipts emitted before the ``alg`` field
     existed (pre-v0.1.0 dev builds) are accepted and reported as
-    ``alg = "hmac-sha256"`` — that was the only algorithm that ever
+    ``alg = "hmac-sha256"`` -- that was the only algorithm that ever
     shipped without an explicit tag. Reject if you want strict.
 
     Returns ``None`` when required fields are absent or the version

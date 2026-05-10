@@ -909,3 +909,51 @@ class TestC8NegativeMaxTokens:
         ctx = _request(owner=Owner.human("alice"), body={"max_tokens": 500})
         result = await check.pre_request(ctx)
         assert result.is_allow
+
+
+# ---------------------------------------------------------------------------
+# S1 (v0.1.7) -- em-dashes in CLI surfaces don't render on cp1252
+# ---------------------------------------------------------------------------
+
+
+class TestS1HelpTextHasNoEmdash:
+    """Em-dash (U+2014) renders as ``?`` on the default Windows cp1252
+    code page. Source-code emit paths -- CLI help text, error messages,
+    audit metadata field formatters -- must use the ASCII ``--`` form.
+
+    The serve banner already used ``--`` (a v0.1.1 fix); the rest of
+    the codebase was swept in v0.1.7 (418 occurrences across 45 files).
+    This test is the regression gate.
+    """
+
+    def test_help_text_has_no_emdash(self) -> None:
+        """``signet --help`` output contains no U+2014 em-dash on
+        cp1252 stdout."""
+        import os
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-m", "signet.cli", "--help"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+        )
+        assert "—" not in result.stdout
+        assert "—" not in result.stderr
+
+    def test_serve_help_has_no_emdash(self) -> None:
+        """``signet serve --help`` is the most-read help surface; same
+        guarantee applies."""
+        import os
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-m", "signet.cli", "serve", "--help"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+        )
+        assert "—" not in result.stdout
+        assert "—" not in result.stderr

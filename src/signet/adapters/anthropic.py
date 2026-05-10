@@ -1,4 +1,4 @@
-"""Anthropic SDK adapter — wrap an anthropic client to route through signet.
+"""Anthropic SDK adapter -- wrap an anthropic client to route through signet.
 
 Usage::
 
@@ -15,7 +15,7 @@ Note: signet's proxy speaks the OpenAI chat-completions wire format.
 This adapter is for the case where you're calling an Anthropic model
 *through* an upstream that translates (LiteLLM, an OpenAI-compatible
 Anthropic gateway, or your own translation layer). signet itself does
-not translate between OpenAI and Anthropic message formats — set the
+not translate between OpenAI and Anthropic message formats -- set the
 upstream URL to a translator if you need that.
 
 If you're calling Anthropic's native Messages API directly, you have
@@ -24,7 +24,7 @@ two options:
 1. Run signet as an OpenAI-compatible front-end to a translator
    (recommended; this adapter handles the SDK side).
 2. Call Anthropic without signet for the request itself, but use
-   signet's pipeline programmatically to evaluate decisions —
+   signet's pipeline programmatically to evaluate decisions --
    construct a :class:`signet.core.pipeline.Pipeline` and call its
    hook methods directly without the HTTP proxy.
 """

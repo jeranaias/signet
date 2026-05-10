@@ -1,4 +1,4 @@
-"""KeyRing — secret key management for the HMAC audit chain.
+"""KeyRing -- secret key management for the HMAC audit chain.
 
 A :class:`KeyRing` holds the keys used to sign and verify audit entries.
 The simplest deployment uses a single key for the chain's lifetime; richer
@@ -11,7 +11,7 @@ the new key but are still chained (via ``prev_hmac``) to the last entry of
 the previous era. Verification walks the whole chain, switching keys at
 era boundaries.
 
-This module is crypto-free at the interface — it just stores key bytes.
+This module is crypto-free at the interface -- it just stores key bytes.
 The actual HMAC computation lives in :mod:`signet.audit.chain`.
 """
 
@@ -58,7 +58,7 @@ class Key:
         """Generate a new key with a cryptographically-random secret.
 
         ``length`` defaults to 32 bytes (256 bits), matching the HMAC-SHA256
-        block-internal state size — the standard recommendation.
+        block-internal state size -- the standard recommendation.
         """
         return cls(key_id=key_id, secret=secrets.token_bytes(length))
 

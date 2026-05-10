@@ -1,4 +1,4 @@
-"""Check — the policy-evaluation primitive.
+"""Check -- the policy-evaluation primitive.
 
 A :class:`Check` inspects some aspect of a request, response, or tool call and
 produces a :class:`CheckResult` saying *allow*, *block*, *redact*, or
@@ -15,7 +15,7 @@ Hook                          When the pipeline calls it
                               Block here to refuse without ever consulting
                               the model.
 :meth:`inspect_response_chunk` On every streamed chunk. Block here to abort
-                              mid-stream — important for spillage detection.
+                              mid-stream -- important for spillage detection.
 :meth:`inspect_tool_call`     When the model emits a tool call. Block here to
                               prevent execution of a specific tool invocation.
 :meth:`post_complete`         After the response has finished. Used by audit
@@ -82,7 +82,7 @@ class CheckResult:
     def __post_init__(self) -> None:
         # F2 (v0.1.7): ``replacement_content`` is meaningful only on a
         # REDACT decision. A BLOCK or ALLOW result that carries
-        # ``replacement_content`` is operator-authored confusion — the
+        # ``replacement_content`` is operator-authored confusion -- the
         # field would land in audit metadata or a 4xx response body,
         # leaking the would-be replacement payload to consumers that
         # never asked for it. Refuse at construction so the bug shows
@@ -166,7 +166,7 @@ class Check:
     """Maximum wall-clock time the pipeline waits for any single hook on
     this check. ``None`` (default) means no timeout; the pipeline waits
     indefinitely. When set and exceeded, the pipeline treats the check
-    as having returned ``CheckResult.block(...)`` with a timeout reason —
+    as having returned ``CheckResult.block(...)`` with a timeout reason --
     fail-closed semantics. Set per-check to bound external dependencies
     (LLM-judge calls, sandbox runners) so a stuck dependency cannot
     halt the proxy."""
@@ -175,7 +175,7 @@ class Check:
     """Sub-ordering within a stage. Lower runs earlier, ties preserve
     registration order. Defaults to ``0``. The pipeline still groups by
     :class:`Stage` first; ``priority`` only matters between two checks
-    that share a stage. Use to enforce dependencies — e.g.
+    that share a stage. Use to enforce dependencies -- e.g.
     :class:`signet.checks.rate_limit.RateLimitCheck` declares
     ``priority=100`` so it runs after content-scanning ADMISSION checks
     and a refused request never costs a token. Set ``priority < 0`` to
@@ -208,12 +208,12 @@ class Check:
                 "`name` class attribute"
             )
         # ``stage`` must be set somewhere in the subclass chain. Merely
-        # inheriting ``Check.stage = Stage.ADMISSION`` doesn't count —
+        # inheriting ``Check.stage = Stage.ADMISSION`` doesn't count --
         # the contract is that subclasses declare lifecycle explicitly.
         if not _explicitly_declared("stage"):
             raise TypeError(
                 f"Check subclass {cls.__name__!r} must explicitly set `stage` "
-                "(inheriting from Check default Stage.ADMISSION is not sufficient — "
+                "(inheriting from Check default Stage.ADMISSION is not sufficient -- "
                 "be explicit about lifecycle)."
             )
         if not isinstance(getattr(cls, "stage", None), Stage):

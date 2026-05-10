@@ -1,4 +1,4 @@
-"""ScopeDriftCheck — abort when output exceeds the originally-approved scope.
+"""ScopeDriftCheck -- abort when output exceeds the originally-approved scope.
 
 Authorization granted at request time has bounds. A request approved
 for 200 output tokens shouldn't silently become a 50,000-token output;
@@ -20,7 +20,7 @@ Three drift dimensions are checked out of the box:
 2. **Length drift** (character-level): output character count exceeds
    ``hard_char_cap`` (default 4x the per-token-2-char rule of thumb on
    ``max_tokens``). **Requires ``max_tokens`` to be a positive integer
-   in the request body** — without it the character cap has no
+   in the request body** -- without it the character cap has no
    anchor and length drift is not enforced (C7.3). Callers that need
    length drift detection MUST set ``max_tokens`` on every request.
 3. **Content drift via classification re-scan**: output contains marker
@@ -55,7 +55,7 @@ from signet.core.stage import Stage
 # coupling between checks.
 #
 # v0.1.7 expansion: the v0.1.6 dictionary missed the most obvious
-# operator spellings — plain ``(SECRET)``, ``(TOP SECRET)``,
+# operator spellings -- plain ``(SECRET)``, ``(TOP SECRET)``,
 # ``(CONFIDENTIAL)``, ``(C)``, the lowercase variants of every slash
 # marker, and the standalone caveats (``//NOFORN``, ``//FVEY``,
 # ``//ORCON``, ``//IMCON``). Matching is now case-insensitive by default
@@ -79,7 +79,7 @@ _CLASSIFICATION_MARKERS: dict[str, int] = {
     "(C)": 1,
     "(U)": 0,
     "(U//FOUO)": 1,
-    # Plain parenthesized full-spellings — the most obvious surface a
+    # Plain parenthesized full-spellings -- the most obvious surface a
     # naive model trips on first.
     "(SECRET)": 2,
     "(TOP SECRET)": 3,
@@ -127,7 +127,7 @@ class ScopeDriftCheck(Check):
     check_classification_drift: bool = True
     markers: dict[str, int] | None = None
     case_sensitive: bool = False
-    """Whether marker matching respects case. Defaults to ``False`` —
+    """Whether marker matching respects case. Defaults to ``False`` --
     a model that hallucinates ``secret//noforn`` should still trip the
     drift detector. Set ``True`` if your corpus contains benign
     lowercase mentions of marker-like substrings (e.g. legal review
@@ -150,7 +150,7 @@ class ScopeDriftCheck(Check):
         self._marker_levels_ci = {k.lower(): v for k, v in self._marker_levels.items()}
         # Pre-compile alternation of markers, longest-first so multi-token
         # markers match before substrings of themselves. Matching is
-        # case-insensitive by default — catches the lowercase
+        # case-insensitive by default -- catches the lowercase
         # ``secret//noforn`` and ``Secret//NoForN`` variants that a
         # hallucinating model frequently emits, at the cost of accepting
         # a slightly broader false-positive surface.
