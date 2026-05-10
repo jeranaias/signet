@@ -148,7 +148,21 @@ class RateLimitCheck(Check):
         key = self._key_for(ctx.owner)
         now = time.monotonic()
 
-        bucket = self._state.get(key)
+        # Fail-closed posture against backend errors (Redis down, network
+        # partition, etc.). The docstring's ``fail-closed`` promise is
+        # only true if a flaky state backend produces a ``BLOCK``
+        # decision rather than letting the exception become a 500 at the
+        # proxy. We catch broadly because backend implementations may
+        # raise anything from ``ConnectionError`` to provider-specific
+        # subclasses; the audit metadata captures the type for triage.
+        try:
+            bucket = self._state.get(key)
+        except Exception as exc:
+            return CheckResult.block(
+                "rate-limit backend unavailable; failing closed",
+                backend_error=type(exc).__name__,
+                backend_message=str(exc),
+            )
         if bucket is None:
             bucket = _Bucket(tokens=float(self.capacity), last_refill_ts=now)
 
@@ -170,7 +184,14 @@ class RateLimitCheck(Check):
                 wait_meta: float | None = None
             else:
                 wait_meta = round((1.0 - bucket.tokens) / self.refill_per_second, 3)
-            self._state.set(key, bucket)
+            try:
+                self._state.set(key, bucket)
+            except Exception as exc:
+                return CheckResult.block(
+                    "rate-limit backend unavailable; failing closed",
+                    backend_error=type(exc).__name__,
+                    backend_message=str(exc),
+                )
             return CheckResult.block(
                 "rate limit exceeded",
                 retry_after_seconds=wait_meta,
@@ -180,7 +201,14 @@ class RateLimitCheck(Check):
             )
 
         bucket.tokens -= 1.0
-        self._state.set(key, bucket)
+        try:
+            self._state.set(key, bucket)
+        except Exception as exc:
+            return CheckResult.block(
+                "rate-limit backend unavailable; failing closed",
+                backend_error=type(exc).__name__,
+                backend_message=str(exc),
+            )
         return CheckResult.allow(
             "rate limit ok",
             tokens_remaining=round(bucket.tokens, 3),

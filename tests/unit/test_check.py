@@ -78,11 +78,25 @@ class TestCheckSubclassValidation:
                 # name omitted
 
     def test_subclass_without_stage_raises_at_definition(self) -> None:
-        with pytest.raises(TypeError, match="`stage` to a Stage"):
+        with pytest.raises(TypeError, match="`stage` must be a Stage"):
 
             class _BadCheck(Check):
                 name = "bad"
                 stage = "admission"  # type: ignore[assignment]  # not a Stage enum
+
+    def test_subclass_inheriting_default_stage_raises(self) -> None:
+        """v0.1.7 E5 regression: a subclass that omits ``stage`` and
+        inherits ``Check.stage = Stage.ADMISSION`` from the base must
+        be rejected. The contract is that lifecycle is declared
+        explicitly; silent ADMISSION default has been a footgun for
+        checks intended to run during INSPECTION but written without
+        a stage line (they then see an empty accumulated_text)."""
+        with pytest.raises(TypeError, match="must explicitly set `stage`"):
+
+            class _BadCheck(Check):
+                name = "no_stage"
+                # stage omitted — inherits Stage.ADMISSION but the
+                # validator should refuse rather than accept silently.
 
     def test_well_formed_subclass_accepts(self) -> None:
         class _GoodCheck(Check):

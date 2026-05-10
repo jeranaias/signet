@@ -291,8 +291,19 @@ class PromptInjectionCheck(Check):
             Severity.LOW: "allow",
         }
     )
-    base64_min_length: int = 64
+    # v0.1.7: lowered from 64 to 24 chars. The shortest interesting
+    # English-language injection ("ignore previous instructions",
+    # 28 raw bytes → 40 chars b64) was previously below the floor and
+    # silently bypassed the decoder. 24 catches anything that decodes
+    # to >= ~17 bytes of attack payload while still skipping the noise
+    # of short hashes / IDs.
+    base64_min_length: int = 24
     scan_decoded_base64: bool = True
+    # Hard cap on the length of input scanned. A 1MB payload at
+    # 256ms/scan blocks the asyncio loop long enough to matter under
+    # concurrency. Larger inputs are truncated at this boundary and an
+    # ``scan_truncated=True`` flag is emitted in audit metadata.
+    scan_max_chars: int = 512 * 1024
 
     def __post_init__(self) -> None:
         for sev, action in self.severity_actions.items():
@@ -301,11 +312,28 @@ class PromptInjectionCheck(Check):
                     f"severity action for {sev.value!r} must be block|escalate|allow, "
                     f"got {action!r}"
                 )
+        if self.base64_min_length < 4:
+            raise ValueError(
+                f"base64_min_length must be >= 4 (a minimum of one decoded byte), "
+                f"got {self.base64_min_length}"
+            )
+        if self.scan_max_chars < 1:
+            raise ValueError(f"scan_max_chars must be >= 1, got {self.scan_max_chars}")
 
     async def pre_request(self, ctx: RequestContext) -> CheckResult:
         text = self._extract_text(ctx.body)
         if not text:
             return CheckResult.allow()
+
+        # Bound the scan input. A 1MB user message can hold the asyncio
+        # loop for ~250ms in the regex search alone; 50 concurrent
+        # malicious senders multiply that into multi-second p99 latency.
+        # Truncate at ``scan_max_chars`` and surface the truncation in
+        # audit metadata so an analyst can spot the pattern.
+        scan_truncated = False
+        if len(text) > self.scan_max_chars:
+            text = text[: self.scan_max_chars]
+            scan_truncated = True
 
         # Scan both the raw text AND the normalized form. Scanning raw
         # catches patterns the normalizer might inadvertently break;
@@ -329,13 +357,19 @@ class PromptInjectionCheck(Check):
                     )
 
         if not matches:
+            if scan_truncated:
+                return CheckResult.allow(
+                    "no injection patterns in scanned prefix",
+                    scan_truncated=True,
+                    scan_max_chars=self.scan_max_chars,
+                )
             return CheckResult.allow()
 
         # Pick the highest-severity match (block > escalate > allow ordering)
         worst = max(matches, key=lambda m: -list(Severity).index(m["severity"]))
         action = self.severity_actions[worst["severity"]]
 
-        meta = {
+        meta: dict[str, Any] = {
             "rule": worst["rule"],
             "severity": worst["severity"].value,
             "match_count": len(matches),
@@ -343,6 +377,9 @@ class PromptInjectionCheck(Check):
         }
         if "source" in worst:
             meta["match_source"] = worst["source"]
+        if scan_truncated:
+            meta["scan_truncated"] = True
+            meta["scan_max_chars"] = self.scan_max_chars
 
         if action == "block":
             return CheckResult.block(
@@ -431,6 +468,15 @@ class PromptInjectionCheck(Check):
 
     @staticmethod
     def _extract_text(body: dict[str, Any]) -> str:
+        # v0.1.7: messages are joined with a single space rather than a
+        # newline. The override-pattern regex uses ``[^.!?\n]`` as its
+        # negative class, so a newline between two adjacent messages
+        # would split a phrase like ``"Please ignore"`` /
+        # ``"all previous instructions"`` and let the attack through.
+        # A space is a benign separator: it never short-circuits the
+        # regex's "no sentence terminator between the verb and noun"
+        # guard, but it preserves word boundaries so
+        # ``"foo"+"bar"`` doesn't fuse into ``"foobar"``.
         parts: list[str] = []
         for msg in body.get("messages", ()):
             if not isinstance(msg, dict):
@@ -442,4 +488,4 @@ class PromptInjectionCheck(Check):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "text":
                         parts.append(str(part.get("text", "")))
-        return "\n".join(parts)
+        return " ".join(parts)

@@ -170,13 +170,37 @@ class Check:
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        if not getattr(cls, "name", None):
+        # Walk every ancestor between ``cls`` and ``Check`` (exclusive of
+        # both) so an intermediate abstract base may legitimately set
+        # ``name`` / ``stage`` for its leaves to inherit. This keeps the
+        # contract honest while allowing small check-class hierarchies.
+        intermediate = [b for b in cls.__mro__[1:] if b is not Check and b is not object]
+
+        def _explicitly_declared(attr: str) -> bool:
+            if attr in cls.__dict__:
+                return True
+            return any(attr in b.__dict__ for b in intermediate)
+
+        # ``name`` must be set somewhere in the subclass chain AND be a
+        # non-empty string. Inheriting the empty-string default from
+        # ``Check`` doesn't count.
+        if not _explicitly_declared("name") or not getattr(cls, "name", ""):
             raise TypeError(
-                f"Check subclass {cls.__name__!r} must set a non-empty `name` class attribute"
+                f"Check subclass {cls.__name__!r} must set a non-empty "
+                "`name` class attribute"
+            )
+        # ``stage`` must be set somewhere in the subclass chain. Merely
+        # inheriting ``Check.stage = Stage.ADMISSION`` doesn't count —
+        # the contract is that subclasses declare lifecycle explicitly.
+        if not _explicitly_declared("stage"):
+            raise TypeError(
+                f"Check subclass {cls.__name__!r} must explicitly set `stage` "
+                "(inheriting from Check default Stage.ADMISSION is not sufficient — "
+                "be explicit about lifecycle)."
             )
         if not isinstance(getattr(cls, "stage", None), Stage):
             raise TypeError(
-                f"Check subclass {cls.__name__!r} must set `stage` to a Stage enum value"
+                f"Check subclass {cls.__name__!r} `stage` must be a Stage enum value"
             )
 
     async def pre_request(self, ctx: RequestContext) -> CheckResult:

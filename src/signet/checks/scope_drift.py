@@ -47,17 +47,46 @@ from signet.core.stage import Stage
 # Markers we look for in output that imply a classification level. Same
 # alias map shape as ClassificationGateCheck but kept local to avoid
 # coupling between checks.
+#
+# v0.1.7 expansion: the v0.1.6 dictionary missed the most obvious
+# operator spellings — plain ``(SECRET)``, ``(TOP SECRET)``,
+# ``(CONFIDENTIAL)``, ``(C)``, the lowercase variants of every slash
+# marker, and the standalone caveats (``//NOFORN``, ``//FVEY``,
+# ``//ORCON``, ``//IMCON``). Matching is now case-insensitive by default
+# (see :attr:`ScopeDriftCheck.case_sensitive`).
+#
+# Levels follow the USG ladder: 0=UNCLASS, 1=CUI/FOUO, 2=SECRET, 3=TS,
+# 4=TS/SCI. Standalone caveats inherit a SECRET-level floor because a
+# ``//NOFORN`` qualifier alone implies the body is at least classified
+# even when the caveat is paired with a missing explicit level.
 _CLASSIFICATION_MARKERS: dict[str, int] = {
+    # Slash-form full markers
     "SECRET//NOFORN": 2,
     "SECRET//REL": 2,
-    "(S)": 2,
-    "(S//NF)": 2,
     "TOP SECRET//SCI": 4,
     "TS//SCI": 4,
+    # Parenthesized abbreviations
+    "(S)": 2,
+    "(S//NF)": 2,
     "(TS)": 3,
     "(TS//SCI)": 4,
+    "(C)": 1,
+    "(U)": 0,
+    "(U//FOUO)": 1,
+    # Plain parenthesized full-spellings — the most obvious surface a
+    # naive model trips on first.
+    "(SECRET)": 2,
+    "(TOP SECRET)": 3,
+    "(CONFIDENTIAL)": 1,
+    # CUI / FOUO family
     "CUI//": 1,
     "FOUO": 1,
+    # Standalone caveats. A model that emits ``//NOFORN`` on its own
+    # has implicitly leaked at least classification-level intent.
+    "//NOFORN": 2,
+    "//FVEY": 2,
+    "//ORCON": 2,
+    "//IMCON": 2,
 }
 
 
@@ -91,9 +120,18 @@ class ScopeDriftCheck(Check):
     char_per_token_estimate: int = 4
     check_classification_drift: bool = True
     markers: dict[str, int] | None = None
+    case_sensitive: bool = False
+    """Whether marker matching respects case. Defaults to ``False`` —
+    a model that hallucinates ``secret//noforn`` should still trip the
+    drift detector. Set ``True`` if your corpus contains benign
+    lowercase mentions of marker-like substrings (e.g. legal review
+    drafts referencing ``"the secret//noforn handling rules"``)."""
 
     _classification_pattern: re.Pattern[str] = field(init=False, repr=False)
     _marker_levels: dict[str, int] = field(init=False, repr=False)
+    # Lowercase-keyed view for case-insensitive lookups. ``_marker_levels``
+    # preserves the configured casing so it remains operator-readable.
+    _marker_levels_ci: dict[str, int] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.token_tolerance < 0:
@@ -103,12 +141,18 @@ class ScopeDriftCheck(Check):
         self._marker_levels = (
             dict(self.markers) if self.markers is not None else dict(_CLASSIFICATION_MARKERS)
         )
+        self._marker_levels_ci = {k.lower(): v for k, v in self._marker_levels.items()}
         # Pre-compile alternation of markers, longest-first so multi-token
-        # markers match before substrings of themselves.
+        # markers match before substrings of themselves. Matching is
+        # case-insensitive by default — catches the lowercase
+        # ``secret//noforn`` and ``Secret//NoForN`` variants that a
+        # hallucinating model frequently emits, at the cost of accepting
+        # a slightly broader false-positive surface.
         ordered = sorted(self._marker_levels, key=len, reverse=True)
         escaped = [re.escape(m) for m in ordered]
+        flags = 0 if self.case_sensitive else re.IGNORECASE
         self._classification_pattern = (
-            re.compile("|".join(escaped)) if escaped else re.compile(r"(?!x)x")
+            re.compile("|".join(escaped), flags) if escaped else re.compile(r"(?!x)x")
         )
 
     async def inspect_response_chunk(self, ctx: ResponseContext, chunk: str) -> CheckResult:
@@ -133,7 +177,18 @@ class ScopeDriftCheck(Check):
             match = self._classification_pattern.search(ctx.accumulated_text)
             if match:
                 marker = match.group(0)
-                marker_level = self._marker_levels.get(marker, 99)
+                # Look up via the case-folded view so a lowercase
+                # ``secret//noforn`` match still resolves to its
+                # SECRET-level configured value. ``99`` is the
+                # paranoid fallback for an unrecognized match (which
+                # shouldn't happen since the regex is built from the
+                # same dict, but keeps the invariant safe).
+                if self.case_sensitive:
+                    marker_level = self._marker_levels.get(marker)
+                else:
+                    marker_level = self._marker_levels_ci.get(marker.lower())
+                if marker_level is None:
+                    marker_level = 99
                 if marker_level > request_level:
                     return CheckResult.block(
                         f"output marker {marker!r} implies classification level "

@@ -70,6 +70,43 @@ _HEADER_AGENT_ID = "X-Agent-Id"
 _HEADER_POLICY_NAME = "X-Policy-Name"
 _HEADER_POLICY_VERSION = "X-Policy-Version"
 
+# Maximum length we accept for any owner / policy principal. Generous
+# for legitimate identifiers (UUIDs, fully-qualified emails, agent
+# slugs) yet small enough to keep audit-row size bounded against a
+# noisy or malicious caller.
+_MAX_PRINCIPAL_LEN = 256
+
+# CR / LF / NUL would let a caller forge log lines in any audit
+# consumer that splits on newlines (Splunk, Loki, plain ``tail``).
+_FORBIDDEN_OWNER_CHARS = frozenset(("\r", "\n", "\x00"))
+
+
+def _sanitize_principal(value: str) -> str | None:
+    """Return a clean principal or ``None`` to signal rejection.
+
+    Rejection cases:
+
+    * empty / whitespace-only after stripping
+    * contains CR / LF / NUL (audit-line forgery)
+    * contains any other ASCII control character below ``\\x20``
+      (regular ASCII space is preserved only in the interior of the
+      principal — leading / trailing whitespace is stripped first)
+    * exceeds :data:`_MAX_PRINCIPAL_LEN` characters
+    """
+    if not value:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    if len(stripped) > _MAX_PRINCIPAL_LEN:
+        return None
+    if any(c in _FORBIDDEN_OWNER_CHARS for c in stripped):
+        return None
+    # Reject any other C0 control characters and DEL (0x7F).
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in stripped):
+        return None
+    return stripped
+
 
 class OwnerResolutionCheck(Check):
     """Resolve and require a commit owner before forwarding."""
@@ -130,15 +167,21 @@ class OwnerResolutionCheck(Check):
         # Precedence: human > agent > policy. If two are sent the human
         # claim wins and the others are silently dropped — documented in
         # the module docstring.
+        #
+        # All extracted principals are routed through ``_sanitize_principal``
+        # to reject CR/LF/NUL, other control chars, and over-length values.
+        # On rejection we return None so the ``require_owner=True`` path
+        # produces the standard refusal — a forged owner_id never reaches
+        # the audit row.
         co = get_header_ci(headers, _HEADER_COMMIT_OWNER)
         if co.startswith("human:"):
-            principal = co[len("human:") :]
+            principal = _sanitize_principal(co[len("human:") :])
             if principal:
                 return Owner.human(principal)
 
         ai = get_header_ci(headers, _HEADER_AGENT_ID)
         if ai.startswith("agent:"):
-            agent_id = ai[len("agent:") :]
+            agent_id = _sanitize_principal(ai[len("agent:") :])
             if agent_id:
                 return Owner.agent(agent_id)
         # Bare X-Agent-Id values without the agent: prefix are NOT accepted.
@@ -146,12 +189,26 @@ class OwnerResolutionCheck(Check):
         # and so an attacker can't bypass owner resolution by sending an
         # arbitrary string in X-Agent-Id.
 
-        pn = get_header_ci(headers, _HEADER_POLICY_NAME)
-        if pn:
-            pv = get_header_ci(headers, _HEADER_POLICY_VERSION)
-            # Policy name + version are joined with a literal '@'. If
-            # your policy name contains '@', supply the joined form
-            # yourself in X-Policy-Name and leave X-Policy-Version unset.
-            return Owner.policy(f"{pn}@{pv}" if pv else pn)
+        pn_raw = get_header_ci(headers, _HEADER_POLICY_NAME)
+        if pn_raw:
+            pn = _sanitize_principal(pn_raw)
+            if pn is None:
+                return None
+            pv_raw = get_header_ci(headers, _HEADER_POLICY_VERSION)
+            if pv_raw:
+                pv = _sanitize_principal(pv_raw)
+                if pv is None:
+                    return None
+                # Policy name + version are joined with a literal '@'. If
+                # your policy name contains '@', supply the joined form
+                # yourself in X-Policy-Name and leave X-Policy-Version unset.
+                joined = f"{pn}@{pv}"
+            else:
+                joined = pn
+            # Re-cap on the joined form so name+version can't sneak past
+            # together what would be rejected individually.
+            if len(joined) > _MAX_PRINCIPAL_LEN:
+                return None
+            return Owner.policy(joined)
 
         return None

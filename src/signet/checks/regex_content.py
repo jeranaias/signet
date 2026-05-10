@@ -16,6 +16,17 @@ than via a constructor flag (which would defeat
 :class:`signet.core.pipeline.Pipeline`'s stage-based ordering).
 
 Pattern format: any Python ``re`` regex. Compiled once at construction.
+
+**ReDoS protection (v0.1.7).** When the third-party ``regex`` package
+is installed, every match is run with a per-pattern wall-clock
+``timeout_seconds`` (default 0.5s). Pathological inputs against
+catastrophic-backtracking patterns (``^(a+)+$`` against
+``"a"*30 + "X"``) are interrupted mid-search and produce a BLOCK
+result rather than holding the asyncio event loop for tens of
+seconds. Without ``regex`` the check falls back to ``re``; the
+timeout is best-effort and an attacker-controlled pattern can still
+hang the loop. ``pip install regex`` (or ``signet-sign[regex]``) for
+the production-grade behaviour.
 """
 
 from __future__ import annotations
@@ -28,6 +39,30 @@ from typing import Any
 from signet.core.check import Check, CheckResult
 from signet.core.context import RequestContext, ResponseContext
 from signet.core.stage import Stage
+
+# Prefer the third-party ``regex`` module when available; only it
+# supports a ``timeout`` kwarg that interrupts the C-level matcher
+# mid-search. Without it, ``re.search`` is uninterruptible from Python
+# and a pathological backtracking pattern hangs the asyncio loop.
+#
+# The ``regex`` package raises Python's built-in :class:`TimeoutError`
+# when a search exceeds the configured wall-clock budget — there is
+# no ``regex.TimeoutError`` attribute. We bind the matcher to that
+# concrete type so the fallback ``re`` path doesn't accidentally
+# swallow unrelated ``TimeoutError`` instances raised elsewhere.
+try:  # pragma: no cover - import-time branch
+    import regex as _regex_module
+
+    _HAS_REGEX_TIMEOUT = True
+    _RegexTimeoutError: type[BaseException] = TimeoutError
+except ImportError:  # pragma: no cover - import-time branch
+    _regex_module = re  # type: ignore[assignment]
+    _HAS_REGEX_TIMEOUT = False
+
+    class _NeverRaisedTimeout(Exception):
+        """Stand-in so ``except`` blocks compile without ``regex``."""
+
+    _RegexTimeoutError = _NeverRaisedTimeout
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,40 +78,76 @@ class Pattern:
         label: Short tag used in audit reasons and metadata. Pick
             something policy-meaningful, e.g. ``"ssn"``, ``"api-key"``,
             ``"profanity"``.
+        timeout_seconds: Wall-clock cap on a single search against this
+            pattern. Defaults to 0.5s. Only honored when the
+            third-party ``regex`` package is installed; the standard
+            library ``re`` cannot be interrupted from Python.
     """
 
     pattern: str
     action: str = "block"
     replacement: str = "[REDACTED]"
     label: str = "match"
+    timeout_seconds: float = 0.5
 
     def __post_init__(self) -> None:
         if self.action not in ("block", "redact"):
             raise ValueError(f"action must be 'block' or 'redact', got {self.action!r}")
+        if self.timeout_seconds <= 0:
+            raise ValueError(
+                f"timeout_seconds must be > 0, got {self.timeout_seconds!r}"
+            )
 
 
-def _compile_patterns(patterns: Iterable[Pattern]) -> tuple[tuple[Pattern, re.Pattern[str]], ...]:
-    """Compile each pattern once at construction; raise on bad regex."""
-    out: list[tuple[Pattern, re.Pattern[str]]] = []
+def _compile_patterns(patterns: Iterable[Pattern]) -> tuple[tuple[Pattern, Any], ...]:
+    """Compile each pattern once at construction; raise on bad regex.
+
+    Uses the ``regex`` module when present so the compiled pattern
+    supports the ``timeout=`` kwarg at search time. Falls back to the
+    standard library ``re`` when ``regex`` isn't installed; in that
+    fallback path patterns are still compiled but cannot be
+    interrupted mid-match.
+    """
+    out: list[tuple[Pattern, Any]] = []
     for p in patterns:
         try:
-            out.append((p, re.compile(p.pattern)))
-        except re.error as exc:
+            compiled = _regex_module.compile(p.pattern)
+        except (_regex_module.error, re.error) as exc:  # type: ignore[attr-defined]
             raise ValueError(f"invalid regex for pattern {p.label!r}: {exc}") from exc
+        out.append((p, compiled))
     return tuple(out)
 
 
 def _scan(
     text: str,
-    compiled: tuple[tuple[Pattern, re.Pattern[str]], ...],
+    compiled: tuple[tuple[Pattern, Any], ...],
 ) -> tuple[CheckResult, ...]:
     """Run every compiled pattern against ``text``.
 
-    Returns one CheckResult per match. Empty if no matches.
+    Returns one CheckResult per match. Empty if no matches. A pattern
+    that times out (``regex.TimeoutError``) produces a BLOCK result
+    flagged with ``redos_timeout=True`` — fail-closed against
+    catastrophic-backtracking inputs that an attacker can craft against
+    operator-supplied patterns.
     """
     results: list[CheckResult] = []
-    for spec, regex in compiled:
-        if not regex.search(text):
+    for spec, regex_pattern in compiled:
+        try:
+            if _HAS_REGEX_TIMEOUT:
+                match = regex_pattern.search(text, timeout=spec.timeout_seconds)
+            else:
+                match = regex_pattern.search(text)
+        except _RegexTimeoutError:
+            results.append(
+                CheckResult.block(
+                    f"pattern {spec.label!r} timed out (potential ReDoS)",
+                    pattern_label=spec.label,
+                    redos_timeout=True,
+                    timeout_seconds=spec.timeout_seconds,
+                )
+            )
+            continue
+        if not match:
             continue
         if spec.action == "block":
             results.append(
@@ -86,7 +157,23 @@ def _scan(
                 )
             )
         else:  # redact
-            redacted = regex.sub(spec.replacement, text)
+            try:
+                if _HAS_REGEX_TIMEOUT:
+                    redacted = regex_pattern.sub(
+                        spec.replacement, text, timeout=spec.timeout_seconds
+                    )
+                else:
+                    redacted = regex_pattern.sub(spec.replacement, text)
+            except _RegexTimeoutError:
+                results.append(
+                    CheckResult.block(
+                        f"pattern {spec.label!r} timed out during redact (potential ReDoS)",
+                        pattern_label=spec.label,
+                        redos_timeout=True,
+                        timeout_seconds=spec.timeout_seconds,
+                    )
+                )
+                continue
             results.append(
                 CheckResult.redact(
                     redacted,
