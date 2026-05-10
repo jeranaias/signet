@@ -42,12 +42,13 @@ import json
 import logging
 import os
 import tempfile
+import zlib
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from signet.audit.backend import JsonlBackend
+from signet.audit.backend import JsonlBackend, exclusive_log_lock
 from signet.audit.chain import HmacChain
 from signet.core.audit import AuditEntry, Decision
 from signet.core.owner import Owner
@@ -464,12 +465,28 @@ def _read_archive(path: Path) -> tuple[ArchiveHeader, MerkleTree, list[AuditEntr
     if entries_end == -1:
         raise ValueError(f"archive {path}: ENTRIES-END not found")
     gz_blob = raw[cursor:entries_end]
-    jsonl = gzip.decompress(gz_blob).decode("utf-8")
+    # A1: a corrupted gzip body raises ``zlib.error`` (or
+    # ``gzip.BadGzipFile`` on some malformations); a corrupt gzip
+    # can also yield bytes that aren't valid UTF-8. Translate all of
+    # those into a ``ValueError`` the verifier already knows how to
+    # map to ``ARCHIVE_FORMAT_INVALID``.
+    try:
+        jsonl = gzip.decompress(gz_blob).decode("utf-8")
+    except (zlib.error, gzip.BadGzipFile, UnicodeDecodeError, OSError) as exc:
+        raise ValueError(
+            f"archive {path}: entries section is corrupt: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     entries: list[AuditEntry] = []
     for line in jsonl.splitlines():
         if not line.strip():
             continue
-        entries.append(AuditEntry.from_dict(json.loads(line)))
+        try:
+            entries.append(AuditEntry.from_dict(json.loads(line)))
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"archive {path}: archived JSONL is corrupt: {exc}"
+            ) from exc
 
     if len(entries) != header.entry_count:
         raise ValueError(
@@ -497,6 +514,7 @@ def compact_audit_log(
     output: Path,
     archive_format_version: int = ARCHIVE_FORMAT_VERSION,
     quiesce_required: bool = True,
+    force: bool = False,
 ) -> CompactionResult | None:
     """Compact entries with timestamps strictly before ``before`` into
     ``output``, replace them in the live chain with a single compaction
@@ -528,6 +546,10 @@ def compact_audit_log(
         quiesce_required: Marker for the contract — the chain must be
             quiesced (no concurrent writers) before this is called.
             Reserved for a future runtime check; currently always True.
+        force: When True, overwrite an existing archive at ``output``.
+            Default False refuses with :class:`FileExistsError`,
+            because clobbering the only non-tampered copy of compacted
+            entries is an unsafe default.
 
     Returns:
         A :class:`CompactionResult` on success, or ``None`` if no
@@ -535,18 +557,43 @@ def compact_audit_log(
 
     Raises:
         ValueError: ``archive_format_version`` is not the supported
-            version, or the chain is empty.
+            version, the chain is empty, or the eligible range
+            includes a previous compaction marker (re-compacting over
+            an existing marker would break ``verify_with_archives``;
+            v0.1.7 refuses cleanly. Multi-archive bridging is a
+            Phase-2 item).
+        FileExistsError: ``output`` already exists and ``force`` is
+            False. Pass ``force=True`` to overwrite.
         OSError: An I/O error occurred during archive write or live
             log rewrite.
 
     Concurrency contract: the live chain MUST be quiesced before this
-    call. Concurrent writes during compaction WILL corrupt the chain.
-    See ``docs/audit-archive-format.md`` for the operator playbook.
+    call. The compactor takes a cross-process exclusive lock on the
+    live log's sidecar (``<path>.lock``) so
+    :class:`FileLockingJsonlBackend` writers block on the same lock
+    for the duration of the rewrite — but other backends (or external
+    processes writing the file directly) are not constrained. See
+    ``docs/audit-archive-format.md`` for the operator playbook.
     """
     if archive_format_version != ARCHIVE_FORMAT_VERSION:
         raise ValueError(
             f"compactor only emits archive format version "
             f"{ARCHIVE_FORMAT_VERSION}; got {archive_format_version}"
+        )
+
+    # Resolve the archive output path. We accept relative paths but the
+    # marker payload records an absolute resolved path so verifier
+    # lookups don't depend on cwd.
+    output = Path(output).resolve()
+
+    # A4: refuse to silently overwrite an existing archive. Operators
+    # who really mean it pass ``force=True`` (the CLI surfaces this as
+    # ``--force``). Default is refusal because an archive on disk may
+    # be the only non-tampered copy of those entries.
+    if output.exists() and not force:
+        raise FileExistsError(
+            f"refusing to overwrite existing archive {output}; "
+            f"pass force=True to override"
         )
 
     # Normalize cutoff to UTC. Naive datetimes are assumed UTC for
@@ -561,99 +608,128 @@ def compact_audit_log(
     delta = before_utc - epoch
     cutoff_ns = (delta.days * 86_400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1_000
 
-    # Read the entire chain. We need every entry both to identify
-    # eligible ones and to rewrite the live log atomically afterwards.
-    all_entries = list(backend.iter_entries())
-    if not all_entries:
-        return None
+    # A7: hold an exclusive lock on the live log's sidecar so any
+    # ``FileLockingJsonlBackend`` writers block on the same lock for
+    # the duration of the read + archive-write + rewrite. This closes
+    # the silent-data-loss footgun where a concurrent appender's open
+    # handle on the live log would race with the compactor's
+    # ``os.replace`` on Windows. Plain ``JsonlBackend`` (single-writer)
+    # is unconstrained — but it isn't multi-writer safe to begin
+    # with.
+    with exclusive_log_lock(backend.path):
+        # Read the entire chain. We need every entry both to identify
+        # eligible ones and to rewrite the live log atomically afterwards.
+        all_entries = list(backend.iter_entries())
+        if not all_entries:
+            return None
 
-    eligible: list[AuditEntry] = []
-    retained: list[AuditEntry] = []
-    for entry in all_entries:
-        if entry.ts_ns < cutoff_ns:
-            eligible.append(entry)
-        else:
-            retained.append(entry)
+        eligible: list[AuditEntry] = []
+        retained: list[AuditEntry] = []
+        for entry in all_entries:
+            if entry.ts_ns < cutoff_ns:
+                eligible.append(entry)
+            else:
+                retained.append(entry)
 
-    if not eligible:
-        # Nothing to compact. No archive, no marker. Operators relying on
-        # idempotent invocation get the right behavior.
-        logger.info("compact_audit_log: no entries before cutoff %s; no-op", before_utc.isoformat())
-        return None
+        if not eligible:
+            # Nothing to compact. No archive, no marker. Operators relying on
+            # idempotent invocation get the right behavior.
+            logger.info(
+                "compact_audit_log: no entries before cutoff %s; no-op",
+                before_utc.isoformat(),
+            )
+            return None
 
-    # Build the Merkle tree over the eligible entries' HMAC fields.
-    tree = MerkleTree.from_entries(eligible)
-    range_start = _ts_ns_to_iso(eligible[0].ts_ns)
-    range_end = _ts_ns_to_iso(eligible[-1].ts_ns)
+        # A2: refuse to re-compact across an existing compaction marker.
+        # Walking the verifier across a marker that itself sits inside
+        # an archive (because a second compaction archived it) requires
+        # multi-archive bridge logic the v0.1.7 verifier does not yet
+        # implement. Surface a clean error here pointing at the marker
+        # so the operator can either widen ``--before`` past it or skip
+        # it. Phase 2: implement marker-bridge logic in
+        # ``verify_with_archives`` and lift this guard.
+        for entry in eligible:
+            if is_compaction_marker(entry):
+                marker_ts_iso = _ts_ns_to_iso(entry.ts_ns)
+                raise ValueError(
+                    f"compaction range includes a previous compaction marker "
+                    f"(entry_id={entry.entry_id}, ts={marker_ts_iso}); "
+                    f"v0.1.7 refuses to re-compact over markers because the "
+                    f"resulting multi-archive chain cannot yet be verified. "
+                    f"Widen --before to either skip the marker or include it "
+                    f"AND its referenced archive in the new archive (the "
+                    f"latter is a Phase-2 feature). Idempotent re-compaction "
+                    f"with the same cutoff also trips this guard, by design."
+                )
 
-    # Resolve the archive output path. We accept relative paths but the
-    # marker payload records an absolute resolved path so verifier
-    # lookups don't depend on cwd.
-    output = Path(output).resolve()
+        # Build the Merkle tree over the eligible entries' HMAC fields.
+        tree = MerkleTree.from_entries(eligible)
+        range_start = _ts_ns_to_iso(eligible[0].ts_ns)
+        range_end = _ts_ns_to_iso(eligible[-1].ts_ns)
 
-    # Write the archive first. If anything goes wrong we have made no
-    # changes to the live chain.
-    header = ArchiveHeader(
-        archive_format_version=ARCHIVE_FORMAT_VERSION,
-        signet_version=_signet_version(),
-        range_start=range_start,
-        range_end=range_end,
-        entry_count=len(eligible),
-        merkle_root=tree.root,
-    )
-    _write_archive(output=output, header=header, tree=tree, entries=eligible)
+        # Write the archive first. If anything goes wrong we have made no
+        # changes to the live chain.
+        header = ArchiveHeader(
+            archive_format_version=ARCHIVE_FORMAT_VERSION,
+            signet_version=_signet_version(),
+            range_start=range_start,
+            range_end=range_end,
+            entry_count=len(eligible),
+            merkle_root=tree.root,
+        )
+        _write_archive(output=output, header=header, tree=tree, entries=eligible)
 
-    # Build the compaction-marker entry. We need to sign it manually
-    # here rather than calling :meth:`HmacChain.append` because the
-    # marker MUST link to the LAST eligible entry's hmac — and at the
-    # moment we're calling, the backend file still contains every
-    # entry, so the chain's normal "what's the latest entry" lookup
-    # would return the wrong predecessor whenever there are retained
-    # entries after the cutoff.
-    #
-    # We use the same machinery that :meth:`HmacChain.append` uses
-    # (active key, anchor, ``_serialize_for_signing``) so the marker
-    # is byte-identical to what a normal append produces, then we hand
-    # it to the rewrite step below to land it in the right slot.
-    last_eligible_hmac = eligible[-1].hmac
-    appended_marker = _sign_compaction_marker(
-        chain=chain,
-        prev_hmac=last_eligible_hmac,
-        archive_path=output,
-        merkle_root=tree.root,
-        compacted_count=len(eligible),
-        range_start=range_start,
-        range_end=range_end,
-    )
+        # Build the compaction-marker entry. We need to sign it manually
+        # here rather than calling :meth:`HmacChain.append` because the
+        # marker MUST link to the LAST eligible entry's hmac — and at the
+        # moment we're calling, the backend file still contains every
+        # entry, so the chain's normal "what's the latest entry" lookup
+        # would return the wrong predecessor whenever there are retained
+        # entries after the cutoff.
+        #
+        # We use the same machinery that :meth:`HmacChain.append` uses
+        # (active key, anchor, ``_serialize_for_signing``) so the marker
+        # is byte-identical to what a normal append produces, then we hand
+        # it to the rewrite step below to land it in the right slot.
+        last_eligible_hmac = eligible[-1].hmac
+        appended_marker = _sign_compaction_marker(
+            chain=chain,
+            prev_hmac=last_eligible_hmac,
+            archive_path=output,
+            merkle_root=tree.root,
+            compacted_count=len(eligible),
+            range_start=range_start,
+            range_end=range_end,
+        )
 
-    # Rewrite the live log so it consists of:
-    #   [marker, retained_entries...]
-    # The marker's prev_hmac points at the last eligible entry's hmac
-    # (recoverable from the archive); the first retained entry's
-    # prev_hmac ALSO points at that same hmac because that's how it
-    # was appended originally. The :func:`verify_with_archives`
-    # verifier knows about this fork: on a marker it switches to the
-    # archive to validate the bridge, then continues with the next
-    # retained entry as a fresh segment whose prev_hmac matches the
-    # archive's last hmac.
-    _atomic_rewrite_live_log(
-        backend=backend,
-        new_entries=[appended_marker, *retained],
-    )
+        # Rewrite the live log so it consists of:
+        #   [marker, retained_entries...]
+        # The marker's prev_hmac points at the last eligible entry's hmac
+        # (recoverable from the archive); the first retained entry's
+        # prev_hmac ALSO points at that same hmac because that's how it
+        # was appended originally. The :func:`verify_with_archives`
+        # verifier knows about this fork: on a marker it switches to the
+        # archive to validate the bridge, then continues with the next
+        # retained entry as a fresh segment whose prev_hmac matches the
+        # archive's last hmac.
+        _atomic_rewrite_live_log(
+            backend=backend,
+            new_entries=[appended_marker, *retained],
+        )
 
-    # The chain's prev cache (if active) is now stale — the next
-    # append should link to whatever the *new* last entry is in the
-    # rewritten file, not whatever the chain happened to cache from a
-    # previous append. Invalidate it.
-    chain._cached_prev = None
+        # The chain's prev cache (if active) is now stale — the next
+        # append should link to whatever the *new* last entry is in the
+        # rewritten file, not whatever the chain happened to cache from a
+        # previous append. Invalidate it.
+        chain._cached_prev = None
 
-    return CompactionResult(
-        archive_path=output,
-        merkle_root=tree.root,
-        compacted_count=len(eligible),
-        range=(range_start, range_end),
-        marker_entry_id=appended_marker.entry_id,
-    )
+        return CompactionResult(
+            archive_path=output,
+            merkle_root=tree.root,
+            compacted_count=len(eligible),
+            range=(range_start, range_end),
+            marker_entry_id=appended_marker.entry_id,
+        )
 
 
 def _sign_compaction_marker(

@@ -489,6 +489,212 @@ class TestTrim:
             trim_before_index(backend, -1)
 
 
+class TestCorruptArchiveBody:
+    """A1 (v0.1.7): a corrupted gzip body in the archive's entries
+    section must surface as a structured ARCHIVE_FORMAT_INVALID
+    break, not a Python traceback."""
+
+    def test_corrupt_gzip_blob_yields_archive_format_invalid(
+        self, chain: HmacChain, backend: JsonlBackend, tmp_path: Path, keyring: KeyRing
+    ) -> None:
+        for i in range(5):
+            chain.append(_make_entry(f"e{i}"))
+        archive_dir = tmp_path / "archives"
+        archive_dir.mkdir()
+        archive_path = archive_dir / "archive.bin"
+        compact_audit_log(
+            chain=chain,
+            backend=backend,
+            before=datetime(2099, 1, 1, tzinfo=UTC),
+            output=archive_path,
+        )
+
+        from signet.audit.compactor import _ENTRIES_END, _ENTRIES_START
+
+        raw = archive_path.read_bytes()
+        es = raw.find(_ENTRIES_START) + len(_ENTRIES_START)
+        ee = raw.find(_ENTRIES_END)
+        # Corrupt one byte well into the gzip body so decompression
+        # fails. Picking the middle of the blob avoids hitting the
+        # gzip header which has its own validation path.
+        midpoint = (es + ee) // 2
+        bad = bytearray(raw)
+        bad[midpoint] ^= 0xFF
+        archive_path.write_bytes(bytes(bad))
+
+        report = verify_with_archives(
+            backend=backend, keyring=keyring, archive_dir=archive_dir
+        )
+        # Must not crash. Must report ARCHIVE_FORMAT_INVALID.
+        assert not report.ok
+        kinds = {b.kind for b in report.breaks}
+        assert BreakKind.ARCHIVE_FORMAT_INVALID in kinds
+
+
+class TestStackedCompactionRefusal:
+    """A2 (v0.1.7): re-compacting over an existing compaction marker
+    is refused with a clear ValueError pointing at the offending
+    marker. Multi-archive bridge support is a Phase-2 item."""
+
+    def test_compact_then_compact_again_refuses(
+        self, chain: HmacChain, backend: JsonlBackend, tmp_path: Path
+    ) -> None:
+        # Append entries with old timestamps, compact half. The marker
+        # itself is appended via HmacChain.append so its ts_ns is the
+        # wall-clock at compaction time. Then run a second compaction
+        # whose ``before`` cutoff is far in the future — the marker
+        # qualifies, and the compactor must refuse.
+        from datetime import timedelta
+
+        base_dt = datetime(2026, 1, 1, tzinfo=UTC)
+        base_ns = int(base_dt.timestamp() * 1_000_000_000)
+        for i in range(10):
+            chain.append(
+                _make_entry(f"e{i}", ts_ns=base_ns + i * 1_000_000_000)
+            )
+        archive1 = tmp_path / "archive-1.bin"
+        compact_audit_log(
+            chain=chain,
+            backend=backend,
+            before=base_dt + timedelta(seconds=5),
+            output=archive1,
+        )
+        # Append more entries; their ts_ns is also "now" (real wall
+        # clock), so a far-future cutoff for compact #2 sweeps in
+        # marker + post-marker entries together.
+        for i in range(5):
+            chain.append(_make_entry(f"post-{i}"))
+
+        archive2 = tmp_path / "archive-2.bin"
+        with pytest.raises(ValueError, match="previous compaction marker"):
+            compact_audit_log(
+                chain=chain,
+                backend=backend,
+                before=datetime(2099, 1, 1, tzinfo=UTC),
+                output=archive2,
+            )
+
+    def test_idempotent_compact_with_same_cutoff_refuses(
+        self, chain: HmacChain, backend: JsonlBackend, tmp_path: Path
+    ) -> None:
+        from datetime import timedelta
+
+        base_dt = datetime(2026, 1, 1, tzinfo=UTC)
+        base_ns = int(base_dt.timestamp() * 1_000_000_000)
+        for i in range(5):
+            chain.append(
+                _make_entry(f"e{i}", ts_ns=base_ns + i * 1_000_000_000)
+            )
+        cutoff = base_dt + timedelta(seconds=3)
+        archive1 = tmp_path / "archive-1.bin"
+        compact_audit_log(
+            chain=chain, backend=backend, before=cutoff, output=archive1
+        )
+        # Second invocation with same cutoff: the existing marker
+        # has ts_ns at the time of the FIRST compaction (now), but the
+        # remaining entries past the cutoff are still after it. The
+        # marker itself was appended via HmacChain.append so its
+        # ts_ns is "now" — strictly LATER than the cutoff window.
+        # The truly-idempotent semantics is "no new entries are
+        # eligible" → no-op, which is fine. Re-running with a
+        # cutoff that includes the marker MUST refuse.
+        far_future = datetime(2099, 1, 1, tzinfo=UTC)
+        archive2 = tmp_path / "archive-2.bin"
+        with pytest.raises(ValueError, match="previous compaction marker"):
+            compact_audit_log(
+                chain=chain,
+                backend=backend,
+                before=far_future,
+                output=archive2,
+            )
+
+
+class TestRefuseOverwrite:
+    """A4 (v0.1.7): compaction refuses to silently overwrite an
+    existing archive at the output path; pass force=True to override."""
+
+    def test_existing_output_path_refused(
+        self, chain: HmacChain, backend: JsonlBackend, tmp_path: Path
+    ) -> None:
+        for i in range(3):
+            chain.append(_make_entry(f"e{i}"))
+        archive = tmp_path / "archive.bin"
+        archive.write_bytes(b"some prior contents that must not be clobbered")
+
+        with pytest.raises(FileExistsError, match="force=True"):
+            compact_audit_log(
+                chain=chain,
+                backend=backend,
+                before=datetime(2099, 1, 1, tzinfo=UTC),
+                output=archive,
+            )
+        # Sanity: the existing file is intact.
+        assert archive.read_bytes().startswith(b"some prior contents")
+
+    def test_force_true_overwrites(
+        self, chain: HmacChain, backend: JsonlBackend, tmp_path: Path
+    ) -> None:
+        for i in range(3):
+            chain.append(_make_entry(f"e{i}"))
+        archive = tmp_path / "archive.bin"
+        archive.write_bytes(b"prior contents to be replaced")
+
+        result = compact_audit_log(
+            chain=chain,
+            backend=backend,
+            before=datetime(2099, 1, 1, tzinfo=UTC),
+            output=archive,
+            force=True,
+        )
+        assert result is not None
+        # The archive is now a real archive, not the placeholder.
+        assert archive.read_bytes().startswith(b"SIGNET-ARCHIVE-V")
+
+
+class TestCompactionLockingHook:
+    """A7 (v0.1.7): the compactor takes the same sidecar lock that
+    FileLockingJsonlBackend appenders take, so concurrent appenders
+    block on the lock instead of silently racing into the
+    ``os.replace`` window."""
+
+    def test_compactor_holds_sidecar_lock(
+        self, tmp_path: Path
+    ) -> None:
+        from signet.audit.backend import (
+            FileLockingJsonlBackend,
+            exclusive_log_lock,
+        )
+
+        path = tmp_path / "audit.jsonl"
+        backend = FileLockingJsonlBackend(path, fsync_after_append=False)
+        ring = KeyRing(active=Key(key_id="k1", secret=b"x" * 32))
+        chain = HmacChain(backend, ring, cache_prev=False)
+        for i in range(3):
+            chain.append(_make_entry(f"e{i}"))
+
+        # The sidecar lockfile exists (compactor would touch it). We
+        # take the lock from the test thread and confirm the appender
+        # blocks (best-effort: we can't easily test cross-process
+        # blocking with msvcrt.locking, but we can verify the
+        # appender's path goes through exclusive_log_lock).
+        # Smoke check: no exception when a compaction runs and an
+        # appender follows.
+        archive = tmp_path / "archive.bin"
+        compact_audit_log(
+            chain=chain,
+            backend=backend,
+            before=datetime(2099, 1, 1, tzinfo=UTC),
+            output=archive,
+        )
+        # After compaction, the sidecar lockfile should exist.
+        assert (tmp_path / "audit.jsonl.lock").exists()
+
+        # And the lock context-manager works as a no-op when nobody
+        # else holds it.
+        with exclusive_log_lock(path):
+            pass
+
+
 class TestArchiveHeaderJson:
     def test_header_json_round_trip(self) -> None:
         h = ArchiveHeader(

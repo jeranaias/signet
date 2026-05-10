@@ -67,6 +67,81 @@ else:
     _LOCK_IMPL = _FcntlLock()
 
 
+@contextlib.contextmanager
+def exclusive_log_lock(path: Path) -> Iterator[None]:
+    """Hold a cross-process exclusive lock on a sidecar of ``path``.
+
+    Used by the compactor to block :class:`FileLockingJsonlBackend`
+    writers for the duration of an atomic rewrite. We lock a sidecar
+    file (``<path>.lock``) rather than the live log itself because on
+    Windows holding any handle on the live log would prevent the
+    compactor's own ``os.replace`` from succeeding — and the whole
+    point here is that the compactor can rewrite the log atomically
+    while concurrent writers either block or get a clean error.
+
+    Lock primitive: ``fcntl.flock`` on POSIX (blocking by default),
+    ``msvcrt.locking`` on Windows (retries internally ~10 s, then
+    raises ``OSError`` — the caller turns that into a useful message).
+
+    The :class:`FileLockingJsonlBackend` already takes a byte-range
+    lock on the log itself for serialization between worker
+    processes; the compactor's sidecar lock is a *coordination* lock
+    one rung above. Appenders that observe the sidecar lock cooperate;
+    appenders that don't (e.g. the plain :class:`JsonlBackend`) are
+    not constrained — but those backends are not multi-writer safe to
+    begin with.
+    """
+    lock_path = Path(str(path) + ".lock")
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "rb+") as f:
+        if sys.platform == "win32":
+            # ``msvcrt.locking`` with LK_LOCK retries internally for a
+            # bit (~10 s) and raises if still locked. We loop a few
+            # times to give the appender a fair window before giving up.
+            import time as _time
+
+            attempts = 0
+            while True:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+                    break
+                except OSError:
+                    attempts += 1
+                    if attempts >= 3:
+                        raise
+                    _time.sleep(0.1)
+        else:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if sys.platform == "win32":
+                with contextlib.suppress(OSError):
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+class MalformedAuditEntry(Exception):
+    """Raised when a JSONL audit line cannot be parsed.
+
+    Carries the offending line number (1-based), the raw line text, and
+    the underlying parse error so the verifier and CLI surfaces can turn
+    it into a structured break instead of a Python traceback.
+
+    Mid-write truncation (the realistic post-crash failure mode) and
+    accidental edits both surface here. BOM bytes at the start of the
+    file are silently stripped by opening with ``utf-8-sig`` so a
+    well-meaning text editor saving the log doesn't trip this.
+    """
+
+    def __init__(self, line_number: int, raw_line: str, parse_error: str) -> None:
+        super().__init__(f"line {line_number}: {parse_error}")
+        self.line_number = line_number
+        self.raw_line = raw_line
+        self.parse_error = parse_error
+
+
 class AuditBackend(Protocol):
     """The storage protocol every audit backend implements."""
 
@@ -154,12 +229,26 @@ class JsonlBackend:
     def iter_entries(self) -> Iterator[AuditEntry]:
         if not self._path.exists():
             return
-        with self._path.open("r", encoding="utf-8") as f:
-            for line in f:
-                stripped = line.strip()
+        # ``utf-8-sig`` strips a single optional BOM at the start of the
+        # file. Editors that helpfully prepend a BOM on save would
+        # otherwise wedge the verifier on the first line.
+        with self._path.open("r", encoding="utf-8-sig") as f:
+            for line_number, raw in enumerate(f, start=1):
+                stripped = raw.strip()
                 if not stripped:
+                    # Blank lines (including a trailing newline) are
+                    # tolerated; they're a common artifact of editors
+                    # and don't carry an entry.
                     continue
-                yield AuditEntry.from_dict(json.loads(stripped))
+                try:
+                    data = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    raise MalformedAuditEntry(
+                        line_number=line_number,
+                        raw_line=stripped,
+                        parse_error=str(exc),
+                    ) from exc
+                yield AuditEntry.from_dict(data)
 
     def last_entry(self) -> AuditEntry | None:
         # JSONL doesn't support efficient seek-to-last without indexing.
@@ -210,8 +299,20 @@ class FileLockingJsonlBackend(JsonlBackend):
         :class:`HmacChain` to re-read the chain head under the lock so
         multi-worker prev_hmac stays correct without leaving the
         critical section.
+
+        Coordination with the compactor (A7): we acquire the sidecar
+        ``<path>.lock`` lock first (the same lock the compactor holds
+        for the duration of an atomic rewrite). If a compaction is in
+        progress, this blocks here — instead of opening the live log
+        and racing with the compactor's ``os.replace``. The byte-range
+        lock on the log itself is still held during the actual write
+        to keep multi-process appenders serialized between
+        themselves.
         """
-        with self._path.open("a", encoding="utf-8") as f:
+        with (
+            exclusive_log_lock(self._path),
+            self._path.open("a", encoding="utf-8") as f,
+        ):
             _LOCK_IMPL.acquire(f.fileno())
             try:
                 if on_locked is not None:

@@ -421,6 +421,143 @@ class TestFileLockingBackend:
         assert report.total_entries == 4
 
 
+class TestMalformedJsonl:
+    """A3 (v0.1.7): a malformed JSONL line surfaces as MALFORMED_LINE
+    instead of crashing the verifier with JSONDecodeError."""
+
+    def test_truncated_last_line_reports_malformed(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        chain.append(_entry("b"))
+        # Truncate the file mid-second-line, simulating a kill during fsync.
+        raw = backend.path.read_text(encoding="utf-8")
+        # Drop the last 30 bytes of the file. Enough to mangle the last line.
+        backend.path.write_text(raw[:-30], encoding="utf-8")
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        assert any(b.kind is BreakKind.MALFORMED_LINE for b in report.breaks)
+
+    def test_non_json_middle_line_reports_malformed(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        chain.append(_entry("b"))
+        chain.append(_entry("c"))
+        lines = backend.path.read_text(encoding="utf-8").splitlines()
+        lines[1] = "this is not json at all"
+        backend.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        malformed = [b for b in report.breaks if b.kind is BreakKind.MALFORMED_LINE]
+        assert len(malformed) == 1
+        # The line number should be carried in the detail.
+        assert "line 2" in malformed[0].detail
+
+    def test_utf8_bom_at_start_is_silently_stripped(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        chain.append(_entry("b"))
+        # Prepend a UTF-8 BOM. Editors that "helpfully" save with BOM
+        # would otherwise crash the verifier on the first line.
+        raw = backend.path.read_bytes()
+        backend.path.write_bytes(b"\xef\xbb\xbf" + raw)
+
+        report = ChainVerifier(backend, keyring).verify()
+        # BOM is stripped (utf-8-sig) so the chain still verifies clean.
+        assert report.ok, f"breaks: {report.breaks}"
+        assert report.total_entries == 2
+
+    def test_non_json_only_line_reports_malformed(
+        self, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        backend.path.write_text("definitely not json\n", encoding="utf-8")
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        assert any(b.kind is BreakKind.MALFORMED_LINE for b in report.breaks)
+
+
+class TestDualBreakSuppression:
+    """A6 (v0.1.7): a single-byte tamper of an entry's stored
+    ``prev_hmac`` should surface as ONE link_mismatch, not link+self."""
+
+    def test_prev_hmac_tamper_emits_single_break(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        chain.append(_entry("b"))
+
+        lines = backend.path.read_text(encoding="utf-8").splitlines()
+        d = json.loads(lines[1])
+        # Flip one hex char of the stored prev_hmac.
+        original = d["prev_hmac"]
+        flipped = ("0" if original[0] != "0" else "1") + original[1:]
+        d["prev_hmac"] = flipped
+        lines[1] = json.dumps(d, separators=(",", ":"), sort_keys=True)
+        backend.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        breaks_at_1 = [b for b in report.breaks if b.index == 1]
+        # Exactly one break at index 1, and it's a link_mismatch.
+        assert len(breaks_at_1) == 1
+        assert breaks_at_1[0].kind is BreakKind.LINK_MISMATCH
+
+
+class TestCascadeSuppression:
+    """A11 (v0.1.7): when ``compact_breaks=True``, runs of cascading
+    link_mismatch entries downstream of a single tamper collapse into
+    a single CASCADE_SUPPRESSED summary."""
+
+    def test_compact_breaks_collapses_cascade(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        # Synthesize a long cascade by tampering with each downstream
+        # entry's stored ``prev_hmac``. This is the worst-case
+        # cascade pattern A11 cares about: one logical corruption,
+        # many cascading breaks that drown the report.
+        chain.append(_entry("a"))
+        chain.append(_entry("b"))
+        for i in range(10):
+            chain.append(_entry(f"after-{i}"))
+
+        lines = backend.path.read_text(encoding="utf-8").splitlines()
+        # Tamper with every entry from index 2 onward: replace each
+        # entry's stored ``prev_hmac`` with a fixed bogus value.
+        # Result: index 2..N all link_mismatch.
+        bogus = "0" * 64
+        for i in range(2, len(lines)):
+            d = json.loads(lines[i])
+            d["prev_hmac"] = bogus
+            lines[i] = json.dumps(d, separators=(",", ":"), sort_keys=True)
+        backend.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        # Without compaction: many link_mismatch breaks.
+        verbose = ChainVerifier(backend, keyring).verify()
+        assert not verbose.ok
+        verbose_link_breaks = [
+            b for b in verbose.breaks if b.kind is BreakKind.LINK_MISMATCH
+        ]
+        assert len(verbose_link_breaks) >= 5  # cascade is real
+
+        # With compaction: the leading link_mismatch survives,
+        # subsequent ones collapse into ONE cascade summary.
+        compact = ChainVerifier(
+            backend, keyring, compact_breaks=True
+        ).verify()
+        assert not compact.ok
+        cascades = [
+            b for b in compact.breaks if b.kind is BreakKind.CASCADE_SUPPRESSED
+        ]
+        assert len(cascades) == 1
+        # The total compact-mode break list is shorter than the
+        # verbose-mode list — the whole point of A11.
+        assert len(compact.breaks) < len(verbose.breaks)
+
+
 class TestVerificationReportShape:
     def test_clean_report_attributes(
         self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing

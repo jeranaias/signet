@@ -24,6 +24,7 @@ and every entry carries non-repudiable attribution to an :class:`Owner`.
 
 from __future__ import annotations
 
+from signet.audit.backend import MalformedAuditEntry
 from signet.audit.compactor import (
     ARCHIVE_FORMAT_VERSION,
     COMPACTION_CHECK_NAME,
@@ -53,6 +54,7 @@ __all__: list[str] = [
     "ChainBreak",
     "ChainVerifier",
     "CompactionResult",
+    "MalformedAuditEntry",
     "MerkleTree",
     "VerificationReport",
     "compact_audit_log",
