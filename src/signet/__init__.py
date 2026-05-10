@@ -12,6 +12,6 @@ can fill out a purchase order but cannot sign the check.
 
 from __future__ import annotations
 
-__version__ = "0.1.7rc1"
+__version__ = "0.1.7rc2"
 
 __all__ = ["__version__"]
