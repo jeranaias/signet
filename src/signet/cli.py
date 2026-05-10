@@ -373,20 +373,30 @@ def keys_generate_ed25519(
     if key_id:
         click.echo(f"\nkey_id (record this; verifiers need it): {key_id}")
     click.echo("\nNext: configure signet with this key for asymmetric receipts.")
+    # C4 (v0.1.7): emit Python's safe ``repr()`` of the path so Windows
+    # backslashes (``D:\tmp\priv.pem``) are properly escaped. Previously
+    # we wrapped the path in double quotes and let click format it,
+    # which produced ``"D:\tmp\priv.pem"`` — pasting that into Python
+    # interprets ``\t`` as a tab and ``\p`` as an invalid escape.
+    # ``repr(str(path))`` produces ``'D:\\tmp\\priv.pem'`` (or just
+    # ``'/tmp/priv.pem'`` on POSIX), which always parses cleanly.
+    out_repr = repr(str(out_path))
+    public_repr = repr(str(public_out_path))
+    key_id_value = key_id or "REPLACE_ME"
     click.echo(
         "  In your pipeline / app code:\n"
         "    from signet.server.receipt import Ed25519ReceiptSigner\n"
         f"    signer = Ed25519ReceiptSigner.from_pem(\n"
-        f'        private_pem_path="{out_path}",\n'
-        f'        key_id="{key_id or "REPLACE_ME"}",\n'
+        f"        private_pem_path={out_repr},\n"
+        f'        key_id="{key_id_value}",\n'
         "    )\n"
         "    SignetApp(config=cfg, pipeline=pipeline, receipt_signer=signer)"
     )
     click.echo(
         "\n  Share the public key with verifiers. They construct a verify-only signer:\n"
         "    Ed25519ReceiptSigner.from_pem(\n"
-        f'        public_pem_path="{public_out_path}",\n'
-        f'        key_id="{key_id or "REPLACE_ME"}",\n'
+        f"        public_pem_path={public_repr},\n"
+        f'        key_id="{key_id_value}",\n'
         "    )"
     )
 
@@ -484,7 +494,13 @@ def doctor(
         except httpx.HTTPError as exc:
             click.secho(f"  /health         unreachable: {exc}", fg="red")
             failed = True
-            return
+            # Fall through to the rest of the doctor flow — each
+            # subsequent probe will surface its own failure and the
+            # final ``sys.exit(1 if failed else 0)`` reports the
+            # overall status. Previously a stray ``return`` here exited
+            # the function before ``sys.exit(...)`` could fire, so
+            # ``signet doctor --self <down>`` exited 0 despite the red
+            # banner.
 
         try:
             ver = httpx.get(f"{base}/version", timeout=5.0).json()
@@ -686,15 +702,25 @@ def audit() -> None:
     "as one logical chain. Recomputes Merkle roots and reports "
     "MERKLE_MISMATCH / ARCHIVE_MISSING / ARCHIVE_FORMAT_INVALID.",
 )
+@click.option(
+    "--summarize-cascades",
+    is_flag=True,
+    help="Collapse cascading link_mismatch breaks downstream of a "
+    "single tamper into one CASCADE_SUPPRESSED summary break. Useful "
+    "for keeping large-chain reports readable when one forgery would "
+    "otherwise surface as N+ link breaks. Mirrors the verifier's "
+    "compact_breaks parameter (A11).",
+)
 def audit_verify(
     log_path: Path,
     hmac_secret: str,
     key_id: str,
     as_json: bool,
     archive_dir: Path | None,
+    summarize_cascades: bool,
 ) -> None:
     """Walk LOG_PATH and report any tampering."""
-    from signet.audit.backend import JsonlBackend
+    from signet.audit.backend import JsonlBackend, MalformedAuditEntry
     from signet.audit.keyring import Key, KeyRing
     from signet.audit.verifier import ChainVerifier, verify_with_archives
 
@@ -705,10 +731,20 @@ def audit_verify(
         )
     )
     backend = JsonlBackend(log_path)
-    if archive_dir is None:
-        report = ChainVerifier(backend, keyring).verify()
-    else:
-        report = verify_with_archives(backend, keyring, archive_dir)
+    try:
+        if archive_dir is None:
+            report = ChainVerifier(
+                backend, keyring, compact_breaks=summarize_cascades
+            ).verify()
+        else:
+            report = verify_with_archives(
+                backend,
+                keyring,
+                archive_dir,
+                compact_breaks=summarize_cascades,
+            )
+    except MalformedAuditEntry as exc:
+        raise _malformed_audit_to_click_exception(exc) from exc
 
     if as_json:
         payload = {
@@ -803,11 +839,14 @@ def audit_count(log_path: Path, group_by: str | None, as_json: bool) -> None:
     """
     from collections import Counter
 
-    from signet.audit.backend import JsonlBackend
+    from signet.audit.backend import JsonlBackend, MalformedAuditEntry
 
     backend = JsonlBackend(log_path)
     if group_by is None:
-        total = sum(1 for _ in backend.iter_entries())
+        try:
+            total = sum(1 for _ in backend.iter_entries())
+        except MalformedAuditEntry as exc:
+            raise _malformed_audit_to_click_exception(exc) from exc
         if as_json:
             click.echo(json.dumps({"total": total}))
         else:
@@ -815,18 +854,21 @@ def audit_count(log_path: Path, group_by: str | None, as_json: bool) -> None:
         return
 
     counts: Counter[str] = Counter()
-    for entry in backend.iter_entries():
-        if group_by == "check":
-            counts[entry.check_name] += 1
-        elif group_by == "decision":
-            counts[entry.decision.value] += 1
-        elif group_by == "owner":
-            counts[str(entry.owner)] += 1
-        elif group_by == "owner_type":
-            counts[entry.owner.owner_type.value] += 1
-        elif group_by == "stage":
-            stage = str(entry.metadata.get("_stage", "unknown"))
-            counts[stage] += 1
+    try:
+        for entry in backend.iter_entries():
+            if group_by == "check":
+                counts[entry.check_name] += 1
+            elif group_by == "decision":
+                counts[entry.decision.value] += 1
+            elif group_by == "owner":
+                counts[str(entry.owner)] += 1
+            elif group_by == "owner_type":
+                counts[entry.owner.owner_type.value] += 1
+            elif group_by == "stage":
+                stage = str(entry.metadata.get("_stage", "unknown"))
+                counts[stage] += 1
+    except MalformedAuditEntry as exc:
+        raise _malformed_audit_to_click_exception(exc) from exc
 
     if as_json:
         click.echo(json.dumps(dict(counts.most_common()), indent=2, sort_keys=True))
@@ -855,7 +897,14 @@ def audit_count(log_path: Path, group_by: str | None, as_json: bool) -> None:
 )
 def audit_tail(log_path: Path, n_lines: int, filter_expr: str | None, as_json: bool) -> None:
     """Show the last N entries from LOG_PATH (optionally filtered)."""
-    from signet.audit.backend import JsonlBackend
+    from signet.audit.backend import JsonlBackend, MalformedAuditEntry
+
+    # C7 (v0.1.7): validate filter field names up-front. Previously an
+    # unknown field (``foo=bar``) silently filtered out every entry —
+    # the operator saw zero output and assumed the chain was empty.
+    # Allowed fields are documented in the --filter help text and
+    # mirror the comparison branches below.
+    _ALLOWED_FILTER_FIELDS = {"check", "decision", "owner_type"}
 
     filters: dict[str, str] = {}
     if filter_expr:
@@ -863,33 +912,42 @@ def audit_tail(log_path: Path, n_lines: int, filter_expr: str | None, as_json: b
             if "=" not in clause:
                 raise click.ClickException(f"bad --filter clause {clause!r}; expected FIELD=VALUE")
             k, v = clause.split("=", 1)
-            filters[k.strip()] = v.strip()
+            field_name = k.strip()
+            if field_name not in _ALLOWED_FILTER_FIELDS:
+                raise click.ClickException(
+                    f"unknown filter field {field_name!r}; "
+                    f"known fields: {', '.join(sorted(_ALLOWED_FILTER_FIELDS))}"
+                )
+            filters[field_name] = v.strip()
 
     from signet.core.audit import AuditEntry
 
     backend = JsonlBackend(log_path)
     matched: list[AuditEntry] = []
-    for entry in backend.iter_entries():
-        if filters:
-            ok = True
-            for f, v in filters.items():
-                actual = (
-                    entry.check_name
-                    if f == "check"
-                    else entry.decision.value
-                    if f == "decision"
-                    else entry.owner.owner_type.value
-                    if f == "owner_type"
-                    else None
-                )
-                if actual != v:
-                    ok = False
-                    break
-            if not ok:
-                continue
-        matched.append(entry)
-        if len(matched) > n_lines:
-            matched.pop(0)
+    try:
+        for entry in backend.iter_entries():
+            if filters:
+                ok = True
+                for f, v in filters.items():
+                    actual = (
+                        entry.check_name
+                        if f == "check"
+                        else entry.decision.value
+                        if f == "decision"
+                        else entry.owner.owner_type.value
+                        if f == "owner_type"
+                        else None
+                    )
+                    if actual != v:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+            matched.append(entry)
+            if len(matched) > n_lines:
+                matched.pop(0)
+    except MalformedAuditEntry as exc:
+        raise _malformed_audit_to_click_exception(exc) from exc
 
     for entry in matched:
         if as_json:
@@ -909,6 +967,28 @@ def _ns_to_iso(ts_ns: int) -> str:
 
     return datetime.datetime.fromtimestamp(ts_ns / 1e9, tz=datetime.UTC).isoformat(
         timespec="seconds"
+    )
+
+
+def _malformed_audit_to_click_exception(exc: Any) -> click.ClickException:
+    """Wrap a :class:`signet.audit.backend.MalformedAuditEntry` into a
+    one-line :class:`click.ClickException`.
+
+    Surfaces the offending line number, the parse error, and a
+    truncated raw line (capped at 200 chars) plus a one-line operator
+    fix instruction. Used by every CLI surface that walks the live
+    audit log so a corrupted JSONL line gives an operator-readable
+    error instead of a Python traceback. Mid-write truncation after a
+    crash is the realistic source of a malformed line, so the message
+    points at the audit-archive operator playbook for restore-from-
+    backup as the canonical fix.
+    """
+    raw = exc.raw_line if isinstance(exc.raw_line, str) else str(exc.raw_line)
+    return click.ClickException(
+        f"audit log line {exc.line_number} is malformed: {exc.parse_error}\n"
+        f"  raw line: {raw[:200]}\n"
+        f"  fix: edit the file to remove or fix the bad line, "
+        f"or restore from backup."
     )
 
 
@@ -979,6 +1059,13 @@ def audit_show(entry_id: str, audit_log_path: Path) -> None:
     "Compaction WILL corrupt the chain if writers are active. "
     "See docs/audit-archive-format.md for the operator playbook.",
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite an existing archive file at --output. The default "
+    "is refusal so an accidental re-run with the same --output never "
+    "destroys an archive on disk.",
+)
 def audit_compact(
     audit_log_path: Path,
     before: str,
@@ -986,6 +1073,7 @@ def audit_compact(
     hmac_secret: str,
     key_id: str,
     quiesce_confirm: bool,
+    force: bool,
 ) -> None:
     """Archive entries before --before into --output and replace them
     with a compaction marker in the live chain.
@@ -1030,12 +1118,22 @@ def audit_compact(
     backend = JsonlBackend(audit_log_path)
     chain = HmacChain(backend, keyring)
 
-    result = compact_audit_log(
-        chain=chain,
-        backend=backend,
-        before=before_dt,
-        output=output,
-    )
+    # ``compact_audit_log`` raises ``FileExistsError`` when output
+    # exists and ``force`` is False. Surface that as a ClickException
+    # rather than a Python traceback.
+    try:
+        result = compact_audit_log(
+            chain=chain,
+            backend=backend,
+            before=before_dt,
+            output=output,
+            force=force,
+        )
+    except FileExistsError as exc:
+        raise click.ClickException(
+            f"refusing to overwrite existing archive at {output}; "
+            f"pass --force to override ({exc})"
+        ) from exc
 
     if result is None:
         click.secho(
@@ -1151,17 +1249,20 @@ def audit_report(
     prior_start = now - 2 * duration
     prior_end = window_start
 
-    from signet.audit.backend import JsonlBackend
+    from signet.audit.backend import JsonlBackend, MalformedAuditEntry
 
     backend = JsonlBackend(audit_log_path)
     cur_window: list[Any] = []
     prior_window: list[Any] = []
-    for entry in backend.iter_entries():
-        ts = datetime.fromtimestamp(entry.ts_ns / 1e9, tz=UTC)
-        if window_start <= ts <= now:
-            cur_window.append(entry)
-        elif prior_start <= ts < prior_end:
-            prior_window.append(entry)
+    try:
+        for entry in backend.iter_entries():
+            ts = datetime.fromtimestamp(entry.ts_ns / 1e9, tz=UTC)
+            if window_start <= ts <= now:
+                cur_window.append(entry)
+            elif prior_start <= ts < prior_end:
+                prior_window.append(entry)
+    except MalformedAuditEntry as exc:
+        raise _malformed_audit_to_click_exception(exc) from exc
 
     integrity_section: dict[str, Any] | None = None
     if hmac_secret:
@@ -1208,6 +1309,10 @@ def audit_report(
         "top_blocked_owners": aggregates["top_blocked_owners"],
         "deltas": _compute_deltas(aggregates, prior_aggregates),
         "integrity": integrity_section,
+        # Carried into the markdown renderer so the section header
+        # ("(anonymized)") matches the anonymize flag operators
+        # actually passed (A5).
+        "anonymize": anonymize,
     }
 
     if fmt == "json":
@@ -1355,6 +1460,30 @@ def _compute_deltas(
     }
 
 
+def _strip_utc_suffix(iso: str) -> str:
+    """Strip the trailing ``+00:00`` from an ISO 8601 string.
+
+    A12 (v0.1.7): the report header used to render
+    ``2026-05-09T12:00+00:00 UTC``, double-tagging the timezone. The
+    payload's ISO timestamp is already known to be in UTC by
+    construction (``datetime.now(tz=UTC)``), so the explicit ``UTC``
+    suffix is the human-readable label and the ``+00:00`` is
+    redundant. Strip the offset from the ISO portion before
+    interpolating into the markdown.
+    """
+    return iso.replace("+00:00", "")
+
+
+def _pluralize_blocks(n: int) -> str:
+    """Render ``n blocks`` / ``1 block`` correctly.
+
+    Tiny but worth its own helper because the report renders the
+    string in two places (raw and anonymized owner lists) and the bug
+    of "1 blocks" was loud enough to flag in ergonomics review.
+    """
+    return f"{n} block{'s' if n != 1 else ''}"
+
+
 def _render_audit_report_markdown(payload: dict[str, Any]) -> str:
     """Render the report payload as the operator-facing markdown doc."""
     lines: list[str] = []
@@ -1362,7 +1491,8 @@ def _render_audit_report_markdown(payload: dict[str, Any]) -> str:
     service_suffix = f" @ {payload['service']}" if payload.get("service") else ""
     lines.append("# signet audit report")
     lines.append(
-        f"**Range:** {rng['start']} -> {rng['end']} UTC ({rng['duration']})"
+        f"**Range:** {_strip_utc_suffix(rng['start'])} -> "
+        f"{_strip_utc_suffix(rng['end'])} UTC ({rng['duration']})"
     )
     lines.append(
         f"**Service:** signet {payload['signet_version']}{service_suffix}"
@@ -1396,10 +1526,21 @@ def _render_audit_report_markdown(payload: dict[str, Any]) -> str:
             lines.append(f"{i}. `{row['name']}` -- {detail}")
     lines.append("")
 
-    lines.append("## Top blocked owners (anonymized)" if payload.get("top_blocked_owners") else "")
+    # A5 (v0.1.7): only mark the section header as "(anonymized)" when
+    # owners actually were anonymized. The previous header was
+    # hard-coded regardless of the --anonymize/--no-anonymize flag.
+    is_anonymized = bool(payload.get("anonymize", True))
     if payload.get("top_blocked_owners"):
+        if is_anonymized:
+            lines.append("## Top blocked owners (anonymized)")
+        else:
+            lines.append("## Top blocked owners")
         for i, row in enumerate(payload["top_blocked_owners"], start=1):
-            lines.append(f"{i}. `{row['owner']}` -- {row['blocks']} blocks")
+            lines.append(
+                f"{i}. `{row['owner']}` -- {_pluralize_blocks(row['blocks'])}"
+            )
+        lines.append("")
+    else:
         lines.append("")
 
     lines.append("## Notable deltas vs prior period")
@@ -1485,7 +1626,10 @@ def lint(config_path: Path, strict: bool) -> None:
     findings = _lint_pipeline(config_path)
 
     if not findings:
-        click.secho("OK: pipeline passes the v0.1.5 lint checks.", fg="green")
+        click.secho(
+            f"OK: pipeline passes the v{__version__} lint checks.",
+            fg="green",
+        )
         sys.exit(0)
 
     for f in findings:
@@ -1596,6 +1740,122 @@ def plugins_list(group: str, as_json: bool) -> None:
                    "to populate this list)")
 
 
+@plugins.command("doctor")
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit a JSON object describing the issues found.",
+)
+def plugins_doctor(as_json: bool) -> None:
+    """Lint the discovered plugin set and exit non-zero on any issue.
+
+    Wraps :func:`discover_plugins` (with refresh on) and reports two
+    classes of failure that ``plugins list`` would otherwise show
+    only via color in the terminal:
+
+    * **Duplicate (group, name) pairs** — two plugin packages
+      registering the same entry-point name within one group. The
+      resolver picks one and silently shadows the other; in CI you
+      want the build to fail.
+    * **Plugins with non-loaded status** — ``incompatible_abi`` (the
+      plugin declares a CHECK_ABI_VERSION signet does not accept) and
+      ``load_error`` (import or type-validation failure during
+      :meth:`EntryPoint.load`).
+
+    Exit code is 0 when both classes are empty, 1 otherwise. Intended
+    to be the CI gate for plugin-heavy deployments — pair with
+    ``signet lint --strict`` and ``signet doctor --probe-injection``.
+    """
+    from signet.plugins import discover_plugins
+
+    plugins_found = discover_plugins(refresh=True)
+
+    # Detect duplicate (group, name) pairs. ``discover_plugins`` does
+    # not deduplicate — both entries surface as separate
+    # ``DiscoveredPlugin`` rows — so we can group them here.
+    seen: dict[tuple[str, str], list[Any]] = {}
+    for p in plugins_found:
+        seen.setdefault((p.group, p.name), []).append(p)
+    duplicates = {
+        (group, name): rows
+        for (group, name), rows in seen.items()
+        if len(rows) > 1
+    }
+
+    # Plugins that failed to come up at all.
+    failed = [p for p in plugins_found if p.status != "loaded"]
+
+    if as_json:
+        payload = {
+            "ok": not duplicates and not failed,
+            "duplicate_count": len(duplicates),
+            "failed_count": len(failed),
+            "duplicates": [
+                {
+                    "group": group,
+                    "name": name,
+                    "packages": [_render_pkg(r) for r in rows],
+                }
+                for (group, name), rows in sorted(duplicates.items())
+            ],
+            "failed": [
+                {
+                    "group": p.group,
+                    "name": p.name,
+                    "package": _render_pkg(p),
+                    "status": p.status,
+                    "error": p.error,
+                }
+                for p in failed
+            ],
+        }
+        click.echo(json.dumps(payload, indent=2, sort_keys=True))
+        sys.exit(0 if payload["ok"] else 1)
+
+    issues = 0
+    if duplicates:
+        click.secho(
+            f"DUPLICATE PLUGIN NAMES ({len(duplicates)})", fg="red", bold=True
+        )
+        for (group, name), rows in sorted(duplicates.items()):
+            packages = ", ".join(_render_pkg(r) for r in rows)
+            click.secho(
+                f"  [{group}] {name} registered by: {packages}", fg="red"
+            )
+        issues += len(duplicates)
+        click.echo("")
+
+    if failed:
+        click.secho(
+            f"PLUGINS WITH NON-LOADED STATUS ({len(failed)})",
+            fg="red",
+            bold=True,
+        )
+        for p in failed:
+            click.secho(
+                f"  [{p.group}] {p.name} ({_render_pkg(p)}): "
+                f"{p.status} -- {p.error or 'unknown'}",
+                fg="red",
+            )
+        issues += len(failed)
+        click.echo("")
+
+    if issues == 0:
+        click.secho(
+            f"OK: {len(plugins_found)} plugin(s) discovered, all loaded "
+            "cleanly with unique (group, name) pairs.",
+            fg="green",
+        )
+        sys.exit(0)
+
+    click.secho(
+        f"FAIL: {issues} plugin issue(s) detected; resolve before deploy.",
+        fg="red",
+    )
+    sys.exit(1)
+
+
 def _render_pkg(p: Any) -> str:
     """Render a plugin's package name + version in one column.
 
@@ -1679,17 +1939,20 @@ def replay(
 
 
 def _show_entry(entry_id: str, audit_log_path: Path) -> None:
-    from signet.audit.backend import JsonlBackend
+    from signet.audit.backend import JsonlBackend, MalformedAuditEntry
 
     # UUIDs are case-insensitive per RFC 4122; operators paste from
     # logs with whatever case the source rendered them in. Normalize
     # both sides to lowercase for the compare.
     target = entry_id.strip().lower()
     backend = JsonlBackend(audit_log_path)
-    for entry in backend.iter_entries():
-        if entry.entry_id.lower() == target:
-            click.echo(json.dumps(entry.to_dict(), indent=2, sort_keys=True))
-            return
+    try:
+        for entry in backend.iter_entries():
+            if entry.entry_id.lower() == target:
+                click.echo(json.dumps(entry.to_dict(), indent=2, sort_keys=True))
+                return
+    except MalformedAuditEntry as exc:
+        raise _malformed_audit_to_click_exception(exc) from exc
     click.secho(f"no entry with id {entry_id!r} found in {audit_log_path}", fg="red")
     sys.exit(1)
 
@@ -1712,16 +1975,19 @@ def _replay_pretty_print(
     import hashlib
     import hmac as _hmac
 
-    from signet.audit.backend import JsonlBackend
+    from signet.audit.backend import JsonlBackend, MalformedAuditEntry
     from signet.audit.chain import KEY_ID_FIELD, _serialize_for_signing
 
     target = entry_id.strip().lower()
     backend = JsonlBackend(audit_log_path)
     found = None
-    for entry in backend.iter_entries():
-        if entry.entry_id.lower() == target:
-            found = entry
-            break
+    try:
+        for entry in backend.iter_entries():
+            if entry.entry_id.lower() == target:
+                found = entry
+                break
+    except MalformedAuditEntry as exc:
+        raise _malformed_audit_to_click_exception(exc) from exc
 
     if found is None:
         click.secho(f"no entry with id {entry_id!r} found in {audit_log_path}", fg="red")
@@ -1798,7 +2064,19 @@ def _replay_pretty_print(
     default=Path("."),
 )
 def init(target_dir: Path) -> None:
-    """Scaffold a starter signet project (config + sample pipeline)."""
+    """Scaffold a starter signet project (config + sample pipeline).
+
+    Partial-write semantics: each scaffolded file is written only if it
+    does not already exist. Pre-existing files are skipped with a
+    ``skipped (already exists)`` line so an operator who deleted just
+    ``pipeline.py`` (the most common "let me regenerate this one"
+    workflow) can re-run ``signet init`` and get exactly that file
+    back without losing edits to ``client_example.py`` or
+    ``.env.example``. ``pipeline.py`` is treated as the load-bearing
+    file: if every file is already present, the command refuses with
+    exit code 1 — this preserves the original "do not overwrite an
+    existing project" guard.
+    """
     target_dir.mkdir(parents=True, exist_ok=True)
 
     pipeline_path = target_dir / "pipeline.py"
@@ -1806,24 +2084,37 @@ def init(target_dir: Path) -> None:
     gitignore_path = target_dir / ".gitignore"
     client_path = target_dir / "client_example.py"
 
-    if pipeline_path.exists():
-        click.secho(f"refusing to overwrite existing {pipeline_path}", fg="yellow")
+    files: list[tuple[Path, str]] = [
+        (pipeline_path, _PIPELINE_TEMPLATE),
+        (env_path, _ENV_TEMPLATE),
+        (client_path, _CLIENT_EXAMPLE_TEMPLATE),
+        (gitignore_path, _GITIGNORE_TEMPLATE),
+    ]
+
+    # If every scaffolded file already exists, the operator is calling
+    # init on an already-initialized directory — refuse so we don't
+    # silently no-op. Mirrors the v0.1.6 contract that an existing
+    # ``pipeline.py`` is load-bearing.
+    if all(path.exists() for path, _ in files):
+        click.secho(
+            f"refusing to overwrite existing {pipeline_path}", fg="yellow"
+        )
         sys.exit(1)
 
-    pipeline_path.write_text(_PIPELINE_TEMPLATE, encoding="utf-8")
-    env_path.write_text(_ENV_TEMPLATE, encoding="utf-8")
-    client_path.write_text(_CLIENT_EXAMPLE_TEMPLATE, encoding="utf-8")
-    # Also drop a .gitignore so the user doesn't accidentally commit
-    # their HMAC secret (.env) or audit log (potentially sensitive
-    # owner attribution data) on first push. Leave any existing
-    # .gitignore alone.
-    if not gitignore_path.exists():
-        gitignore_path.write_text(_GITIGNORE_TEMPLATE, encoding="utf-8")
-        click.secho(f"  wrote {gitignore_path}", fg="green")
+    wrote_any = False
+    for path, content in files:
+        if path.exists():
+            click.secho(f"  skipped (already exists): {path}", fg="yellow")
+            continue
+        path.write_text(content, encoding="utf-8")
+        click.secho(f"  wrote {path}", fg="green")
+        wrote_any = True
 
-    click.secho(f"  wrote {pipeline_path}", fg="green")
-    click.secho(f"  wrote {env_path}", fg="green")
-    click.secho(f"  wrote {client_path}", fg="green")
+    if not wrote_any:
+        # Defensive: the all-exist branch above should already have
+        # exited. Keeps mypy and humans happy.
+        sys.exit(1)
+
     click.echo("\nnext: review the files, then run:")
     click.echo("  signet serve --upstream http://localhost:11434/v1 --dev")
     click.echo("\nthen, in another terminal:")
@@ -1944,24 +2235,35 @@ def _lint_pipeline(config_path: Path) -> list[_LintFinding]:
             )
         )
 
-    # Rule 1 (SIG001 — v0.1.6 repurpose):
+    # Rule 1 (SIG001 — v0.1.6 repurpose, v0.1.7 docstring fix):
     # The original v0.1.4 SIG001 fired on declared-position misordering of
     # RateLimitCheck before content checks. v0.1.5 made that moot: the
     # check's class-level ``priority=100`` self-orders it last within
     # ADMISSION regardless of registration order. The remaining footgun
-    # is operators who construct ``RateLimitCheck`` with an explicit
-    # ``priority`` override below 100, which re-creates the original
-    # drain-on-refused-request behavior.
+    # is operators who SUBCLASS ``RateLimitCheck`` and override the
+    # class-level ``priority`` attribute below 100 (e.g.
+    # ``class FastRL(RateLimitCheck): priority = 10``), which re-creates
+    # the original drain-on-refused-request behavior.
+    #
+    # IMPORTANT: ``RateLimitCheck.__init__`` does NOT accept a
+    # ``priority=`` keyword argument. v0.1.6 of this file's docstring
+    # incorrectly suggested it did. The lint logic itself is correct —
+    # it inspects the class-level attribute exposed via ``c.priority`` —
+    # but the only way for operators to make it fire is to subclass and
+    # override the class attr. Treat the rule as catching subclass
+    # overrides, not constructor arguments.
     #
     # CHANGELOG: SIG001 was repurposed in v0.1.6. Its original
     # registration-order check was retired alongside the v0.1.5 priority
-    # default. The rule now fires on explicit priority<100 overrides.
+    # default. The rule now fires on explicit priority<100 overrides
+    # via subclass, surfaced through the resolved ``c.priority``.
     for c in checks_by_index:
         if not isinstance(c, RateLimitCheck):
             continue
         # The class default is 100. ``c.priority`` may be a class attr
-        # or an instance attr depending on whether the operator
-        # subclassed and overrode it. Compare to 100 directly.
+        # (subclass override — the documented trigger) or an instance
+        # attr (rare, but possible if an operator monkey-patches one).
+        # Compare to 100 directly.
         rl_priority = getattr(c, "priority", 100)
         if isinstance(rl_priority, int) and rl_priority < 100:
             findings.append(
@@ -1971,11 +2273,16 @@ def _lint_pipeline(config_path: Path) -> list[_LintFinding]:
                     message=(
                         f"RateLimitCheck has priority={rl_priority}; values < 100 "
                         "recreate the v0.1.4 footgun where rate limits drain "
-                        "on downstream-blocked requests."
+                        "on downstream-blocked requests. The most common "
+                        "trigger is a subclass override "
+                        "(`class FastRL(RateLimitCheck): priority = 10`); "
+                        "RateLimitCheck.__init__ does not accept priority "
+                        "as a keyword argument."
                     ),
                     hint=(
-                        "Remove the priority override unless you specifically "
-                        "need rate limiting before content checks."
+                        "Remove the subclass priority override and keep the "
+                        "default of 100 unless you specifically need rate "
+                        "limiting to run before content checks."
                     ),
                 )
             )
@@ -2147,7 +2454,31 @@ def _load_pipeline_from_path(path: Path) -> Pipeline:
     if spec is None or spec.loader is None:
         raise click.ClickException(f"could not load config from {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # C5 (v0.1.7): Wrap the exec so the operator sees a one-line
+    # ClickException instead of a Python traceback when ``signet lint``
+    # / ``signet serve --config`` is pointed at a file with a syntax or
+    # import error. The traceback is the wrong UX for a CLI surface —
+    # they want to know which file and which line, not the Python call
+    # stack. The broad catch is intentional: arbitrary user code may
+    # raise anything at import time (NameError, AttributeError, ...).
+    try:
+        spec.loader.exec_module(module)
+    except SyntaxError as exc:
+        raise click.ClickException(
+            f"syntax error in {path}: {exc.msg} at line {exc.lineno}"
+        ) from exc
+    except ImportError as exc:
+        raise click.ClickException(
+            f"failed to import {path}: {exc}"
+        ) from exc
+    except click.ClickException:
+        # Don't double-wrap — _load_pipeline_from_path may be called
+        # transitively. Pass through.
+        raise
+    except Exception as exc:
+        raise click.ClickException(
+            f"failed to load {path}: {type(exc).__name__}: {exc}"
+        ) from exc
     from signet.core.pipeline import Pipeline as _Pipeline
 
     pipeline = getattr(module, "pipeline", None)

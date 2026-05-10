@@ -369,11 +369,22 @@ class TestDoctor:
         assert "OK:" in result.output
 
     def test_init_refuses_overwrite(self, tmp_path: Path) -> None:
-        (tmp_path / "pipeline.py").write_text("# pre-existing", encoding="utf-8")
+        # v0.1.7 (C2): init now does partial-write-skip-existing — when
+        # ``pipeline.py`` exists alone, the other files are still
+        # written and the existing pipeline.py is preserved unchanged
+        # with a "skipped (already exists)" note. Only when every
+        # scaffolded file exists does init refuse with exit code 1.
+        original = "# pre-existing"
+        (tmp_path / "pipeline.py").write_text(original, encoding="utf-8")
         runner = CliRunner()
         result = runner.invoke(main, ["init", str(tmp_path)])
-        assert result.exit_code == 1
-        assert "refusing to overwrite" in result.output
+        assert result.exit_code == 0, result.output
+        assert "skipped (already exists)" in result.output
+        # The pre-existing file must NOT have been overwritten.
+        assert (tmp_path / "pipeline.py").read_text(encoding="utf-8") == original
+        # And the other files must have been scaffolded.
+        assert (tmp_path / ".env.example").exists()
+        assert (tmp_path / "client_example.py").exists()
 
     def test_init_scaffold_imports_cleanly(self, tmp_path: Path) -> None:
         """The starter pipeline.py must be valid Python that imports cleanly."""
@@ -1145,3 +1156,844 @@ class TestAuditReport:
         )
         assert result.exit_code != 0
         assert "anonymize-salt" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# v0.1.7 P0/HIGH/MED CLI fixes
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorSelfDownExitCode:
+    """v0.1.7 C1: ``signet doctor --self <down>`` must exit non-zero
+    when the proxy is unreachable. The previous version had a stray
+    ``return`` in the /health except branch that skipped the final
+    ``sys.exit(1 if failed else 0)``.
+    """
+
+    def test_doctor_self_unreachable_exits_1(self) -> None:
+        runner = CliRunner()
+        # Deliberately unroutable port -- /health probe will fail with
+        # a connection-refused error.
+        result = runner.invoke(main, ["doctor", "--self", "http://127.0.0.1:1/"])
+        assert result.exit_code == 1, result.output
+        assert "/health" in result.output
+        assert "unreachable" in result.output.lower()
+
+
+class TestInitPartialWriteSkip:
+    """v0.1.7 C2: ``signet init`` does partial-write-skip-existing.
+    Operators who delete just ``pipeline.py`` (the most common
+    re-init workflow) get exactly that file scaffolded back without
+    losing edits to ``client_example.py`` / ``.env.example``.
+    """
+
+    def test_init_skips_existing_client_and_env(self, tmp_path: Path) -> None:
+        client_path = tmp_path / "client_example.py"
+        env_path = tmp_path / ".env.example"
+        client_path.write_text("# user-edited client", encoding="utf-8")
+        env_path.write_text("# user-edited env\nKEY=value\n", encoding="utf-8")
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["init", str(tmp_path)])
+        assert result.exit_code == 0, result.output
+        # Both pre-existing files are reported as skipped.
+        assert "skipped (already exists)" in result.output
+        assert "client_example.py" in result.output
+        assert ".env.example" in result.output
+        # The originals are preserved.
+        assert client_path.read_text(encoding="utf-8") == "# user-edited client"
+        assert env_path.read_text(encoding="utf-8") == "# user-edited env\nKEY=value\n"
+        # And the missing pipeline.py was scaffolded.
+        assert (tmp_path / "pipeline.py").exists()
+        assert "from signet.checks import" in (
+            tmp_path / "pipeline.py"
+        ).read_text(encoding="utf-8")
+
+    def test_init_refuses_when_every_file_exists(self, tmp_path: Path) -> None:
+        # All four scaffolded files pre-exist.
+        for name in ("pipeline.py", ".env.example", "client_example.py", ".gitignore"):
+            (tmp_path / name).write_text("pre", encoding="utf-8")
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["init", str(tmp_path)])
+        assert result.exit_code == 1
+        assert "refusing to overwrite" in result.output
+
+
+class TestKeysGenerateEd25519PathRepr:
+    """v0.1.7 C4: the keys generate-ed25519 success message renders
+    paths via ``repr()`` so Windows backslashes become escaped Python
+    strings (``'D:\\tmp\\priv.pem'``) that parse cleanly when copy-
+    pasted as code.
+    """
+
+    def test_emits_repr_quoted_paths(self, tmp_path: Path) -> None:
+        priv_path = tmp_path / "signet.key"
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["keys", "generate-ed25519", "--out", str(priv_path), "--key-id", "test"],
+        )
+        assert result.exit_code == 0, result.output
+        # The emitted code uses ``private_pem_path=<repr>`` and
+        # ``public_pem_path=<repr>``. ``repr(str(Path))`` always
+        # produces a Python string literal -- on POSIX that's a
+        # single-quoted string with forward slashes; on Windows it's
+        # a single-quoted string with doubled backslashes. Either
+        # parses under ``compile()``.
+        assert f"private_pem_path={str(priv_path)!r}" in result.output
+        assert (
+            f"public_pem_path={str(priv_path) + '.pub'!r}" in result.output
+        )
+
+        # And the snippet must compile as Python.
+        import re
+
+        snippet = re.search(
+            r"Ed25519ReceiptSigner\.from_pem\(\s*private_pem_path=([^,]+),",
+            result.output,
+        )
+        assert snippet is not None
+        # ``compile()`` rejects invalid escapes only when the source
+        # contains them; this is the regression we care about.
+        compile(f"x = {snippet.group(1)}", "<test>", "exec")
+
+
+class TestPluginsDoctor:
+    """v0.1.7 P1: ``signet plugins doctor`` is the CI gate for plugin
+    issues. Detects duplicate (group, name) pairs and any plugin with
+    non-loaded status; exit 1 when either is non-empty.
+    """
+
+    def _plugin(self, **overrides):
+        from signet.plugins.discovery import DiscoveredPlugin
+
+        defaults = {
+            "group": "signet.checks",
+            "name": "example",
+            "package": "pkg-a",
+            "package_version": "0.1.0",
+            "target": "pkg_a:Example",
+            "status": "loaded",
+            "abi_declared": 1,
+            "abi_required": 1,
+            "error": None,
+            "obj": object,
+        }
+        defaults.update(overrides)
+        return DiscoveredPlugin(**defaults)
+
+    def test_doctor_clean_exits_0(self, monkeypatch) -> None:
+        plugins = [
+            self._plugin(name="alpha"),
+            self._plugin(name="beta", package="pkg-b"),
+        ]
+        import signet.plugins as signet_plugins
+
+        monkeypatch.setattr(
+            signet_plugins, "discover_plugins", lambda *, refresh=False: plugins
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["plugins", "doctor"])
+        assert result.exit_code == 0, result.output
+        assert "OK" in result.output
+
+    def test_doctor_flags_duplicate_names(self, monkeypatch) -> None:
+        plugins = [
+            self._plugin(name="duplicate", package="pkg-a"),
+            self._plugin(name="duplicate", package="pkg-b"),
+        ]
+        import signet.plugins as signet_plugins
+
+        monkeypatch.setattr(
+            signet_plugins, "discover_plugins", lambda *, refresh=False: plugins
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["plugins", "doctor"])
+        assert result.exit_code == 1
+        assert "DUPLICATE PLUGIN NAMES" in result.output
+        assert "duplicate" in result.output
+        assert "pkg-a" in result.output and "pkg-b" in result.output
+
+    def test_doctor_flags_failed_plugins(self, monkeypatch) -> None:
+        plugins = [
+            self._plugin(name="ok"),
+            self._plugin(
+                name="bad_abi",
+                status="incompatible_abi",
+                abi_declared=99,
+                error="declares 99; signet wants 1",
+            ),
+            self._plugin(
+                name="bad_load",
+                status="load_error",
+                error="ImportError: nope",
+            ),
+        ]
+        import signet.plugins as signet_plugins
+
+        monkeypatch.setattr(
+            signet_plugins, "discover_plugins", lambda *, refresh=False: plugins
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["plugins", "doctor"])
+        assert result.exit_code == 1
+        assert "NON-LOADED" in result.output
+        assert "bad_abi" in result.output
+        assert "bad_load" in result.output
+
+    def test_doctor_json_output(self, monkeypatch) -> None:
+        import json
+
+        plugins = [
+            self._plugin(name="dup", package="a"),
+            self._plugin(name="dup", package="b"),
+            self._plugin(name="ok"),
+        ]
+        import signet.plugins as signet_plugins
+
+        monkeypatch.setattr(
+            signet_plugins, "discover_plugins", lambda *, refresh=False: plugins
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["plugins", "doctor", "--json"])
+        assert result.exit_code == 1
+        parsed = json.loads(result.output)
+        assert parsed["ok"] is False
+        assert parsed["duplicate_count"] == 1
+        assert parsed["duplicates"][0]["name"] == "dup"
+
+
+class TestLintErrorsAreOneLine:
+    """v0.1.7 C5: lint surfaces a one-line ClickException when the
+    pipeline file has a syntax or import error, instead of a full
+    Python traceback.
+    """
+
+    def test_syntax_error_in_pipeline_emits_clean_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "pipeline.py"
+        path.write_text(
+            "from signet.core.pipeline import Pipeline\n"
+            "pipeline = Pipeline(checks=[\n"
+            "    # missing close-bracket -> SyntaxError\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["lint", str(path)])
+        assert result.exit_code != 0
+        # No Python traceback should be emitted; click handles the
+        # ClickException as a one-line error prefixed with "Error:".
+        assert "Traceback (most recent call last)" not in result.output
+        assert "syntax error" in result.output.lower()
+
+    def test_import_error_in_pipeline_emits_clean_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "pipeline.py"
+        path.write_text(
+            "import nonexistent_signet_test_module  # noqa: F401\n"
+            "from signet.core.pipeline import Pipeline\n"
+            "pipeline = Pipeline(checks=[])\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["lint", str(path)])
+        assert result.exit_code != 0
+        assert "Traceback (most recent call last)" not in result.output
+        # The wrapped error message includes the imported name.
+        out = result.output.lower()
+        assert "failed to import" in out or "no module named" in out
+
+
+class TestAuditCorruptLogClickException:
+    """v0.1.7 C6: every audit subcommand that walks the chain emits a
+    one-line ClickException on a malformed JSONL line instead of a
+    Python traceback (MalformedAuditEntry).
+    """
+
+    def _build_corrupt_log(self, log_path: Path) -> None:
+        # First line is valid JSON; second line is a half-written
+        # entry (the realistic post-crash truncation).
+        log_path.write_text(
+            "{}\n"  # parses but isn't a valid AuditEntry
+            "{not valid json,\n",
+            encoding="utf-8",
+        )
+
+    def test_audit_count_clean_error_on_malformed(self, tmp_path: Path) -> None:
+        # We need a log with one valid AuditEntry then a bad line so
+        # iter_entries() actually reaches the malformed line. Build a
+        # real entry first, then append garbage.
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        chain.append(
+            AuditEntry(
+                owner=Owner.human("alice"),
+                check_name="x",
+                decision=Decision.ALLOW,
+                reason="ok",
+            )
+        )
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write("{not valid json,\n")
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", "count", str(log_path)])
+        assert result.exit_code != 0
+        assert "Traceback (most recent call last)" not in result.output
+        assert "malformed" in result.output.lower()
+        assert "line 2" in result.output
+
+    def test_audit_tail_clean_error_on_malformed(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        chain.append(
+            AuditEntry(
+                owner=Owner.human("alice"),
+                check_name="x",
+                decision=Decision.ALLOW,
+                reason="ok",
+            )
+        )
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write("{not valid json,\n")
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", "tail", str(log_path)])
+        assert result.exit_code != 0
+        assert "Traceback (most recent call last)" not in result.output
+        assert "malformed" in result.output.lower()
+
+    def test_audit_show_clean_error_on_malformed(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        chain.append(
+            AuditEntry(
+                owner=Owner.human("alice"),
+                check_name="x",
+                decision=Decision.ALLOW,
+                reason="ok",
+            )
+        )
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write("{not valid json,\n")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "show",
+                "00000000-0000-0000-0000-000000000000",
+                "--audit-log",
+                str(log_path),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "Traceback (most recent call last)" not in result.output
+        assert "malformed" in result.output.lower()
+
+    def test_replay_clean_error_on_malformed(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        chain.append(
+            AuditEntry(
+                owner=Owner.human("alice"),
+                check_name="x",
+                decision=Decision.ALLOW,
+                reason="ok",
+            )
+        )
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write("{not valid json,\n")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "replay",
+                "00000000-0000-0000-0000-000000000000",
+                "--audit-log",
+                str(log_path),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "Traceback (most recent call last)" not in result.output
+        assert "malformed" in result.output.lower()
+
+
+class TestAuditTailFilterValidation:
+    """v0.1.7 C7: ``audit tail --filter foo=bar`` raises ClickException
+    on unknown fields rather than silently filtering out everything.
+    """
+
+    def test_unknown_filter_field_errors(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        chain.append(
+            AuditEntry(
+                owner=Owner.human("alice"),
+                check_name="x",
+                decision=Decision.ALLOW,
+                reason="ok",
+            )
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            main, ["audit", "tail", str(log_path), "--filter", "foo=bar"]
+        )
+        assert result.exit_code != 0
+        assert "unknown filter field" in result.output.lower()
+        assert "foo" in result.output
+
+    def test_known_filter_fields_still_work(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        chain.append(
+            AuditEntry(
+                owner=Owner.human("alice"),
+                check_name="rate_limit",
+                decision=Decision.ALLOW,
+                reason="ok",
+            )
+        )
+        chain.append(
+            AuditEntry(
+                owner=Owner.human("alice"),
+                check_name="prompt_injection",
+                decision=Decision.BLOCK,
+                reason="bad",
+            )
+        )
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ["audit", "tail", str(log_path), "--filter", "decision=block"],
+        )
+        assert result.exit_code == 0, result.output
+        # Only the BLOCK entry should appear.
+        assert "prompt_injection" in result.output
+        assert "rate_limit" not in result.output
+
+
+class TestLintVersionInSuccessMessage:
+    """v0.1.7: lint success message interpolates ``__version__`` so it
+    no longer says ``v0.1.5`` after the version moves on.
+    """
+
+    def test_success_message_uses_current_version(self, tmp_path: Path) -> None:
+        from signet import __version__
+
+        path = tmp_path / "pipeline.py"
+        path.write_text(
+            "from signet.checks import (OwnerResolutionCheck, "
+            "ScopeDriftCheck, ClassificationGateCheck)\n"
+            "from signet.core.pipeline import Pipeline\n"
+            "pipeline = Pipeline(checks=[\n"
+            "    OwnerResolutionCheck(require_owner=True),\n"
+            "    ClassificationGateCheck(),\n"
+            "    ScopeDriftCheck(),\n"
+            "])\n",
+            encoding="utf-8",
+        )
+        runner = CliRunner()
+        result = runner.invoke(main, ["lint", str(path)])
+        assert result.exit_code == 0, result.output
+        assert f"v{__version__}" in result.output
+        # Stale version string is gone.
+        if __version__ != "0.1.5":
+            assert "v0.1.5 lint checks" not in result.output
+
+
+class TestSig001SubclassDocstring:
+    """v0.1.7 C3: SIG001 message clarifies the trigger is a subclass
+    override, since RateLimitCheck.__init__ does not accept priority=
+    as a kwarg.
+    """
+
+    _SUBCLASS_PIPELINE = """
+from signet.checks import (OwnerResolutionCheck, RateLimitCheck,
+    ScopeDriftCheck)
+from signet.core.pipeline import Pipeline
+
+
+class FastRateLimit(RateLimitCheck):
+    priority = 10  # documented v0.1.4 footgun
+
+
+pipeline = Pipeline(checks=[
+    OwnerResolutionCheck(require_owner=True),
+    FastRateLimit(capacity=60, refill_per_second=1.0),
+    ScopeDriftCheck(),
+])
+"""
+
+    def test_sig001_fires_on_subclass_override_with_subclass_hint(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "pipeline.py"
+        path.write_text(self._SUBCLASS_PIPELINE, encoding="utf-8")
+        runner = CliRunner()
+        result = runner.invoke(main, ["lint", str(path)])
+        assert "SIG001" in result.output
+        assert "priority=10" in result.output
+        # The remediation now mentions subclasses, not constructor args.
+        assert "subclass" in result.output.lower()
+
+
+class TestAuditReportPolish:
+    """v0.1.7 A5/A12 + pluralization: the audit report markdown
+    renders the anonymize section conditionally, strips ``+00:00``
+    from ISO timestamps, and pluralizes ``block`` correctly.
+    """
+
+    def _build_chain_with_one_block(self, log_path: Path, secret: bytes) -> None:
+        import time
+
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        now_ns = time.time_ns()
+        chain.append(
+            AuditEntry(
+                owner=Owner.human("alice"),
+                check_name="prompt_injection",
+                decision=Decision.BLOCK,
+                reason="blocked",
+                ts_ns=now_ns - 60 * 1_000_000_000,
+            )
+        )
+
+    def test_no_anonymize_header_drops_anonymized_label(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_chain_with_one_block(log_path, secret)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "report",
+                "--audit-log",
+                str(log_path),
+                "--since",
+                "1h",
+                "--no-anonymize",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "## Top blocked owners" in result.output
+        assert "(anonymized)" not in result.output
+
+    def test_anonymize_header_keeps_anonymized_label(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_chain_with_one_block(log_path, secret)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "report",
+                "--audit-log",
+                str(log_path),
+                "--since",
+                "1h",
+                "--anonymize-salt",
+                "test-salt",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "## Top blocked owners (anonymized)" in result.output
+
+    def test_range_header_strips_double_utc_tag(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_chain_with_one_block(log_path, secret)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "report",
+                "--audit-log",
+                str(log_path),
+                "--since",
+                "1h",
+                "--no-anonymize",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        # The "+00:00 UTC" double-tag must be gone.
+        assert "+00:00 UTC" not in result.output
+        # The single UTC label remains.
+        assert " UTC " in result.output
+
+    def test_blocks_pluralization(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        # Exactly one block by alice -> "1 block" (no s).
+        self._build_chain_with_one_block(log_path, secret)
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "report",
+                "--audit-log",
+                str(log_path),
+                "--since",
+                "1h",
+                "--no-anonymize",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "1 block" in result.output
+        # Defensively assert no "1 blocks".
+        assert "1 blocks" not in result.output
+
+
+class TestAuditCompactForce:
+    """v0.1.7 A4: ``signet audit compact --force`` plumbs through to
+    ``compact_audit_log(force=True)`` so an existing archive at
+    ``--output`` can be intentionally overwritten.
+    """
+
+    def _build_chain(self, log_path: Path, secret: bytes, n: int):
+        from datetime import UTC, datetime
+
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        appended = []
+        base_ts = int(datetime(2026, 1, 1, tzinfo=UTC).timestamp() * 1e9)
+        for i in range(n):
+            entry = AuditEntry(
+                owner=Owner.human(f"u{i}"),
+                check_name="owner_resolution",
+                decision=Decision.ALLOW,
+                reason="ok",
+                ts_ns=base_ts + i * 1_000_000_000,
+            )
+            appended.append(chain.append(entry))
+        return appended
+
+    def test_compact_refuses_when_archive_exists_without_force(
+        self, tmp_path: Path
+    ) -> None:
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        self._build_chain(log_path, secret, 3)
+        archive = tmp_path / "archive.bin"
+        # Pre-create the archive file so the compactor's
+        # FileExistsError fires.
+        archive.write_bytes(b"existing")
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "compact",
+                "--audit-log",
+                str(log_path),
+                "--before",
+                "2030-01-01T00:00:00Z",
+                "--output",
+                str(archive),
+                "--hmac-secret",
+                secret.hex(),
+                "--quiesce-confirm",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "refusing to overwrite" in result.output.lower()
+        # Original bytes must be untouched.
+        assert archive.read_bytes() == b"existing"
+
+    def test_compact_force_overwrites_existing_archive(self, tmp_path: Path) -> None:
+        from datetime import UTC, datetime
+
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        entries = self._build_chain(log_path, secret, 5)
+        archive = tmp_path / "archive.bin"
+        archive.write_bytes(b"existing")
+
+        cutoff_ts_ns = entries[3].ts_ns
+        cutoff_iso = (
+            datetime.fromtimestamp(cutoff_ts_ns / 1e9, tz=UTC)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "compact",
+                "--audit-log",
+                str(log_path),
+                "--before",
+                cutoff_iso,
+                "--output",
+                str(archive),
+                "--hmac-secret",
+                secret.hex(),
+                "--quiesce-confirm",
+                "--force",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "compaction complete" in result.output
+        # And the archive on disk is no longer the placeholder.
+        assert archive.read_bytes() != b"existing"
+
+
+class TestAuditVerifySummarizeCascades:
+    """v0.1.7 A11: ``signet audit verify --summarize-cascades`` plumbs
+    through to ChainVerifier(compact_breaks=True).
+    """
+
+    def test_summarize_cascades_collapses_link_breaks(self, tmp_path: Path) -> None:
+        # Build a chain of N entries, then surgically tamper the FIRST
+        # entry's stored ``hmac`` field. The next entry's ``prev_hmac``
+        # is unchanged on disk but no longer matches the (tampered)
+        # entry-1 hmac, so the verifier emits a link_mismatch on
+        # entry 2. Each later entry inherits the now-broken
+        # prev_hmac comparison through the same mechanism, so
+        # entries 3..N also produce link_mismatch breaks. That is
+        # the cascade that ``--summarize-cascades`` collapses.
+        import json as _json
+
+        log_path = tmp_path / "audit.jsonl"
+        secret = b"x" * 32
+        keyring = KeyRing(active=Key(key_id="k1", secret=secret))
+        chain = HmacChain(JsonlBackend(log_path), keyring)
+        for i in range(6):
+            chain.append(
+                AuditEntry(
+                    owner=Owner.human(f"u{i}"),
+                    check_name="owner_resolution",
+                    decision=Decision.ALLOW,
+                    reason="ok",
+                )
+            )
+
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        first = _json.loads(lines[0])
+        # Flip one hex character in the stored hmac.
+        original = first["hmac"]
+        flipped_char = "0" if original[0] != "0" else "1"
+        first["hmac"] = flipped_char + original[1:]
+        # Re-serialize with the same canonical form (sort_keys, no
+        # whitespace) so other fields stay identical.
+        lines[0] = _json.dumps(first, separators=(",", ":"), sort_keys=True)
+        log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        runner = CliRunner()
+        baseline = runner.invoke(
+            main,
+            [
+                "audit",
+                "verify",
+                str(log_path),
+                "--hmac-secret",
+                secret.hex(),
+            ],
+        )
+        assert baseline.exit_code == 2
+        baseline_break_count = baseline.output.count("link_mismatch")
+        # The cascade is real — at least the second entry's link is
+        # broken by the tamper.
+        assert baseline_break_count >= 1
+
+        with_flag = runner.invoke(
+            main,
+            [
+                "audit",
+                "verify",
+                str(log_path),
+                "--hmac-secret",
+                secret.hex(),
+                "--summarize-cascades",
+            ],
+        )
+        assert with_flag.exit_code == 2
+        out_lower = with_flag.output.lower()
+        # When more than one downstream entry cascades, the flag
+        # introduces a CASCADE_SUPPRESSED line. With only one
+        # downstream link_mismatch the verifier may still emit it
+        # individually; either way, the summarized output has at
+        # most as many link_mismatch lines as the baseline.
+        if baseline_break_count >= 2:
+            assert "cascade_suppressed" in out_lower
+        assert (
+            with_flag.output.count("link_mismatch")
+            <= baseline_break_count
+        )
+
+
+class TestProbeCorpusBase32:
+    """v0.1.7: the base32_encoded probe is now a real round-trippable
+    encoding of ``ignore previous instructions``.
+    """
+
+    def test_base32_decodes_to_expected_text(self) -> None:
+        import base64
+
+        from signet.cli_helpers.probe_injection_corpus import (
+            PROMPT_INJECTION_PROBE_CORPUS,
+        )
+
+        probe = next(
+            p for p in PROMPT_INJECTION_PROBE_CORPUS if p.name == "base32_encoded"
+        )
+        # Strip the "Decode: " prefix.
+        encoded = probe.payload.split("Decode:", 1)[1].strip()
+        decoded = base64.b32decode(encoded).decode("ascii")
+        assert "ignore previous instructions" in decoded.lower()
+
+    def test_other_decoded_corpus_entries_round_trip(self) -> None:
+        # Sanity-check that the other decoder probes still decode to
+        # the canonical phrase. Catches similar regressions in
+        # base64/hex/rot13 if anyone edits the corpus carelessly.
+        import base64
+        import codecs
+
+        from signet.cli_helpers.probe_injection_corpus import (
+            PROMPT_INJECTION_PROBE_CORPUS,
+        )
+
+        by_name = {p.name: p for p in PROMPT_INJECTION_PROBE_CORPUS}
+
+        b64 = by_name["base64_encoded"].payload.split(":", 1)[1].strip()
+        assert (
+            "ignore previous instructions"
+            in base64.b64decode(b64).decode("ascii").lower()
+        )
+
+        hex_payload = by_name["hex_encoded"].payload.split(":", 1)[1].strip()
+        assert (
+            "ignore previous instructions"
+            in bytes.fromhex(hex_payload).decode("ascii").lower()
+        )
+
+        rot13_payload = by_name["rot13_encoded"].payload.split(":", 1)[1].strip()
+        assert (
+            "ignore previous instructions"
+            in codecs.decode(rot13_payload, "rot_13").lower()
+        )
