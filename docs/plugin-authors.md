@@ -53,6 +53,25 @@ geo = resolve("geopolitical_compliance")
 pipeline = Pipeline(checks=[geo(strict=True), ...])
 ```
 
+## Duplicate entry-point names
+
+Two packages cannot share an entry-point name in the same group.
+If both `pkg-one` and `pkg-two` register
+`signet.checks: geopolitical_compliance = ...`, signet's discovery
+walk now flags **both** entries as `duplicate_name` rather than
+silently picking whichever was installed first. The CLI surfaces
+the conflict and `signet.plugins.resolve(...)` raises `RuntimeError`
+listing the conflicting packages so the operator knows which one
+to uninstall.
+
+This matters most for plugin upgrades: if a vendor renames the
+import path but keeps the entry-point name, an old version of the
+package left behind in `site-packages` would silently shadow the
+new one. Discovery-time detection turns that into a loud failure.
+
+If you need parallel implementations, give them distinct names —
+`my_check_v1`, `my_check_v2` — or scope them to a different group.
+
 ## ABI versioning
 
 signet exposes `signet.core.check.CHECK_ABI_VERSION` as a stable

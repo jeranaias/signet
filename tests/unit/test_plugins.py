@@ -81,7 +81,12 @@ class TestDiscovery:
             assert isinstance(entry.package, str)
             assert isinstance(entry.package_version, str)
             assert isinstance(entry.target, str) and ":" in entry.target
-            assert entry.status in {"loaded", "incompatible_abi", "load_error"}
+            assert entry.status in {
+                "loaded",
+                "incompatible_abi",
+                "load_error",
+                "duplicate_name",
+            }
             assert isinstance(entry.abi_required, int)
             if entry.status == "loaded":
                 assert entry.error is None
@@ -135,6 +140,256 @@ class TestDiscovery:
 
         cls = resolve("stub_resolve_check")
         assert cls is _StubCheck
+
+    def test_duplicate_entry_point_names_flagged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two packages registering the same (group, name) must both
+        be marked ``duplicate_name`` with ``duplicate_with`` pointing
+        at the OTHER package, and ``obj`` cleared so the silently
+        shadowed class can no longer be invoked.
+        """
+        from signet.core.check import Check
+        from signet.core.stage import Stage
+        from signet.plugins import discovery as discovery_mod
+
+        class _FirstCheck(Check):
+            name = "conflicting_name"
+            stage = Stage.ADMISSION
+
+        class _SecondCheck(Check):
+            name = "conflicting_name"
+            stage = Stage.ADMISSION
+
+        class _FakeDist:
+            def __init__(self, name: str, version: str) -> None:
+                self.name = name
+                self.version = version
+
+        class _FakeEP:
+            def __init__(self, name: str, value: str, target, dist) -> None:
+                self.name = name
+                self.value = value
+                self._target = target
+                self.dist = dist
+
+            def load(self):
+                return self._target
+
+        eps_by_group = {
+            "signet.checks": [
+                _FakeEP(
+                    "conflicting_name",
+                    "pkg_one.checks:_FirstCheck",
+                    _FirstCheck,
+                    _FakeDist("pkg-one", "1.0.0"),
+                ),
+                _FakeEP(
+                    "conflicting_name",
+                    "pkg_two.checks:_SecondCheck",
+                    _SecondCheck,
+                    _FakeDist("pkg-two", "2.0.0"),
+                ),
+            ],
+            "signet.adapters": [],
+            "signet.anchors": [],
+        }
+
+        def fake_iter(group: str):
+            return list(eps_by_group.get(group, []))
+
+        monkeypatch.setattr(discovery_mod, "_iter_entry_points", fake_iter)
+        reset_cache()
+        result = discover_plugins(refresh=True)
+
+        conflicting = [p for p in result if p.name == "conflicting_name"]
+        assert len(conflicting) == 2
+        for entry in conflicting:
+            assert entry.status == "duplicate_name"
+            assert entry.obj is None
+            assert entry.error is not None
+            assert "conflicting_name" in entry.error
+        # duplicate_with must point at the OTHER package, not self.
+        first = next(p for p in conflicting if p.package == "pkg-one")
+        second = next(p for p in conflicting if p.package == "pkg-two")
+        assert first.duplicate_with == ("pkg-two",)
+        assert second.duplicate_with == ("pkg-one",)
+
+        # discover() (back-compat dict facade) must NOT hand out a
+        # shadowed class for a duplicated name.
+        reset_cache()
+        monkeypatch.setattr(discovery_mod, "_iter_entry_points", fake_iter)
+        check_map = discover(refresh=True)
+        assert "conflicting_name" not in check_map
+
+    def test_resolve_refuses_duplicate_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """resolve() on a duplicated entry-point name must raise
+        ``RuntimeError`` naming the conflicting packages.
+        """
+        from signet.plugins import discovery as discovery_mod
+
+        dup_a = DiscoveredPlugin(
+            group="signet.checks",
+            name="conflicting_name",
+            package="pkg-one",
+            package_version="1.0.0",
+            target="pkg_one.checks:_FirstCheck",
+            status="duplicate_name",
+            abi_declared=None,
+            abi_required=1,
+            error="entry-point name 'conflicting_name' is also registered by: pkg-two",
+            obj=None,
+            duplicate_with=("pkg-two",),
+        )
+        dup_b = DiscoveredPlugin(
+            group="signet.checks",
+            name="conflicting_name",
+            package="pkg-two",
+            package_version="2.0.0",
+            target="pkg_two.checks:_SecondCheck",
+            status="duplicate_name",
+            abi_declared=None,
+            abi_required=1,
+            error="entry-point name 'conflicting_name' is also registered by: pkg-one",
+            obj=None,
+            duplicate_with=("pkg-one",),
+        )
+
+        def fake_discover_plugins(*, refresh: bool = False) -> list[DiscoveredPlugin]:
+            return [dup_a, dup_b]
+
+        import signet.plugins as plugins_pkg
+
+        monkeypatch.setattr(discovery_mod, "discover_plugins", fake_discover_plugins)
+        monkeypatch.setattr(plugins_pkg, "discover_plugins", fake_discover_plugins)
+
+        with pytest.raises(RuntimeError, match="duplicate registrations"):
+            resolve("conflicting_name")
+
+    def test_single_plugin_no_duplicates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One plugin under a name must remain ``loaded`` — the
+        duplicate-detection pass is a no-op for the common case.
+        """
+        from signet.core.check import Check
+        from signet.core.stage import Stage
+        from signet.plugins import discovery as discovery_mod
+
+        class _SoloCheck(Check):
+            name = "solo_check"
+            stage = Stage.ADMISSION
+
+        class _FakeDist:
+            def __init__(self, name: str, version: str) -> None:
+                self.name = name
+                self.version = version
+
+        class _FakeEP:
+            def __init__(self, name: str, value: str, target, dist) -> None:
+                self.name = name
+                self.value = value
+                self._target = target
+                self.dist = dist
+
+            def load(self):
+                return self._target
+
+        eps_by_group = {
+            "signet.checks": [
+                _FakeEP(
+                    "solo_check",
+                    "pkg_solo.checks:_SoloCheck",
+                    _SoloCheck,
+                    _FakeDist("pkg-solo", "1.0.0"),
+                ),
+            ],
+            "signet.adapters": [],
+            "signet.anchors": [],
+        }
+
+        def fake_iter(group: str):
+            return list(eps_by_group.get(group, []))
+
+        monkeypatch.setattr(discovery_mod, "_iter_entry_points", fake_iter)
+        reset_cache()
+        result = discover_plugins(refresh=True)
+
+        solo = [p for p in result if p.name == "solo_check"]
+        assert len(solo) == 1
+        assert solo[0].status == "loaded"
+        assert solo[0].duplicate_with == ()
+        assert solo[0].obj is _SoloCheck
+
+    def test_same_name_in_different_groups_is_not_a_duplicate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``signet.checks: foo`` and ``signet.adapters: foo`` are
+        independent registrations. Neither should be flagged as a
+        duplicate.
+        """
+        from signet.core.check import Check
+        from signet.core.stage import Stage
+        from signet.plugins import discovery as discovery_mod
+
+        class _FooCheck(Check):
+            name = "foo"
+            stage = Stage.ADMISSION
+
+        # The signet.adapters group has no ABI gate, so any object
+        # that EntryPoint.load() returns is recorded as "loaded".
+        class _FooAdapter:  # not a Check subclass — and that's fine
+            pass
+
+        class _FakeDist:
+            def __init__(self, name: str, version: str) -> None:
+                self.name = name
+                self.version = version
+
+        class _FakeEP:
+            def __init__(self, name: str, value: str, target, dist) -> None:
+                self.name = name
+                self.value = value
+                self._target = target
+                self.dist = dist
+
+            def load(self):
+                return self._target
+
+        eps_by_group = {
+            "signet.checks": [
+                _FakeEP(
+                    "foo",
+                    "pkg_a.checks:_FooCheck",
+                    _FooCheck,
+                    _FakeDist("pkg-a", "1.0.0"),
+                ),
+            ],
+            "signet.adapters": [
+                _FakeEP(
+                    "foo",
+                    "pkg_b.adapters:_FooAdapter",
+                    _FooAdapter,
+                    _FakeDist("pkg-b", "1.0.0"),
+                ),
+            ],
+            "signet.anchors": [],
+        }
+
+        def fake_iter(group: str):
+            return list(eps_by_group.get(group, []))
+
+        monkeypatch.setattr(discovery_mod, "_iter_entry_points", fake_iter)
+        reset_cache()
+        result = discover_plugins(refresh=True)
+
+        foos = [p for p in result if p.name == "foo"]
+        assert len(foos) == 2
+        for entry in foos:
+            assert entry.status == "loaded"
+            assert entry.duplicate_with == ()
 
     def test_incompatible_abi_marked_as_unloaded(
         self, monkeypatch: pytest.MonkeyPatch

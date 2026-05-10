@@ -83,10 +83,15 @@ def resolve(name: str, *, group: str = "signet.checks") -> type[Check]:
         KeyError: When no plugin with that name is registered in
             ``group``. The message lists the known names so typos
             surface immediately.
-        RuntimeError: When the plugin was discovered but failed to
-            load or declared an ABI version signet refuses
-            (status ``"load_error"`` or ``"incompatible_abi"``).
-            The original error message is embedded.
+        RuntimeError: When the plugin was discovered but is unsafe
+            to use — failed to load (status ``"load_error"``),
+            declared an incompatible ABI (status
+            ``"incompatible_abi"``), or has been registered by two
+            or more packages under the same name (status
+            ``"duplicate_name"``). The original error message is
+            embedded; for duplicate names the message names the
+            conflicting packages so the operator knows which one to
+            uninstall.
     """
     plugins = discover_plugins()
     matches = [p for p in plugins if p.group == group and p.name == name]
@@ -99,6 +104,12 @@ def resolve(name: str, *, group: str = "signet.checks") -> type[Check]:
             f"known plugins: {', '.join(known)}"
         )
     plugin = matches[0]
+    if plugin.status == "duplicate_name":
+        raise RuntimeError(
+            f"signet plugin {name!r} ({group}) has duplicate "
+            f"registrations: {plugin.duplicate_with}; resolve "
+            f"ambiguity by uninstalling the conflicting package"
+        )
     if plugin.status != "loaded":
         raise RuntimeError(
             f"signet plugin {name!r} ({group}) is unavailable "

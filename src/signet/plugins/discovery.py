@@ -21,7 +21,7 @@ interpreter startups. Pass ``refresh=True`` (or call
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from importlib.metadata import EntryPoint, entry_points
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -44,7 +44,9 @@ ENTRY_POINT_GROUPS: tuple[str, ...] = (
 logger = logging.getLogger("signet.plugins")
 
 
-PluginStatus = Literal["loaded", "incompatible_abi", "load_error"]
+PluginStatus = Literal[
+    "loaded", "incompatible_abi", "load_error", "duplicate_name"
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,18 +66,28 @@ class DiscoveredPlugin:
         target: ``"module.path:Symbol"`` — the entry point's value.
         status: ``"loaded"`` for a successfully loaded plugin,
             ``"incompatible_abi"`` when the plugin declares an ABI
-            version signet does not accept, or ``"load_error"`` when
+            version signet does not accept, ``"load_error"`` when
             ``EntryPoint.load()`` raised or the loaded object failed
-            type validation.
+            type validation, or ``"duplicate_name"`` when two or more
+            packages register the same ``(group, name)`` pair (in
+            which case ``obj`` is cleared so a silently shadowed class
+            cannot be invoked).
         abi_declared: The plugin's declared :data:`CHECK_ABI_VERSION`
             (only meaningful for the ``signet.checks`` group). ``None``
             when the plugin failed to load or did not declare one.
         abi_required: signet's ``CHECK_ABI_VERSION`` at the time of
             discovery.
-        error: Populated on ``load_error`` (the exception text) or
-            ``incompatible_abi`` (a human-readable mismatch message);
-            ``None`` otherwise.
+        error: Populated on ``load_error`` (the exception text),
+            ``incompatible_abi`` (a human-readable mismatch message),
+            or ``duplicate_name`` (a message naming the conflicting
+            packages); ``None`` otherwise.
         obj: The loaded class. Only set when ``status == "loaded"``.
+        duplicate_with: When ``status == "duplicate_name"``, the
+            distribution names of the OTHER packages that registered
+            the same ``(group, name)`` pair. Empty tuple in every
+            other status. CLI surfaces (``signet plugins list``,
+            ``signet plugins doctor``) read this to render a
+            disambiguation hint.
     """
 
     group: str
@@ -88,6 +100,7 @@ class DiscoveredPlugin:
     abi_required: int
     error: str | None
     obj: Any | None
+    duplicate_with: tuple[str, ...] = field(default=())
 
 
 _DISCOVERED_PLUGINS_CACHE: list[DiscoveredPlugin] | None = None
@@ -229,6 +242,51 @@ def discover_plugins(*, refresh: bool = False) -> list[DiscoveredPlugin]:
                         obj=obj,
                     )
                 )
+
+    # Detect duplicate (group, name) registrations. importlib.metadata
+    # happily returns multiple entry points with the same name when two
+    # packages both register one — the first by install order wins
+    # silently. Plugin upgrades that retain the name but change the
+    # import path therefore appear successful while still running the
+    # old class. We refuse the ambiguity at discovery time and let the
+    # CLI surface it.
+    seen_keys: dict[tuple[str, str], list[int]] = {}
+    for idx, plugin in enumerate(results):
+        seen_keys.setdefault((plugin.group, plugin.name), []).append(idx)
+
+    for (_group, _name), indices in seen_keys.items():
+        if len(indices) <= 1:
+            continue
+        # Build a stable list of the conflicting packages, with a
+        # placeholder for entry points whose distribution metadata
+        # could not be resolved (so the message is still actionable).
+        package_labels = [
+            results[i].package or "<unknown distribution>" for i in indices
+        ]
+        for idx in indices:
+            others = tuple(
+                package_labels[j] for j, other_idx in enumerate(indices)
+                if other_idx != idx
+            )
+            this_pkg = results[idx].package or "<unknown distribution>"
+            msg = (
+                f"entry-point name {results[idx].name!r} in group "
+                f"{results[idx].group!r} is also registered by: "
+                f"{', '.join(others)} (this entry: {this_pkg})"
+            )
+            logger.warning("%s; refusing to load (ambiguous)", msg)
+            results[idx] = replace(
+                results[idx],
+                status="duplicate_name",
+                error=msg,
+                obj=None,
+                duplicate_with=others,
+            )
+        # If any collisions land on signet.checks, drop the now-unsafe
+        # entries from the back-compat checks map so discover() doesn't
+        # hand callers a shadowed class.
+        if results[indices[0]].group == "signet.checks":
+            checks.pop(results[indices[0]].name, None)
 
     _DISCOVERED_PLUGINS_CACHE = results
     _DISCOVERED_CHECKS_CACHE = checks
