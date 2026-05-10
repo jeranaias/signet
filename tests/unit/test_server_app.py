@@ -1281,3 +1281,417 @@ class TestMultimodalRedaction:
         text_parts = [p for p in new_content if p.get("type") == "text"]
         assert len(text_parts) == 1
         assert text_parts[0]["text"] == "[REDACTED]"
+
+
+class TestNonDictBody:
+    """v0.1.7 H1: non-dict JSON bodies must 400, not 500.
+
+    ``json.loads`` happily parses a top-level list/scalar/null; downstream
+    code assumed a dict and 500'd with AttributeError when it wasn't.
+    Reject the request with a structured 400 instead so the audit chain
+    isn't blamed for client errors.
+    """
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            b"[]",
+            b"null",
+            b"123",
+            b'"hi"',
+            b"true",
+        ],
+    )
+    def test_non_dict_body_returns_400(self, app_factory, raw: bytes) -> None:
+        _, client = app_factory(Pipeline(checks=[]))
+        r = client.post(
+            "/v1/chat/completions",
+            content=raw,
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 400
+        body = r.json()
+        assert body["error"] == "request body must be a JSON object"
+        assert "got_type" in body
+        assert "expected" in body
+
+    def test_completions_non_dict_body_returns_400(self, app_factory) -> None:
+        _, client = app_factory(Pipeline(checks=[]))
+        r = client.post(
+            "/v1/completions",
+            content=b"[]",
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 400
+        assert r.json()["error"] == "request body must be a JSON object"
+
+    def test_embeddings_non_dict_body_returns_400(self, app_factory) -> None:
+        _, client = app_factory(Pipeline(checks=[]))
+        r = client.post(
+            "/v1/embeddings",
+            content=b"42",
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 400
+        assert r.json()["error"] == "request body must be a JSON object"
+
+    def test_empty_body_message_is_actionable(self, app_factory) -> None:
+        """L4: empty-body 400 carries an ``expected`` hint so callers
+        can tell at a glance what shape the gate wants."""
+        _, client = app_factory(Pipeline(checks=[]))
+        r = client.post(
+            "/v1/chat/completions",
+            content=b"",
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 400
+        body = r.json()
+        assert body["error"] == "empty request body"
+        assert "messages" in body["expected"]
+
+
+class TestUpstreamNonJsonAttribution:
+    """v0.1.7 H2: upstream non-JSON returns 502 WITH attribution headers.
+
+    Without the headers, callers can't distinguish a 502 the upstream
+    caused (a misconfigured backend, a 302 to an HTML login page, etc.)
+    from a 502 signet itself produced.
+    """
+
+    def test_502_carries_upstream_attribution_headers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fake_post(_self, _url, **_kwargs):
+            class FakeResp:
+                status_code = 200
+                content = b"<html>maintenance window</html>"
+                headers: ClassVar[dict[str, str]] = {"content-type": "text/html"}
+
+                @staticmethod
+                def json() -> dict[str, Any]:
+                    raise __import__("json").JSONDecodeError("bad", "doc", 0)
+
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+        config = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            upstream_label="test-upstream",
+            allow_ephemeral_key=True,
+        )
+        signet_app = SignetApp(
+            config=config,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True)]),
+        )
+        client = TestClient(signet_app.app)
+
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Commit-Owner": "human:alice"},
+        )
+        assert r.status_code == 502
+        # Both attribution headers fire so callers can blame upstream.
+        assert r.headers.get("X-Signet-Upstream") == "test-upstream"
+        assert r.headers.get("X-Signet-Upstream-Status") == "200"
+        # Body is the upstream's verbatim non-JSON content.
+        assert b"maintenance window" in r.content
+
+
+class TestUnsupportedEndpointVersion:
+    """v0.1.7 H3: refusal body uses ``__version__``, not a hardcoded literal."""
+
+    def test_refusal_body_uses_current_version(self, app_factory) -> None:
+        from signet import __version__
+
+        _, client = app_factory(Pipeline(checks=[]))
+        r = client.post("/v1/audio/transcriptions", json={})
+        assert r.status_code == 404
+        body = r.json()
+        # Body MUST name the live version, not a hardcoded older one.
+        assert __version__ in body["error"]
+        assert __version__ in body["note"]
+        # And must NOT carry the historic v0.1.3 sentinel.
+        assert "v0.1.3" not in body["error"]
+        assert "v0.1.3" not in body["note"]
+
+
+class TestAbortFrameTransportPreserved:
+    """v0.1.7 S2: transport-reason abort frames survive strict redaction.
+
+    A protocol violation, exception, or timeout is a wire-state condition
+    SDKs must distinguish from a policy refusal so retry semantics work.
+    Strict mode coarsens policy reasons but preserves transport reasons.
+    """
+
+    def test_strict_preserves_upstream_protocol_violation(self) -> None:
+        from signet.server.app import SignetApp as _App
+
+        cfg = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            strict_error_redaction=True,
+        )
+        app = _App(config=cfg, pipeline=Pipeline(checks=[]))
+        frames = app._build_abort_frames(
+            reason="upstream_protocol_violation",
+            stage="inspection",
+            check_name=None,
+            entry=None,
+        )
+        # First frame holds the JSON payload; second is the [DONE] marker.
+        body = frames[0].decode("utf-8").lstrip("data: ").strip()
+        import json as _json
+
+        payload = _json.loads(body)
+        assert payload["reason"] == "upstream_protocol_violation"
+        # Strict still drops check field.
+        assert "check" not in payload
+
+    def test_strict_coarsens_policy_reason_to_refused(self) -> None:
+        from signet.server.app import SignetApp as _App
+
+        cfg = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            strict_error_redaction=True,
+        )
+        app = _App(config=cfg, pipeline=Pipeline(checks=[]))
+        frames = app._build_abort_frames(
+            reason="output marker (S//NF) implies classification level 2",
+            stage="inspection",
+            check_name="scope_drift",
+            entry=None,
+        )
+        import json as _json
+
+        payload = _json.loads(frames[0].decode("utf-8").lstrip("data: ").strip())
+        # Policy reason coarsened to ``refused``; check name dropped.
+        assert payload["reason"] == "refused"
+        assert "check" not in payload
+
+    def test_verbose_keeps_full_reason_and_check(self) -> None:
+        from signet.server.app import SignetApp as _App
+
+        cfg = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            strict_error_redaction=False,
+        )
+        app = _App(config=cfg, pipeline=Pipeline(checks=[]))
+        frames = app._build_abort_frames(
+            reason="some policy reason",
+            stage="inspection",
+            check_name="scope_drift",
+            entry=None,
+        )
+        import json as _json
+
+        payload = _json.loads(frames[0].decode("utf-8").lstrip("data: ").strip())
+        assert payload["reason"] == "some policy reason"
+        assert payload["check"] == "scope_drift"
+
+
+class TestSessionIdStripped:
+    """v0.1.7 L6: trailing whitespace in X-Signet-Session is stripped.
+
+    Some HTTP clients add whitespace when composing headers; an empty
+    post-strip value should be treated as no-session, not a session
+    indexed by the literal whitespace.
+    """
+
+    def test_whitespace_session_id_treated_as_unset(
+        self, monkeypatch: pytest.MonkeyPatch, upstream_response_body: dict[str, Any]
+    ) -> None:
+        from signet.core.check import Check, CheckResult
+        from signet.core.context import RequestContext
+        from signet.core.stage import Stage
+
+        seen: dict[str, Any] = {}
+
+        class _Snitch(Check):
+            name = "snitch"
+            stage = Stage.ADMISSION
+
+            async def pre_request(self, ctx: RequestContext) -> CheckResult:
+                seen["session"] = ctx.scratch.get("_session")
+                seen["session_id"] = ctx.session_id
+                return CheckResult.allow()
+
+        async def fake_post(_self, _url, **_kwargs):
+            class FakeResp:
+                status_code = 200
+                content = b""
+                headers: ClassVar[dict[str, str]] = {}
+
+                @staticmethod
+                def json() -> dict[str, Any]:
+                    return upstream_response_body
+
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+        config = ServerConfig(upstream_url="http://m/v1", allow_ephemeral_key=True)
+        signet_app = SignetApp(
+            config=config,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True), _Snitch()]),
+        )
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            headers={
+                "X-Commit-Owner": "human:alice",
+                "X-Signet-Session": "   ",  # whitespace-only
+            },
+        )
+        assert r.status_code == 200
+        # Whitespace-only session ID is normalized to None — no
+        # phantom session object created.
+        assert seen["session_id"] is None
+        assert seen["session"] is None
+
+    def test_session_id_trimmed(
+        self, monkeypatch: pytest.MonkeyPatch, upstream_response_body: dict[str, Any]
+    ) -> None:
+        from signet.core.check import Check, CheckResult
+        from signet.core.context import RequestContext
+        from signet.core.stage import Stage
+
+        seen: dict[str, Any] = {}
+
+        class _Snitch(Check):
+            name = "snitch"
+            stage = Stage.ADMISSION
+
+            async def pre_request(self, ctx: RequestContext) -> CheckResult:
+                seen["session_id"] = ctx.session_id
+                return CheckResult.allow()
+
+        async def fake_post(_self, _url, **_kwargs):
+            class FakeResp:
+                status_code = 200
+                content = b""
+                headers: ClassVar[dict[str, str]] = {}
+
+                @staticmethod
+                def json() -> dict[str, Any]:
+                    return upstream_response_body
+
+            return FakeResp()
+
+        monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+        config = ServerConfig(upstream_url="http://m/v1", allow_ephemeral_key=True)
+        signet_app = SignetApp(
+            config=config,
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True), _Snitch()]),
+        )
+        client = TestClient(signet_app.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+            headers={
+                "X-Commit-Owner": "human:alice",
+                "X-Signet-Session": "  sess-abc  ",
+            },
+        )
+        assert r.status_code == 200
+        assert seen["session_id"] == "sess-abc"
+
+
+class TestCorsCredentialsWildcardWarn:
+    """v0.1.7 L7: warn when cors_allow_credentials=True meets wildcard origin.
+
+    Browsers refuse the response per the CORS spec; logging at startup
+    catches the misconfig before it reaches a real user.
+    """
+
+    def test_wildcard_with_credentials_logs_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        cfg = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            cors_allowed_origins=("*",),
+            cors_allow_credentials=True,
+        )
+        with caplog.at_level(logging.WARNING, logger="signet.server"):
+            SignetApp(config=cfg, pipeline=Pipeline(checks=[]))
+        # The warning fires once at startup.
+        warnings = [
+            r for r in caplog.records
+            if "cors_allow_credentials" in r.getMessage()
+            and "*" in r.getMessage()
+        ]
+        assert len(warnings) >= 1
+
+    def test_specific_origins_with_credentials_no_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        cfg = ServerConfig(
+            upstream_url="http://upstream-mock/v1",
+            allow_ephemeral_key=True,
+            cors_allowed_origins=("https://example.com",),
+            cors_allow_credentials=True,
+        )
+        with caplog.at_level(logging.WARNING, logger="signet.server"):
+            SignetApp(config=cfg, pipeline=Pipeline(checks=[]))
+        # No CORS misconfig warning emitted.
+        warnings = [
+            r for r in caplog.records
+            if "cors_allow_credentials" in r.getMessage()
+        ]
+        assert len(warnings) == 0
+
+
+class TestBoolEnvParser:
+    """v0.1.7 H4: ``_parse_bool_env`` accepts the spectrum of truthy values.
+
+    CHANGELOG documented ``SIGNET_SHADOW=1`` but the original parser
+    only accepted ``"true"``. Standardize so every bool-flag env var
+    has identical semantics.
+    """
+
+    def test_truthy_values(self) -> None:
+        from signet.server.config import _parse_bool_env
+
+        for v in ("1", "true", "True", "TRUE", "yes", "YES", "on", " on ", "enabled"):
+            assert _parse_bool_env(v) is True, f"expected truthy: {v!r}"
+
+    def test_falsy_values(self) -> None:
+        from signet.server.config import _parse_bool_env
+
+        for v in ("0", "false", "FALSE", "no", "off", "", "  ", "disabled"):
+            assert _parse_bool_env(v) is False, f"expected falsy: {v!r}"
+
+    def test_shadow_accepts_one(self) -> None:
+        cfg = ServerConfig.from_env({"SIGNET_SHADOW": "1"})
+        assert cfg.shadow is True
+
+    def test_shadow_accepts_yes(self) -> None:
+        cfg = ServerConfig.from_env({"SIGNET_SHADOW": "yes"})
+        assert cfg.shadow is True
+
+    def test_emit_receipts_accepts_on(self) -> None:
+        cfg = ServerConfig.from_env({"SIGNET_EMIT_RECEIPTS": "on"})
+        assert cfg.emit_receipts is True
+
+    def test_strict_redaction_accepts_uppercase(self) -> None:
+        cfg = ServerConfig.from_env({"SIGNET_STRICT_ERROR_REDACTION": "TRUE"})
+        assert cfg.strict_error_redaction is True
+
+    def test_ephemeral_accepts_enabled(self) -> None:
+        cfg = ServerConfig.from_env({"SIGNET_ALLOW_EPHEMERAL_KEY": "enabled"})
+        assert cfg.allow_ephemeral_key is True
+
+    def test_falsy_env_disables(self) -> None:
+        cfg = ServerConfig.from_env({"SIGNET_SHADOW": "false"})
+        assert cfg.shadow is False
+        cfg = ServerConfig.from_env({"SIGNET_SHADOW": "0"})
+        assert cfg.shadow is False
+        cfg = ServerConfig.from_env({"SIGNET_SHADOW": "no"})
+        assert cfg.shadow is False

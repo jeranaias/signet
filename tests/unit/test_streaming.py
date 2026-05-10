@@ -534,3 +534,187 @@ class TestShadowMode:
             and e.metadata.get("shadow") is True
         ]
         assert len(shadow_rows) >= 1
+
+
+class TestUpstreamGenericException:
+    """v0.1.7 S3: non-httpx exceptions also produce a structured abort frame.
+
+    The previous code's ``except (httpx.RemoteProtocolError, httpx.ReadError)``
+    was too narrow — any other failure (RuntimeError from a misconfigured
+    transport, ssl error subclasses, custom transport exceptions in a
+    live bridge subclass) escaped into the StreamingResponse generator
+    and the SDK saw an opaque hang instead of a parseable terminal frame.
+    """
+
+    def test_runtime_error_yields_upstream_exception_abort(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        chunks = [_content_chunk("clean ")]
+        _patch_upstream_stream(
+            monkeypatch,
+            chunks=chunks,
+            raise_mid_stream=RuntimeError,
+            raise_after_chunks=1,
+        )
+
+        log = tmp_path / "audit.jsonl"
+        _app, client = _make_app(Pipeline(checks=[]), audit_log_path=log)
+        r = _post_stream(client, {"model": "test", "messages": []})
+
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        # Pre-error chunk delivered.
+        assert any("clean" in p for p in payloads)
+        # Abort frame uses the new transport-reason token so SDKs can
+        # split protocol violations from generic exceptions.
+        frame = _find_abort_frame(payloads)
+        assert frame is not None
+        assert frame["reason"] == "upstream_exception"
+        assert frame["stage"] == "inspection"
+        assert payloads[-1] == "[DONE]"
+
+        # Audit row records the exception class + message for forensics.
+        entries = list(JsonlBackend(log).iter_entries())
+        upstream_rows = [
+            e for e in entries if e.check_name == "pipeline.upstream"
+        ]
+        assert len(upstream_rows) == 1
+        meta = upstream_rows[0].metadata
+        assert meta.get("_exception_class") == "RuntimeError"
+        assert meta.get("_exception_message")
+        assert meta.get("abort_stage") == "upstream"
+        # No tracing escapes the generator: the test would have raised
+        # if the proxy had let the exception propagate.
+
+    def test_strict_mode_preserves_upstream_exception_reason(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """v0.1.7 S2: strict redaction preserves the transport reason
+        (``upstream_exception``) so SDKs can branch on retry semantics."""
+        chunks = [_content_chunk("hello")]
+        _patch_upstream_stream(
+            monkeypatch,
+            chunks=chunks,
+            raise_mid_stream=RuntimeError,
+            raise_after_chunks=1,
+        )
+
+        _app, client = _make_app(
+            Pipeline(checks=[]),
+            audit_log_path=tmp_path / "audit.jsonl",
+            strict_error_redaction=True,
+        )
+        r = _post_stream(client, {"model": "test", "messages": []})
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        frame = _find_abort_frame(payloads)
+        assert frame is not None
+        # Strict normally coarsens to ``refused``; transport reasons
+        # survive so the SDK can tell a retryable wire error from a
+        # policy refusal.
+        assert frame["reason"] == "upstream_exception"
+        # Strict still drops the firing-check field for consistency
+        # with policy-blocked aborts.
+        assert "check" not in frame
+
+    def test_strict_mode_preserves_protocol_violation_reason(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """v0.1.7 S2: strict mode preserves ``upstream_protocol_violation``."""
+        chunks = [_content_chunk("hello")]
+        _patch_upstream_stream(
+            monkeypatch,
+            chunks=chunks,
+            raise_mid_stream=httpx.RemoteProtocolError,
+            raise_after_chunks=1,
+        )
+
+        _app, client = _make_app(
+            Pipeline(checks=[]),
+            audit_log_path=tmp_path / "audit.jsonl",
+            strict_error_redaction=True,
+        )
+        r = _post_stream(client, {"model": "test", "messages": []})
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        frame = _find_abort_frame(payloads)
+        assert frame is not None
+        assert frame["reason"] == "upstream_protocol_violation"
+        assert "check" not in frame
+
+    def test_strict_mode_coarsens_policy_block(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        """v0.1.7 S2 control: a policy block under strict still becomes
+        ``refused`` — the transport-preservation rule does NOT leak
+        check identity for policy decisions."""
+        # Two chunks; second triggers a budget block.
+        chunks = [
+            _content_chunk("A" * 30),
+            _content_chunk("B" * 30),
+        ]
+        _patch_upstream_stream(monkeypatch, chunks=chunks)
+
+        _app, client = _make_app(
+            Pipeline(checks=[_TokenBudgetStubCheck(char_cap=40)]),
+            audit_log_path=tmp_path / "audit.jsonl",
+            strict_error_redaction=True,
+        )
+        r = _post_stream(client, {"model": "test", "messages": []})
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        frame = _find_abort_frame(payloads)
+        assert frame is not None
+        assert frame["reason"] == "refused"
+        assert "check" not in frame
+
+
+class TestClassificationLeakAfterPad:
+    """v0.1.7 S1 coordination: a long benign prefix followed by a
+    classification marker still aborts.
+
+    This test guards the streaming-layer side of the S1 finding. The
+    actual marker-detection lives in scope_drift (owned by Agent 1.1);
+    the proxy side here only has to make sure the chunk text reaches
+    ``inspect_response_chunk`` — the cap on ``accumulated_text`` does
+    NOT silence inspection because ``_extract_sse_content`` returns
+    the current chunk's content independently. If the chain is
+    Agent 1.1 still has work to do, this test will fail and the
+    coordination flag in the report will surface that.
+    """
+
+    def test_marker_after_long_prefix_blocks(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        # Pad with 50 chunks of benign filler then a leak.
+        chunks = [
+            _content_chunk("benign payload chunk " * 5)
+            for _ in range(50)
+        ]
+        chunks.append(_content_chunk("(S//NF) classified marker"))
+        chunks.append(_content_chunk(" must not appear"))
+        chunks.append(b"data: [DONE]\n\n")
+        _patch_upstream_stream(monkeypatch, chunks=chunks)
+
+        log = tmp_path / "audit.jsonl"
+        _app, client = _make_app(
+            Pipeline(checks=[ScopeDriftCheck()]),
+            audit_log_path=log,
+        )
+        r = _post_stream(
+            client,
+            {"model": "test", "messages": [{"role": "user", "content": "go"}]},
+            headers={"X-Classification": "UNCLASS"},
+        )
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        # Forwarded content frames must NOT carry the marker, regardless
+        # of how long the benign prefix was.
+        content_frames = [
+            p for p in payloads
+            if p != "[DONE]" and "signet_abort" not in p
+        ]
+        assert not any("(S//NF)" in p for p in content_frames)
+        assert not any("must not appear" in p for p in content_frames)
+        # Abort frame fired.
+        assert _find_abort_frame(payloads) is not None

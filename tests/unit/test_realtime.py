@@ -124,6 +124,10 @@ class TestAdmission:
             event = ws.receive_json()
             assert event["type"] == "signet.refusal"
             assert event["stage"] == "admission"
+            # v0.1.7 R1: ``decision`` field is present so SDKs can
+            # branch on a single name across stages (admission /
+            # commitment / inspection all carry the same key).
+            assert event["decision"] == "block"
             # Verbose mode in this fixture: reason + check are
             # present (strict mode is off by default in _make_app).
             assert event.get("correlation_id")
@@ -145,6 +149,32 @@ class TestAdmission:
                               "pipeline.realtime.session_end"}
             for e in entries
         )
+
+    def test_admission_refusal_decision_survives_strict_redaction(
+        self, tmp_path
+    ) -> None:
+        """v0.1.7 R1: ``decision`` is structural, not policy-revealing,
+        so it MUST survive strict-error-redaction coarsening."""
+        log = tmp_path / "audit.jsonl"
+        _, client = _make_app(
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True)]),
+            audit_log_path=log,
+            strict_error_redaction=True,
+        )
+        from starlette.websockets import WebSocketDisconnect
+
+        with (
+            pytest.raises(WebSocketDisconnect),
+            client.websocket_connect("/v1/realtime") as ws,
+        ):
+            event = ws.receive_json()
+            assert event["type"] == "signet.refusal"
+            assert event["stage"] == "admission"
+            # decision survives strict; reason/check do not.
+            assert event["decision"] == "block"
+            assert event["reason"] == "refused"
+            assert "check" not in event
+            ws.receive_json()  # raises disconnect
 
     def test_admission_refusal_in_shadow_closes_1000(self, tmp_path) -> None:
         log = tmp_path / "audit.jsonl"

@@ -59,6 +59,22 @@ from signet.server.session import InMemorySessionStore, SessionStore
 
 logger = logging.getLogger("signet.server")
 
+#: Abort-frame ``reason`` tokens that name a network/transport failure
+#: rather than a policy decision. These survive strict-error-redaction
+#: coarsening because they describe a wire state the SDK needs to react
+#: to — retrying a ``refused`` request is wrong, retrying an
+#: ``upstream_protocol_violation`` may be right. The set is closed:
+#: anything not listed here is treated as policy-revealing and coarsened
+#: to ``"refused"`` under strict mode.
+_TRANSPORT_ABORT_REASONS: frozenset[str] = frozenset(
+    {
+        "upstream_protocol_violation",
+        "upstream_exception",
+        "upstream_timeout",
+        "upstream_error",
+    }
+)
+
 
 class SignetApp:
     """Build and own the FastAPI application.
@@ -124,10 +140,23 @@ class SignetApp:
 
         Skipped when the tuple is empty (default), so non-browser
         deployments incur zero CORS overhead.
+
+        Spec sanity check: ``cors_allow_credentials=True`` combined
+        with a wildcard origin (``"*"``) violates the CORS spec — the
+        browser will refuse the response — so log a warning at startup
+        rather than silently shipping a misconfigured gate. Operators
+        should specify exact origins when credentials are required.
         """
         origins = self.config.cors_allowed_origins
         if not origins:
             return
+        if self.config.cors_allow_credentials and "*" in origins:
+            logger.warning(
+                "cors_allow_credentials=True combined with cors_allowed_origins "
+                "containing '*' violates the CORS spec; browsers will refuse "
+                "the response. Specify exact origins instead, or set "
+                "cors_allow_credentials=False."
+            )
         from fastapi.middleware.cors import CORSMiddleware
 
         self.app.add_middleware(
@@ -376,14 +405,14 @@ class SignetApp:
             return JSONResponse(
                 status_code=404,
                 content={
-                    "error": "endpoint not implemented in signet v0.1.3",
+                    "error": f"endpoint not implemented in signet v{__version__}",
                     "endpoint": f"/v1/{path}",
                     "note": (
-                        "v0.1.3 gates /v1/chat/completions, /v1/completions, "
-                        "and /v1/embeddings. /v1/audio/* and /v1/images/* are "
-                        "roadmapped — their non-JSON request shapes need "
-                        "their own check protocols and aren't a copy-paste "
-                        "addition."
+                        f"signet v{__version__} gates /v1/chat/completions, "
+                        "/v1/completions, and /v1/embeddings. /v1/audio/* "
+                        "and /v1/images/* are roadmapped — their non-JSON "
+                        "request shapes need their own check protocols "
+                        "and aren't a copy-paste addition."
                     ),
                 },
             )
@@ -423,7 +452,10 @@ class SignetApp:
         if not raw:
             return JSONResponse(
                 status_code=400,
-                content={"error": "empty request body"},
+                content={
+                    "error": "empty request body",
+                    "expected": "JSON object with 'messages' field for chat completions",
+                },
             )
 
         try:
@@ -433,12 +465,36 @@ class SignetApp:
                 status_code=400,
                 content={"error": f"invalid JSON in request body: {e}"},
             )
+        # Top-level shape check. ``json.loads`` happily returns lists,
+        # numbers, strings, booleans, and ``None`` for syntactically valid
+        # but semantically wrong bodies; downstream code assumes a dict
+        # (``body.get("stream", ...)`` etc.) and would 500 with an
+        # AttributeError otherwise. Refuse with a structured 400 instead
+        # so callers get a parseable hint and the audit chain isn't
+        # blamed for a client error.
+        if not isinstance(body, dict):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "request body must be a JSON object",
+                    "got_type": type(body).__name__,
+                    "expected": "object with 'messages' field for chat completions",
+                },
+            )
 
         headers = dict(request.headers.items())
         client_ip = request.client.host if request.client else None
         # Starlette typically lowercases header names but proxies may not;
-        # use get_header_ci so any case variant resolves.
-        session_id = get_header_ci(headers, SESSION_HEADER) or None
+        # use get_header_ci so any case variant resolves. Strip surrounding
+        # whitespace because some HTTP clients add a trailing space when
+        # composing headers; an empty post-strip value is treated as
+        # no-session so the session store doesn't index a blank key.
+        session_id_raw = get_header_ci(headers, SESSION_HEADER) or get_header_ci(
+            headers, SESSION_HEADER.lower()
+        )
+        session_id = session_id_raw.strip() if session_id_raw else None
+        if not session_id:
+            session_id = None
         request_fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest() if raw else ""
 
         ctx = RequestContext(
@@ -707,10 +763,16 @@ class SignetApp:
         try:
             data = upstream_resp.json()
         except json.JSONDecodeError:
+            # Upstream returned non-JSON (HTML error page, empty body,
+            # 302 redirect HTML, etc). Surface the upstream attribution
+            # headers so callers can see this 502 came from the upstream
+            # rather than from signet itself; without them the response
+            # is indistinguishable from a signet-internal failure.
             return Response(
                 status_code=502,
                 content=upstream_resp.content,
                 media_type=upstream_resp.headers.get("content-type", "text/plain"),
+                headers=self._upstream_attribution_headers(upstream_resp.status_code),
             )
 
         rctx = ResponseContext(request=ctx)
@@ -768,6 +830,12 @@ class SignetApp:
         rctx = ResponseContext(request=ctx)
 
         async def event_stream() -> AsyncIterator[bytes]:
+            # asyncio is imported lazily here so the function-scoped
+            # CancelledError handler can let cancellation propagate
+            # without paying a top-level import cost on a module that
+            # already keeps the import lazy in :meth:`_lifespan`.
+            import asyncio
+
             client = self._ensure_http()
             completed_normally = False
             inspection_aborted = False
@@ -803,6 +871,7 @@ class SignetApp:
                             rctx,
                             upstream_status=upstream.status_code,
                             reason_detail=f"upstream returned {upstream.status_code}",
+                            reason_token="upstream_protocol_violation",  # noqa: S106
                         ):
                             yield frame
                         return
@@ -880,6 +949,13 @@ class SignetApp:
                                 return
 
                             yield raw_chunk
+                    except asyncio.CancelledError:
+                        # Caller disconnected mid-stream; let
+                        # cancellation propagate so the StreamingResponse
+                        # generator unwinds cleanly. The ``finally``
+                        # block below records the disconnect via the
+                        # client_disconnect path.
+                        raise
                     except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
                         # Upstream tore down the stream or shipped
                         # malformed bytes after the headers. We have
@@ -897,6 +973,33 @@ class SignetApp:
                                 f"upstream protocol violation: "
                                 f"{type(exc).__name__}: {exc}"
                             ),
+                            reason_token="upstream_protocol_violation",  # noqa: S106
+                            exception=exc,
+                        ):
+                            yield frame
+                        return
+                    except Exception as exc:
+                        # Catch-all for any other upstream failure mode
+                        # (RuntimeError from a misconfigured client,
+                        # ssl errors, custom transport exceptions in
+                        # the live bridge, etc.). Without this clause
+                        # the exception bubbles into the StreamingResponse
+                        # generator and the SDK sees an opaque hang
+                        # rather than a structured terminal frame.
+                        # CancelledError is re-raised above so caller
+                        # disconnects still propagate cleanly.
+                        upstream_aborted = True
+                        rctx.finish_reason = "upstream_exception"
+                        async for frame in self._emit_upstream_error_abort(
+                            ctx,
+                            rctx,
+                            upstream_status=getattr(upstream, "status_code", None),
+                            reason_detail=(
+                                f"upstream exception: "
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                            reason_token="upstream_exception",  # noqa: S106
+                            exception=exc,
                         ):
                             yield frame
                         return
@@ -1008,11 +1111,30 @@ class SignetApp:
         survive coarsening because they're structural (incident
         response can't pivot without them) rather than
         policy-revealing.
+
+        Transport-reason exception: tokens in
+        :data:`_TRANSPORT_ABORT_REASONS` (e.g.
+        ``upstream_protocol_violation``, ``upstream_exception``) name
+        a wire-state condition the SDK needs to differentiate from a
+        policy refusal — retrying a ``refused`` is wrong, retrying an
+        upstream blip may be right. These survive strict coarsening so
+        callers can branch on the reason without parsing the audit
+        chain. The ``check`` field is still omitted under strict to
+        keep behavior consistent with policy-blocked aborts.
         """
-        if self.config.strict_error_redaction:
+        is_transport = reason in _TRANSPORT_ABORT_REASONS
+        if self.config.strict_error_redaction and not is_transport:
             payload: dict[str, Any] = {
                 "signet_abort": True,
                 "reason": "refused",
+                "stage": stage,
+            }
+        elif self.config.strict_error_redaction and is_transport:
+            # Preserve the transport reason but still drop the firing
+            # check name (in line with strict policy-redaction shape).
+            payload = {
+                "signet_abort": True,
+                "reason": reason,
                 "stage": stage,
             }
         else:
@@ -1040,8 +1162,10 @@ class SignetApp:
         ctx: RequestContext,
         rctx: ResponseContext,
         *,
-        upstream_status: int,
+        upstream_status: int | None,
         reason_detail: str,
+        reason_token: str = "upstream_protocol_violation",  # noqa: S107
+        exception: BaseException | None = None,
     ) -> AsyncIterator[bytes]:
         """Yield the abort-frame pair for an upstream malformation/5xx.
 
@@ -1052,10 +1176,18 @@ class SignetApp:
         distinguish proxy-side aborts (INSPECTION block) from
         upstream-failure aborts.
 
-        Frame ``reason`` is the stable token
+        Frame ``reason`` defaults to the stable token
         ``"upstream_protocol_violation"`` so SDKs can match against it
-        without parsing the trailing detail string. Detail is logged in
-        the audit row for incident review, not in the wire frame.
+        without parsing the trailing detail string. Pass
+        ``reason_token="upstream_exception"`` for non-protocol upstream
+        failures (RuntimeError from a misconfigured proxy, etc.) so
+        dashboards can split the two failure modes apart. Detail is
+        logged in the audit row for incident review, not in the wire
+        frame.
+
+        ``exception`` is captured into the audit-row metadata as
+        ``_exception_class`` and ``_exception_message`` for forensics
+        when the caller has the live exception object.
         """
         # Build a synthetic CheckResult-shape so _record_decision
         # treats this as a non-allow with stage metadata; we want
@@ -1070,19 +1202,23 @@ class SignetApp:
             _stage="inspection",
             upstream_status=upstream_status,
         )
+        meta: dict[str, Any] = {
+            "chunks_delivered": rctx.chunk_count,
+            "chunk_count_at_abort": rctx.chunk_count,
+            "abort_stage": "upstream",
+            "upstream_status": upstream_status,
+        }
+        if exception is not None:
+            meta["_exception_class"] = type(exception).__name__
+            meta["_exception_message"] = str(exception)
         entry = self._record_decision(
             ctx,
             result=synthetic,
             check_name="pipeline.upstream",
-            metadata={
-                "chunks_delivered": rctx.chunk_count,
-                "chunk_count_at_abort": rctx.chunk_count,
-                "abort_stage": "upstream",
-                "upstream_status": upstream_status,
-            },
+            metadata=meta,
         )
         for frame in self._build_abort_frames(
-            reason="upstream_protocol_violation",
+            reason=reason_token,
             stage="inspection",
             # No firing check — the upstream itself failed. Strict
             # mode would omit this anyway; verbose-mode SDKs see
@@ -1268,10 +1404,25 @@ class SignetApp:
         """
         decision = _result_to_decision(result)
         # Always tally pipeline decisions, even when no audit chain
-        # is configured (developer mode, ephemeral runs).
+        # is configured (developer mode, ephemeral runs). Stage label
+        # is read from the result metadata when present so dashboards
+        # can group by stage (admission/inspection/commitment/record);
+        # an empty string means "stage not stamped" (e.g. synthetic
+        # ``pipeline.complete`` rows that aren't tied to a single
+        # stage).
+        stage_label = ""
+        if result is not None:
+            try:
+                stage_label = str(result.metadata.get("_stage", ""))
+            except AttributeError:  # pragma: no cover — defensive
+                stage_label = ""
         self.metrics.inc(
             "signet_pipeline_decisions_total",
-            {"check": check_name, "decision": decision.value},
+            {
+                "check": check_name,
+                "stage": stage_label,
+                "decision": decision.value,
+            },
         )
         is_shadowed = (
             self.config.shadow

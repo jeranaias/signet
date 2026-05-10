@@ -344,10 +344,17 @@ class RealtimeHandler:
             return
 
         # Non-shadow: send a refusal status event for SDK ergonomics,
-        # then close 1008.
+        # then close 1008. Carry ``decision="block"`` for parity with
+        # the COMMITMENT- and INSPECTION-stage refusal frames so SDKs
+        # can branch on a single field name across stages. ADMISSION
+        # in 0.1.6/0.1.7 only ever blocks on the WebSocket path —
+        # escalate would need an out-of-band approval workflow that
+        # WS-handshake refusals can't surface — so the decision is
+        # always ``block`` here.
         refusal_event: dict[str, Any] = {
             "type": "signet.refusal",
             "stage": "admission",
+            "decision": "block",
             "correlation_id": entry.entry_id if entry is not None else None,
         }
         if self.app.config.strict_error_redaction:

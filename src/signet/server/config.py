@@ -14,6 +14,30 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+#: Values treated as truthy by :func:`_parse_bool_env`. Compared
+#: case-insensitively after stripping surrounding whitespace, so
+#: ``"YES"``, ``" on "``, ``"Enabled"`` all match. The CHANGELOG
+#: documents ``SIGNET_SHADOW=1`` as the supported on-switch; this set
+#: codifies the same UX across every bool-flag env var so callers don't
+#: need to memorize which knob accepts which spelling.
+_TRUTHY_ENV_VALUES: frozenset[str] = frozenset(
+    {"1", "true", "yes", "on", "enabled"}
+)
+
+
+def _parse_bool_env(value: str) -> bool:
+    """Parse an environment-variable value into a bool.
+
+    Accepts ``1``/``true``/``yes``/``on``/``enabled`` as truthy
+    (case-insensitive, surrounding whitespace stripped). Anything else
+    — including the empty string and ``"0"``/``"false"``/``"no"`` —
+    is falsy. Centralized so every bool-flag env var has identical
+    parsing semantics; previously each call site spelled
+    ``v.lower() == "true"`` inline, which silently rejected ``"1"``
+    even though the CHANGELOG documents ``SIGNET_SHADOW=1`` as valid.
+    """
+    return value.strip().lower() in _TRUTHY_ENV_VALUES
+
 
 @dataclass
 class ServerConfig:
@@ -187,18 +211,18 @@ class ServerConfig:
         if v := e.get("SIGNET_HMAC_SECRET"):
             cfg.hmac_secret = bytes.fromhex(v)
         if v := e.get("SIGNET_ALLOW_EPHEMERAL_KEY"):
-            cfg.allow_ephemeral_key = v.lower() == "true"
+            cfg.allow_ephemeral_key = _parse_bool_env(v)
         if v := e.get("SIGNET_RECEIPT_HEADER_NAME"):
             cfg.receipt_header_name = v
         if v := e.get("SIGNET_EMIT_RECEIPTS"):
-            cfg.emit_receipts = v.lower() == "true"
+            cfg.emit_receipts = _parse_bool_env(v)
         if v := e.get("SIGNET_MAX_REQUEST_BODY_BYTES"):
             cfg.max_request_body_bytes = int(v)
         if v := e.get("SIGNET_UPSTREAM_LABEL"):
             cfg.upstream_label = v
         if v := e.get("SIGNET_STRICT_ERROR_REDACTION"):
-            cfg.strict_error_redaction = v.lower() == "true"
+            cfg.strict_error_redaction = _parse_bool_env(v)
         if v := e.get("SIGNET_SHADOW"):
-            cfg.shadow = v.lower() == "true"
+            cfg.shadow = _parse_bool_env(v)
 
         return cfg

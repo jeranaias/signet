@@ -18,10 +18,17 @@ backends.
 
 Counters surfaced:
 
-* ``signet_requests_total{path, decision, status}`` — every request
-  that reached :class:`signet.server.app.SignetApp`
-* ``signet_pipeline_decisions_total{stage, check, decision}`` — every
-  result returned by a check in the pipeline
+* ``signet_requests_total{path}`` — every request that reached
+  :class:`signet.server.app.SignetApp`. The label set is intentionally
+  small: the counter increments at handler entry before the pipeline
+  has classified the request, so ``decision`` and ``status`` aren't
+  yet known. Use :data:`signet_pipeline_decisions_total` for
+  decision-shaped roll-ups.
+* ``signet_pipeline_decisions_total{check, stage, decision}`` — every
+  result returned by a check in the pipeline. ``stage`` is the
+  ADMISSION/INSPECTION/COMMITMENT/RECORD lifecycle stage from the
+  result metadata; an empty ``stage`` label denotes stageless
+  synthetic rows (the per-request ``pipeline.complete`` row, etc.).
 * ``signet_audit_chain_appends_total`` — total entries written to the
   audit chain
 * ``signet_audit_anchor_failures_total{backend}`` — anchor backend
