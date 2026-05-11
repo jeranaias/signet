@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "signet.fullname" . }}
+  labels:
+    {{- include "signet.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "signet.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "signet.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Rolls the pods whenever the pipeline ConfigMap changes.
+        checksum/pipeline: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: signet
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          args:
+            - serve
+            - --upstream
+            - {{ .Values.upstream.url | quote }}
+            - --host
+            - "0.0.0.0"
+            - --port
+            - "8443"
+            - --config
+            - /etc/signet/pipeline.py
+            {{- if .Values.auditLog.enabled }}
+            - --audit-log
+            - {{ printf "%s/%s" .Values.auditLog.mountPath .Values.auditLog.filename | quote }}
+            {{- end }}
+            - --log-format
+            - json
+          env:
+            - name: SIGNET_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "signet.hmacSecretName" . }}
+                  key: {{ include "signet.hmacSecretKey" . }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8443
+              protocol: TCP
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: pipeline
+              mountPath: /etc/signet
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.auditLog.enabled }}
+            - name: audit
+              mountPath: {{ .Values.auditLog.mountPath }}
+            {{- end }}
+      volumes:
+        - name: pipeline
+          configMap:
+            name: {{ include "signet.fullname" . }}-pipeline
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.auditLog.enabled }}
+        - name: audit
+          persistentVolumeClaim:
+            claimName: {{ include "signet.fullname" . }}-audit
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

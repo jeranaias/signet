@@ -1,0 +1,28 @@
+apiVersion: v2
+name: signet
+description: Capability-based safety gate for LLM agents.
+type: application
+
+# Chart version is independent of signet's app version.
+version: 0.1.0
+
+# Pinned to the release this example was authored against. Override
+# at install time:  helm install signet . --set image.tag=0.1.9
+appVersion: "0.1.8"
+
+home: https://github.com/jeranaias/signet
+sources:
+  - https://github.com/jeranaias/signet
+
+maintainers:
+  - name: Jesse Morgan
+    url: https://github.com/jeranaias
+
+keywords:
+  - llm
+  - safety
+  - guardrails
+  - audit
+  - capability-security
+
+icon: https://raw.githubusercontent.com/jeranaias/signet/main/docs/assets/logo.png

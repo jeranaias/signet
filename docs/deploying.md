@@ -212,6 +212,24 @@ detail tail the audit log; attackers do not. Disable
 (`--no-strict-error-redaction`) only for first-time integration
 debugging; the default is what production should run.
 
+## Quick-start examples
+
+Three pre-built recipes live in `examples/`:
+
+- **[docker-compose](../examples/docker-compose/)** — one-command local
+  production. Brings up signet + a local LLM (Ollama) + an optional
+  Prometheus/Grafana stack behind a compose profile.
+- **[github-action](../examples/github-action/)** — CI gate that runs
+  `signet lint --strict`, `signet doctor --probe-injection`, and a
+  `signet bench` performance gate against every PR touching
+  `pipeline.py`.
+- **[kubernetes](../examples/kubernetes/)** — multi-replica deployment
+  via a minimal Helm chart, with `/healthz` liveness, `/readyz`
+  readiness, a ConfigMap-mounted pipeline, and an audit-log PVC.
+
+Each example pins `signet-sign==0.1.8` so it stays paste-and-go for the
+lifetime of the release.
+
 ## What signet does not handle
 
 * TLS termination — see [TLS and the trust boundary](#tls-and-the-trust-boundary).

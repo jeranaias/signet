@@ -1,0 +1,95 @@
+name: signet policy + bench check
+
+# Runs on every PR that touches the policy file plus a manual trigger,
+# so the check can be re-run after a flake without pushing a new commit.
+on:
+  pull_request:
+    paths:
+      - "pipeline.py"
+      - ".github/workflows/signet-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  signet-check:
+    name: Lint + probe + bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install signet
+        run: |
+          python -m pip install --upgrade pip
+          pip install signet-sign==0.1.8
+
+      # Static analysis on pipeline.py. Strict mode = warnings are
+      # errors, so misconfigurations fail the build instead of being
+      # surfaced as advisory.
+      - name: Lint pipeline (strict)
+        run: signet lint pipeline.py --strict
+
+      # Bring signet up against a mock upstream so the probe and bench
+      # steps can hit a live process. --dev gives us an ephemeral HMAC
+      # key and auto-wires pipeline.py / audit.jsonl.
+      - name: Start signet
+        run: |
+          # Mock upstream: any HTTP server that 200s on /models is fine.
+          # We use signet's own /health endpoint indirectly via --self.
+          signet serve \
+            --upstream http://127.0.0.1:18080/v1 \
+            --host 127.0.0.1 \
+            --port 8443 \
+            --config pipeline.py \
+            --dev \
+            > signet.log 2>&1 &
+          echo "SIGNET_PID=$!" >> "$GITHUB_ENV"
+
+          # Wait for /health to come up.
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8443/health >/dev/null; then
+              echo "signet is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "signet failed to start; log:"
+          cat signet.log
+          exit 1
+
+      # Runtime probe: exercises the obfuscated-injection corpus and
+      # asserts every one is blocked. Catches "someone mis-edited the
+      # rule list and the prompt-injection check stopped firing"
+      # regressions.
+      - name: Doctor probe
+        run: signet doctor --self http://127.0.0.1:8443 --probe-injection
+
+      # Performance gate: refuse PRs that regress p95 past 10ms or p99
+      # past 20ms with a mock upstream. Adjust thresholds to your SLO.
+      # --mock-upstream uses signet's bundled stub so this step needs
+      # no network access.
+      - name: Bench gate
+        run: signet bench --mock-upstream --gate p95=10ms,p99=20ms
+
+      - name: Show signet log on failure
+        if: failure()
+        run: |
+          echo "----- signet.log -----"
+          cat signet.log || true
+
+      - name: Stop signet
+        if: always()
+        run: |
+          if [ -n "${SIGNET_PID:-}" ]; then
+            kill "$SIGNET_PID" || true
+          fi

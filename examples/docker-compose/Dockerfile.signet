@@ -1,0 +1,29 @@
+# Minimal signet image. The version is pinned so this example keeps
+# working for the lifetime of v0.1.8.
+FROM python:3.12-slim
+
+# Non-root by default. Bind-mounts on the audit volume need to be
+# writable by uid 10001 if you mount in a host directory instead of
+# the named volume used in docker-compose.yml.
+RUN groupadd --system --gid 10001 signet \
+    && useradd --system --uid 10001 --gid signet --shell /usr/sbin/nologin signet \
+    && mkdir -p /var/log/signet /app \
+    && chown -R signet:signet /var/log/signet /app
+
+WORKDIR /app
+
+# Pin to the release this example was authored against. Bump in
+# lockstep with examples/README.md.
+RUN pip install --no-cache-dir signet-sign==0.1.8
+
+COPY --chown=signet:signet pipeline.py /app/pipeline.py
+
+USER signet
+
+EXPOSE 8443
+
+# The `signet` console script is installed by the package. Default
+# command is overridden by docker-compose.yml; this is the fallback
+# for `docker run` use.
+ENTRYPOINT ["signet"]
+CMD ["serve", "--upstream", "http://localhost:11434/v1", "--host", "0.0.0.0", "--port", "8443", "--config", "/app/pipeline.py"]

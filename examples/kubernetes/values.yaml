@@ -1,0 +1,138 @@
+# Default values for the signet chart. Override any of these with
+# `--set key=value` or a `values-prod.yaml` file passed via `-f`.
+
+replicaCount: 2
+
+image:
+  # Reference image. Build your own from examples/docker-compose/Dockerfile.signet
+  # or pin a registry that mirrors signet-sign==<appVersion>.
+  repository: ghcr.io/jeranaias/signet
+  tag: ""  # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 8443
+
+# --- HMAC secret ------------------------------------------------------
+# Two modes:
+#   1. Inline: set hmacSecret.value (chart renders a Secret for you).
+#      Convenient for dev; never commit a real value.
+#   2. External: set hmacSecret.existingSecret to the name of a Secret
+#      you provisioned via ESO / SealedSecrets / vault-csi. The chart
+#      mounts that secret instead of templating its own. THIS IS THE
+#      PRODUCTION PATH.
+hmacSecret:
+  existingSecret: ""        # e.g. "signet-hmac" -- preferred
+  existingSecretKey: "secret"
+  value: ""                 # only used when existingSecret is empty
+
+upstream:
+  # OpenAI-compatible /v1 endpoint. Override at install time.
+  url: "http://ollama.ollama.svc.cluster.local:11434/v1"
+
+# Pipeline (Python config) is supplied via a ConfigMap. The default
+# value below mirrors examples/docker-compose/pipeline.py. Override
+# with --set-file pipeline=path/to/pipeline.py for a real deployment.
+pipeline: |
+  from signet.checks import (
+      ClassificationGateCheck,
+      LoopbackTrustCheck,
+      OwnerResolutionCheck,
+      PromptInjectionCheck,
+      RateLimitCheck,
+      RiskTier,
+      ScopeDriftCheck,
+      ToolCallInspectorCheck,
+  )
+  from signet.core.pipeline import Pipeline
+
+  pipeline = Pipeline(checks=[
+      LoopbackTrustCheck(),
+      OwnerResolutionCheck(require_owner=True),
+      RateLimitCheck(capacity=60, refill_per_second=1.0),
+      ClassificationGateCheck(),
+      PromptInjectionCheck(),
+      ScopeDriftCheck(),
+      ToolCallInspectorCheck(
+          registry={},
+          max_allowed_tier=RiskTier.HIGH,
+          allow_critical=False,
+      ),
+  ])
+
+# --- Audit log volume -------------------------------------------------
+# A ReadWriteMany PVC is the simplest path when replicaCount > 1; on
+# single-replica deployments ReadWriteOnce is fine. For true multi-
+# replica production, swap the JsonlBackend in your pipeline.py for
+# FileLockingJsonlBackend with cache_prev=False (see docs/deploying.md).
+auditLog:
+  enabled: true
+  mountPath: /var/log/signet
+  filename: audit.jsonl
+  persistence:
+    storageClass: ""         # "" uses the cluster default
+    accessMode: ReadWriteOnce
+    size: 10Gi
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+# Liveness probes /healthz (always 200 if the process is alive).
+# Readiness probes /readyz (503s on upstream failure so traffic sheds
+# without restarting the pod). See docs/deploying.md "Probe wiring".
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 6
+
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# Extra environment variables (e.g., SIGNET_STRICT_ERROR_REDACTION).
+extraEnv: []
+  # - name: SIGNET_STRICT_ERROR_REDACTION
+  #   value: "true"
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8443"
+  prometheus.io/path: "/metrics"

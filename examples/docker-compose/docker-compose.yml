@@ -1,0 +1,113 @@
+# signet + local LLM (Ollama) + optional Prometheus/Grafana.
+#
+# Bring up:   docker compose up -d
+# With obs:   docker compose --profile observability up -d
+# Tear down:  docker compose down -v
+#
+# All ports are exposed on 127.0.0.1 by default; flip to 0.0.0.0 only
+# after working through docs/deploying.md "TLS and the trust boundary".
+
+services:
+  ollama:
+    # Public image; pulls and serves an OpenAI-compatible /v1 endpoint.
+    image: ollama/ollama:latest
+    container_name: signet-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    # Pull a tiny model on first start so the example works without
+    # a separate "now go fetch a model" step.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        ollama serve &
+        SERVER_PID=$$!
+        until ollama list >/dev/null 2>&1; do sleep 1; done
+        ollama pull llama3.2:1b || true
+        wait $$SERVER_PID
+
+  signet:
+    build:
+      context: .
+      dockerfile: Dockerfile.signet
+    container_name: signet
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      # HMAC secret comes from .env -- never commit a real value.
+      SIGNET_HMAC_SECRET: ${SIGNET_HMAC_SECRET:?set SIGNET_HMAC_SECRET in .env, see .env.example}
+      SIGNET_UPSTREAM_URL: http://ollama:11434/v1
+      SIGNET_AUDIT_LOG_PATH: /var/log/signet/audit.jsonl
+      SIGNET_HOST: 0.0.0.0
+      SIGNET_PORT: "8443"
+    command:
+      - signet
+      - serve
+      - --upstream
+      - http://ollama:11434/v1
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8443"
+      - --config
+      - /app/pipeline.py
+      - --audit-log
+      - /var/log/signet/audit.jsonl
+      - --log-format
+      - json
+    ports:
+      - "127.0.0.1:8443:8443"
+    volumes:
+      - audit_logs:/var/log/signet
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8443/health', timeout=2).status==200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # ---- Optional observability stack ----------------------------------
+  # Enable with:  docker compose --profile observability up -d
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: signet-prometheus
+    profiles: ["observability"]
+    restart: unless-stopped
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom_data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      - signet
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: signet-grafana
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  ollama_data:
+  audit_logs:
+  prom_data:
+  grafana_data:

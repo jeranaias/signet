@@ -1,0 +1,17 @@
+{{- if .Values.auditLog.enabled -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "signet.fullname" . }}-audit
+  labels:
+    {{- include "signet.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.auditLog.persistence.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.auditLog.persistence.size }}
+  {{- with .Values.auditLog.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end -}}
