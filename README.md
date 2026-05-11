@@ -5,14 +5,52 @@
 [![License](https://img.shields.io/pypi/l/signet-sign.svg)](LICENSE)
 [![Python](https://img.shields.io/pypi/pyversions/signet-sign.svg)](https://pypi.org/project/signet-sign/)
 
-**📚 Full documentation: [jeranaias.github.io/signet](https://jeranaias.github.io/signet/)**
-**📖 Launch writeup: [How an AI agent deleted a company's database in 9 seconds, and the pattern that stops it](https://jeranaias.substack.com/p/how-a-claude-powered-ai-agent-deleted)**
+**Capability-based safety gates for LLM agents.** The model proposes; signet authorizes.
 
-> **The model decides what to do. signet decides whether the decision is allowed to fire.**
+signet sits between your application and an LLM and enforces policy:
+owner resolution, classification gates, prompt injection detection,
+rate limits, tool-call inspection, mid-stream abort. Every decision is
+HMAC-chained into a tamper-evident audit log. Drop-in install in front
+of any OpenAI-compatible endpoint.
 
-Your AI agents are issuing refunds, calling APIs, running tools, writing to databases. Each of those actions is being authorized by a non-deterministic system that can be talked into anything by a sufficiently clever prompt. **The blast radius of "the model held commit authority" is your next incident report.**
+`pip install signet-sign`. Apache-2.0. Production-ready.
 
-signet is a small Apache-2.0 proxy that sits between your callers and the LLM. Every request runs through programmatic checks before the model sees it; every response is re-checked before the caller sees it; every tool call is gated before it executes. Every decision lands in a tamper-evident, HMAC-chained audit log compatible with NIST 800-53 audit-content and integrity requirements. **The model never holds commit authority — same shape as a junior employee who fills out the purchase order but can't sign the check.**
+[Why use this](#why-use-this) · [60-second quickstart](#quickstart) · [Public bug-hunt log](docs/bug-hunt-log.md) · [PyPI](https://pypi.org/project/signet-sign/)
+
+**Full documentation:** [jeranaias.github.io/signet](https://jeranaias.github.io/signet/)
+**Launch writeup:** [How an AI agent deleted a company's database in 9 seconds, and the pattern that stops it](https://jeranaias.substack.com/p/how-a-claude-powered-ai-agent-deleted)
+
+---
+
+## Why use this
+
+Three reasons LLM agent operators reach for signet:
+
+1. **You need to refuse before the model sees it.** A capability gate
+   in front of the LLM is the only place to enforce "junior employee
+   cannot sign the check." signet does owner resolution, classification
+   gating, and prompt injection detection before the request is
+   forwarded.
+
+2. **You need an audit chain that holds up in review.** Every decision
+   (allow, block, redact, escalate) is recorded with an HMAC chain;
+   tampering is detectable. RFC 3161 anchor backend ships in-box;
+   bring your own KMS for production HMAC.
+
+3. **You need to pilot enforcement without risk.** `--shadow` mode
+   runs the pipeline non-enforcing: blocks and escalates become
+   200-with-headers, audit chain records what would have happened.
+   Operators flip the switch when the audit looks right.
+
+What signet is NOT: a model. A classifier. A vendor's hosted control
+plane. signet runs in your VPC, reads your headers, refuses your
+requests. Zero external calls except the optional anchor backend.
+
+---
+
+## The problem in one paragraph
+
+Your AI agents are issuing refunds, calling APIs, running tools, writing to databases. Each of those actions is being authorized by a non-deterministic system that can be talked into anything by a sufficiently clever prompt. **The blast radius of "the model held commit authority" is your next incident report.** signet is a small Apache-2.0 proxy that sits between your callers and the LLM. Every request runs through programmatic checks before the model sees it; every response is re-checked before the caller sees it; every tool call is gated before it executes. Every decision lands in a tamper-evident, HMAC-chained audit log compatible with NIST 800-53 audit-content and integrity requirements. **The model never holds commit authority — same shape as a junior employee who fills out the purchase order but can't sign the check.**
 
 Drop-in: existing OpenAI/Anthropic SDK code keeps working with one config change. Runs in your VPC. No data sent to third parties. < 100 MB memory. < 5 ms overhead per request.
 
@@ -95,7 +133,7 @@ cd my-gate
 # --config pipeline.py, and --no-strict-error-redaction
 signet serve --upstream http://localhost:11434/v1 --dev
 
-# In another terminal — point any OpenAI-compatible client at signet
+# In another terminal - point any OpenAI-compatible client at signet
 python client_example.py
 ```
 
@@ -147,6 +185,38 @@ resp = client.chat.completions.create(
 ```
 
 Symmetric `wrap_anthropic` for Anthropic's SDK; `SignetCallbackHandler` for LangChain.
+
+## Production deployment
+
+Three paste-and-go recipes in [`examples/`](examples/):
+
+- [`docker-compose`](examples/docker-compose/) — one-command local prod
+- [`kubernetes`](examples/kubernetes/) — minimal helm chart
+- [`github-action`](examples/github-action/) — CI gating with lint + probe + bench
+
+See [docs/deploying.md](docs/deploying.md) for the opinionated
+production guide.
+
+## Measure overhead
+
+signet's per-request overhead is small. Measure it yourself:
+
+```
+signet bench --upstream http://localhost:11434/v1 --requests 1000
+
+Per-request overhead (excluding upstream):
+  Stage         p50     p95     p99
+  ADMISSION   2.1ms   4.8ms   6.2ms
+  INSPECTION  0.4ms   0.9ms   1.3ms
+  RECORD      0.7ms   1.4ms   2.0ms
+  TOTAL       3.2ms   7.1ms   9.5ms
+```
+
+In CI, gate regressions:
+
+```
+signet bench --mock-upstream --gate p95=10ms
+```
 
 ## What signet does NOT do (and what you do about it)
 
@@ -245,6 +315,22 @@ point — signet's plugin protocol is designed so production-grade
 additions don't require forking the core.
 
 Full threat model and the granular hardening checklist: [`SECURITY.md`](SECURITY.md).
+
+## Built in the open
+
+This project keeps a [public bug-hunt log](docs/bug-hunt-log.md). Every
+published version that fails a stated promise gets documented; every
+hunt cycle that surfaces new bugs adds them. The log is the credibility
+artifact.
+
+Recent cycles:
+- v0.1.5 → v0.1.6: 13-item polish + six architectural features (shadow
+  mode, plugin discovery, audit compaction, WebSocket realtime, etc.)
+- v0.1.6 → v0.1.7: five hunters surfaced ~98 bugs against v0.1.6; v0.1.7
+  fixed every P0/HIGH plus most P1/P2, with regression tests gating each.
+- v0.1.7 → v0.1.8: confidence-hunt against v0.1.7 found that 1 P0 (S1)
+  and 2 new HIGH bypasses (N1, N2) survived; v0.1.8 closes them. Probe
+  corpus now 11/11.
 
 ## Operations cheat sheet
 
