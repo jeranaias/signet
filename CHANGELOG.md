@@ -8,6 +8,142 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.8] -- 2026-05-10
+
+### The version that actually delivers on the project's promises
+
+v0.1.7 closed ~90% of v0.1.6's bug surface. The v0.1.7 confidence-hunt
+(`docs/bug-hunt-log.md` cycle 5) found that one P0 (S1 classification
+leak) and two new HIGH bypasses (N1 ROT13 prefix, N2 truncation tail —
+both regressions introduced by Phase 1's prompt-injection improvements)
+survived the polish. v0.1.8 closes them, plus the four broken-CLI
+surfaces, plus the V2 concurrency race, plus NF1 (audit-row gap) and
+NF2 (NaN crash). Probe corpus: 11/11 blocked (was 6/9 at 0.1.6, 9/9 at
+0.1.7). Every advertised feature is verifiable against the published
+wheel.
+
+### Fixed (P0/HIGH from the v0.1.7 confidence hunt)
+
+- **S1 — Classification leak via `accumulated_text_cap`** (was P0 in
+  v0.1.6, advertised-fixed-but-not-actually-fixed in v0.1.7). The fix:
+  `ScopeDriftCheck.inspect_response_chunk` now scans the current `chunk`
+  parameter directly when `accumulated_text_truncated=True`. Per-context
+  cursor in `ctx.scratch` prevents double-counting on the cumulative
+  scan path. The S6 contract (don't scan non-`data:` SSE lines on the
+  default path) is preserved because the chunk-direct fallback is gated
+  on cap-saturation. Integration test: pad-1-MiB-then-leak blocks.
+- **N1 — ROT13 fast-path English-prefix bypass** (new HIGH introduced
+  by v0.1.7 C6.7). `_looks_like_natural_english` sampled only the first
+  4096 chars; an attacker prepending 4 KB of stop-words skipped ROT13
+  decoding for a tail-appended attack. The fast-path is removed; ROT13
+  always runs. The 1-2 ms savings wasn't worth the bypass surface. New
+  corpus entry `rot13_english_prefix_bypass` is the permanent gate.
+- **N2 — PromptInjection truncation-tail bypass** (new HIGH introduced
+  by v0.1.7 C6.6). The `scan_max_chars=512KB` cap silently allowed
+  injection past the cap. Now `PromptInjectionCheck` accepts
+  `on_scan_truncated: Literal["block","escalate","allow"] = "block"`.
+  Default fails closed (`match_source="truncation-fail-closed"`).
+  `"allow"` opts back into the v0.1.7 shape for operators legitimately
+  shipping multi-megabyte content. Corpus entry `truncation_tail_bypass`
+  gates the regression.
+- **NF1 — Malformed body 400 writes audit row** (HIGH charter
+  violation: v0.1.7's H1 fix landed the 400 response shape but skipped
+  the audit row). New `_record_preflight_refusal` helper wires synthetic
+  audit rows for every pre-pipeline 400 path: empty body,
+  `JSONDecodeError`, non-dict body, and the new non-finite-float gate.
+  Rows carry `_pre_pipeline_refusal=True` plus a `_refusal_kind`
+  discriminator (`empty_body`, `json_decode_error`, `non_object_body`,
+  `non_finite_float`). Metrics
+  (`signet_pipeline_decisions_total{check="pipeline.preflight"}`) stay
+  consistent with pipeline-stage decisions.
+- **NF2 — NaN/Infinity in JSON crashes upstream forward** (HIGH).
+  Python's `json.loads` accepts `NaN`/`Infinity`/`-Infinity`; httpx's
+  `encode_json` rejects with `ValueError`, which v0.1.7 misattributed as
+  502 `upstream_forward_failed`. New `_contains_non_finite_float` walks
+  the parsed body before forwarding and refuses with 400. Depth limit
+  prevents pathological inputs from blowing the recursion limit.
+- **V2 — `HmacChain.append` outside cross-process lock** (HIGH). v0.1.7's
+  A7 lock landed for the compactor but the appender path still read the
+  chain head outside the lock, so `cache_prev=False` with concurrent
+  Windows appenders could fork the chain on the `os.replace` race. New
+  `FileLockingJsonlBackend.append_locked_with_link` routes the entire
+  read-modify-write through one acquire. `HmacChain.append` refactored
+  into `_build_linked_entry(prev_hmac)` so the locked path can call it
+  inside the acquire. `cache_prev=True` path is byte-identical to
+  v0.1.7.
+
+### Fixed (broken CLI surfaces from cycle 5)
+
+- **A9 — Anonymize slug 8 hex → 16 hex.** v0.1.7 CHANGELOG advertised
+  16 (64 bits); `cli.py` was still 8. Now matches the docstring contract.
+- **A13/F2 — `audit verify --json` missing fields.** v0.1.7's Phase 2
+  agent added `signet_version` + `verified_at` to the
+  `VerificationReport` dataclass; the CLI's JSON serializer omitted them.
+  Wired through.
+- **F1 — `audit compact --force` traceback leak.** Stacked-compaction
+  errors no longer escape as raw Python tracebacks through the CLI;
+  wrapped in `ClickException` with the remediation hint.
+- **F3 — `signet init` scaffold missing `PromptInjectionCheck`.**
+  Scaffold pipeline now includes the check (Option A: scaffold is useful
+  on first run). `doctor --probe-injection` helper also emits a friendly
+  hint when every probe leaks as plain HTTP 200 with no shadow header,
+  pointing the operator at the missing check (Option B: UX win for
+  legacy scaffolds).
+
+### Added — the adoption push
+
+- **`signet bench`** — new CLI subcommand that measures per-request
+  overhead, decomposed by stage. Operators evaluating signet can verify
+  the "<5 ms" claim themselves; CI can use `--gate p95=10ms,p99=20ms` to
+  catch regressions. JSON / Markdown / CSV output formats. Spec at
+  `docs/bench.md`.
+
+  ```
+  Per-request overhead (excluding upstream):
+    Stage         p50     p95     p99     max
+    ADMISSION    2.1ms   4.8ms   6.2ms   12.4ms
+    INSPECTION   0.4ms   0.9ms   1.3ms   3.1ms
+    RECORD       0.7ms   1.4ms   2.0ms   4.3ms
+    TOTAL        3.2ms   7.1ms   9.5ms   19.8ms
+  ```
+
+- **`examples/`** — three paste-and-go deployment recipes:
+  - `examples/docker-compose/`: signet + Ollama + optional
+    Prometheus/Grafana with a pre-loaded dashboard
+  - `examples/kubernetes/`: minimal Helm chart (deployment, service,
+    configmap, secret, pvc) with `/healthz` liveness + `/readyz`
+    readiness, non-root container, RO rootfs
+  - `examples/github-action/`: CI workflow with `signet lint --strict`,
+    `signet doctor --probe-injection`, and `signet bench --gate` on
+    public runners (no secrets needed)
+- **`docs/bug-hunt-log.md`** — public iteration record from v0.1.5
+  through v0.1.8. Every published version that fails a stated promise is
+  documented; every hunt cycle that surfaces new bugs adds. The log is
+  the credibility artifact for an OSS LLM safety gate.
+- **Probe corpus expansion**: 9 → 11 entries (added
+  `rot13_english_prefix_bypass` and `truncation_tail_bypass` so the
+  v0.1.7-era regressions can't return silently).
+
+### Changed
+
+- `PromptInjectionCheck` no longer has a "natural English" fast-path
+  for ROT13 (security > 1ms speedup).
+- `PromptInjectionCheck.on_scan_truncated` defaults to `"block"`
+  (was: silent allow with `scan_truncated=True` metadata in v0.1.7).
+  Operators with legitimate long-input workloads opt into `"allow"`.
+- README rewritten with a "Why use this" section, a visible link to the
+  bug-hunt log, and a link to `examples/`. Hero pitch tightened.
+
+### Tests
+
+- 705 → 763 total tests (+58 across this cycle): unit 693, integration
+  70, plus 7 skipped that hit a live LLM (Ollama / RigRun) and skip
+  when unreachable.
+- All five P0/HIGH from the v0.1.7 confidence-hunt verified fixed
+  against the published `signet-sign==0.1.8rc1` wheel before the final
+  tag.
+- Probe corpus 11/11 blocked.
+
 ## [0.1.7] -- 2026-05-09
 
 ### The polish release -- every bug surfaced by the v0.1.6 hunt is fixed

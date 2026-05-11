@@ -141,6 +141,41 @@ All five fixed within the v0.1.6 sprint window before final tag.
 - Docker-compose + GitHub Action example for one-command production wiring
 - README "why use this" section refreshed
 
-**Findings closed (in progress)**: …
+**Findings closed**:
 
-This section will be updated as v0.1.8 lands.
+| Cycle-5 finding | Status in v0.1.8 | Evidence |
+|---|---|---|
+| **S1 — classification leak via accumulated_text_cap** | VERIFIED FIXED | ScopeDriftCheck now scans the current `chunk` parameter when `accumulated_text_truncated=True`; pad-then-leak integration test blocks. |
+| **N1 — ROT13 fast-path English-prefix bypass** | VERIFIED FIXED | `_looks_like_natural_english` removed; ROT13 always runs. Corpus entry `rot13_english_prefix_bypass` blocks. |
+| **N2 — Truncation-tail bypass** | VERIFIED FIXED | New `on_scan_truncated="block"` default; corpus entry `truncation_tail_bypass` blocks. `"allow"` opt-in for legitimate long-input use. |
+| **NF1 — Malformed body 400 writes no audit row** | VERIFIED FIXED | `_record_preflight_refusal` wires 4 pre-pipeline 400 paths. Direct test: 4/4 bad bodies produce 400 + structured audit row with `_pre_pipeline_refusal=True`. |
+| **NF2 — NaN/Infinity → 502 misattribution** | VERIFIED FIXED | `_contains_non_finite_float` walks the body before forward; refuses with 400. NaN + Infinity both produce 400. |
+| **V2 — HmacChain.append outside lock** | VERIFIED FIXED | New `FileLockingJsonlBackend.append_locked_with_link` routes the entire read-modify-write through one acquire. 30-thread concurrent test verifies chain clean. |
+| **A9 — Anonymize slug 8 hex** | VERIFIED FIXED | Slug now 16 hex chars (64 bits). |
+| **A13/F2 — verify --json missing fields** | VERIFIED FIXED | `signet_version` + `verified_at` present. |
+| **F1 — compact --force traceback** | VERIFIED FIXED | Stacked-compaction errors surface as `ClickException` not Python traceback. |
+| **F3 — scaffold missing PromptInjectionCheck** | VERIFIED FIXED | `signet init` scaffold now includes the check; doctor's probe-injection helper also emits a friendly hint for legacy scaffolds. |
+
+**Probe corpus result**: 11/11 blocked (was 6/9 at v0.1.6, 9/9 at v0.1.7). Two new entries added in v0.1.8 to gate the N1 and N2 regressions permanently: `rot13_english_prefix_bypass` and `truncation_tail_bypass`.
+
+**Adoption surfaces added in v0.1.8**:
+- `signet bench`: per-request overhead measurement with `--gate` for CI regression-detection
+- `examples/docker-compose/`: one-command local production
+- `examples/kubernetes/`: minimal Helm chart skeleton
+- `examples/github-action/`: CI workflow with lint + probe + bench gate
+
+**Verification methodology**: cycle-6 ran the same five-hunter pattern as cycle-4 and cycle-5, this time against `signet-sign==0.1.8rc1` from PyPI. All cycle-5 findings closed; no new P0/HIGH surfaced.
+
+**Net for v0.1.8**: This is the version that actually delivers on the project's promises. The probe corpus 11/11 result, the public bug-hunt log (this file), the CHANGELOG that documents the iteration cycle, and the regression-test gate are the credibility artifacts. v0.1.5 → v0.1.6 → v0.1.7 → v0.1.8 is the discipline.
+
+---
+
+## Cadence
+
+Future cycles will follow the same shape:
+1. **Bug-hunt cycle**: five domain agents (audit, server+ergonomics, streaming+realtime, pipeline+checks, CLI+plugins) in parallel against the latest published wheel.
+2. **Resolution cycle**: P0/HIGH fixed first, P1/P2 polished, regression tests added for every found bug.
+3. **Confidence cycle**: re-run the five hunters against the RC.
+4. **This log gets updated.**
+
+Anyone reading this file should be able to answer: "what bugs did this version ship with, and how were they caught?" If the answer is "we don't know" — the gate isn't trustworthy.
