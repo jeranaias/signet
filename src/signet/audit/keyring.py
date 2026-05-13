@@ -38,8 +38,14 @@ class Key:
     secret: bytes
 
     def __post_init__(self) -> None:
-        if not self.key_id:
-            raise ValueError("Key.key_id must be a non-empty string")
+        # Round 7 LOW-2: reject whitespace-only key_ids. ``"   "`` is
+        # truthy in Python so the bare ``if not self.key_id`` check
+        # slipped them through, producing unreadable verify reports
+        # and a defense-in-depth gap (a config file with a broken
+        # escape could silently end up with ``"\n"`` or ``"   "`` as
+        # the key_id without anyone noticing).
+        if not self.key_id or not self.key_id.strip():
+            raise ValueError("Key.key_id must be a non-empty, non-whitespace string")
         if len(self.secret) < 16:
             raise ValueError(
                 f"Key.secret must be at least 16 bytes (got {len(self.secret)}); "

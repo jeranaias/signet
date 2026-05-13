@@ -246,7 +246,9 @@ class TestKeyRingValidation:
             Key(key_id="too-short", secret=b"tiny")
 
     def test_empty_key_id_rejected(self) -> None:
-        with pytest.raises(ValueError, match="non-empty string"):
+        # Round 7 LOW-2 widened the rejection message to call out the
+        # whitespace-only case explicitly.
+        with pytest.raises(ValueError, match="non-empty, non-whitespace"):
             Key(key_id="", secret=b"x" * 32)
 
     def test_repr_does_not_leak_secret(self) -> None:
@@ -480,6 +482,191 @@ class TestMalformedJsonl:
         assert any(b.kind is BreakKind.MALFORMED_LINE for b in report.breaks)
 
 
+class TestNFR21SchemaCorruptionMalformedLine:
+    """NF-R2-1 (v0.1.8): every byte-level / schema-level corruption of
+    an audit log line that previously leaked a raw Python traceback
+    (``UnicodeDecodeError``, ``KeyError``, ``ValueError``,
+    ``TypeError``) now surfaces as a structured
+    :class:`BreakKind.MALFORMED_LINE` break via the same
+    :class:`MalformedAuditEntry` channel that already covered
+    ``json.JSONDecodeError``.
+
+    Round 2 fuzz: 991/2000 random byte flips tripped
+    ``UnicodeDecodeError``, 87/2000 tripped ``KeyError``, 18/2000
+    tripped ``ValueError``. All three classes must round-trip through
+    the verifier as one canonical structured break.
+    """
+
+    def test_invalid_utf8_byte_in_line_produces_malformed_break(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        chain.append(_entry("b"))
+
+        # Inject a raw 0x80 byte (an invalid UTF-8 start byte) into the
+        # middle of the second line. Pre-fix: ``open(..., encoding=
+        # "utf-8-sig")`` raised ``UnicodeDecodeError`` mid-iteration
+        # and the verifier crashed. Post-fix: the per-line decode
+        # catches it and raises ``MalformedAuditEntry``.
+        raw = backend.path.read_bytes()
+        # Find the first newline so we land inside line 2.
+        nl = raw.index(b"\n")
+        # Splice a 0x80 byte into line 2 right after the newline.
+        mutated = raw[: nl + 1] + b"\x80" + raw[nl + 1 :]
+        backend.path.write_bytes(mutated)
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        kinds = {b.kind for b in report.breaks}
+        assert BreakKind.MALFORMED_LINE in kinds, (
+            f"invalid UTF-8 byte must surface as MALFORMED_LINE; breaks={report.breaks}"
+        )
+
+    def test_missing_required_schema_field_produces_malformed_break(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        chain.append(_entry("b"))
+
+        # Strip a required field (``owner_type``) from line 2. Valid
+        # JSON, but :meth:`AuditEntry.from_dict` raises ``KeyError``.
+        lines = backend.path.read_text(encoding="utf-8").splitlines()
+        data = json.loads(lines[1])
+        del data["owner_type"]
+        lines[1] = json.dumps(data, separators=(",", ":"), sort_keys=True)
+        backend.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        kinds = {b.kind for b in report.breaks}
+        assert BreakKind.MALFORMED_LINE in kinds, (
+            f"missing schema field must surface as MALFORMED_LINE; breaks={report.breaks}"
+        )
+
+    def test_invalid_enum_value_produces_malformed_break(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        chain.append(_entry("b"))
+
+        # Mutate the ``decision`` enum to a typo. Valid JSON, but
+        # :class:`Decision` enum coercion raises ``ValueError``.
+        lines = backend.path.read_text(encoding="utf-8").splitlines()
+        data = json.loads(lines[1])
+        data["decision"] = "alloS"
+        lines[1] = json.dumps(data, separators=(",", ":"), sort_keys=True)
+        backend.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        kinds = {b.kind for b in report.breaks}
+        assert BreakKind.MALFORMED_LINE in kinds, (
+            f"invalid enum value must surface as MALFORMED_LINE; breaks={report.breaks}"
+        )
+
+    def test_wrong_type_for_field_produces_malformed_break(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        chain.append(_entry("b"))
+
+        # Replace ``check_name`` with a non-string. Down in
+        # :class:`Owner` / :class:`AuditEntry`, slots-based dataclass
+        # field assignment may raise ``TypeError`` somewhere down the
+        # stack. Either way: the verifier MUST NOT crash.
+        lines = backend.path.read_text(encoding="utf-8").splitlines()
+        data = json.loads(lines[1])
+        data["owner_type"] = None  # null -> OwnerType(None) -> TypeError
+        lines[1] = json.dumps(data, separators=(",", ":"), sort_keys=True)
+        backend.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        kinds = {b.kind for b in report.breaks}
+        assert BreakKind.MALFORMED_LINE in kinds, (
+            f"wrong-type value must surface as MALFORMED_LINE; breaks={report.breaks}"
+        )
+
+
+class TestFR41NonFiniteJsonConstantsRejected:
+    """F-R4-1 (v0.1.8.2): ``NaN`` / ``Infinity`` / ``-Infinity`` in an
+    audit JSON line surface as ``MALFORMED_LINE`` rather than crashing
+    a downstream consumer.
+
+    ``json.loads`` accepts these three non-standard JSON constants by
+    default. The write side already refuses them (``allow_nan=False``)
+    so signet never emits them, but a tampered or hand-edited line can
+    smuggle one in. Pre-fix, an ``Infinity`` ``ts_ns`` would slip past
+    schema validation and only later raise ``OverflowError`` /
+    ``ValueError`` when ``audit tail`` / ``audit show`` converted it
+    through ``datetime.fromtimestamp``. Post-fix, the
+    ``parse_constant`` callback raises at the JSON boundary and the
+    same ``MalformedAuditEntry`` channel that already covers schema
+    corruption picks it up.
+    """
+
+    def test_f_r4_1_nan_in_audit_log_produces_break(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        # Append a hand-crafted line with a NaN ``ts_ns``. We bypass
+        # the writer (which would refuse NaN) and edit the file
+        # directly.
+        with backend.path.open("a", encoding="utf-8") as f:
+            f.write('{"ts_ns": NaN, "owner_type": "human", "decision": "allow"}\n')
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        kinds = {b.kind for b in report.breaks}
+        assert BreakKind.MALFORMED_LINE in kinds, (
+            f"NaN constant must surface as MALFORMED_LINE; breaks={report.breaks}"
+        )
+
+    def test_f_r4_1_infinity_in_audit_log_produces_break(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        with backend.path.open("a", encoding="utf-8") as f:
+            f.write('{"ts_ns": Infinity, "owner_type": "human", "decision": "allow"}\n')
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        kinds = {b.kind for b in report.breaks}
+        assert BreakKind.MALFORMED_LINE in kinds
+
+    def test_f_r4_1_negative_infinity_in_audit_log_produces_break(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        with backend.path.open("a", encoding="utf-8") as f:
+            f.write('{"ts_ns": -Infinity, "owner_type": "human", "decision": "allow"}\n')
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        kinds = {b.kind for b in report.breaks}
+        assert BreakKind.MALFORMED_LINE in kinds
+
+    def test_f_r4_1_audit_tail_handles_nan_gracefully(
+        self, chain: HmacChain, backend: JsonlBackend
+    ) -> None:
+        """The CLI surface that converts ``ts_ns`` through
+        ``datetime.fromtimestamp`` must exit non-zero with a clean
+        operator-readable error, NOT a Python traceback.
+        """
+        from click.testing import CliRunner
+
+        from signet.cli import main
+
+        chain.append(_entry("a"))
+        with backend.path.open("a", encoding="utf-8") as f:
+            f.write('{"ts_ns": NaN, "owner_type": "human", "decision": "allow"}\n')
+
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", "tail", str(backend.path)])
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+
+
 class TestDualBreakSuppression:
     """A6 (v0.1.7): a single-byte tamper of an entry's stored
     ``prev_hmac`` should surface as ONE link_mismatch, not link+self."""
@@ -538,20 +725,14 @@ class TestCascadeSuppression:
         # Without compaction: many link_mismatch breaks.
         verbose = ChainVerifier(backend, keyring).verify()
         assert not verbose.ok
-        verbose_link_breaks = [
-            b for b in verbose.breaks if b.kind is BreakKind.LINK_MISMATCH
-        ]
+        verbose_link_breaks = [b for b in verbose.breaks if b.kind is BreakKind.LINK_MISMATCH]
         assert len(verbose_link_breaks) >= 5  # cascade is real
 
         # With compaction: the leading link_mismatch survives,
         # subsequent ones collapse into ONE cascade summary.
-        compact = ChainVerifier(
-            backend, keyring, compact_breaks=True
-        ).verify()
+        compact = ChainVerifier(backend, keyring, compact_breaks=True).verify()
         assert not compact.ok
-        cascades = [
-            b for b in compact.breaks if b.kind is BreakKind.CASCADE_SUPPRESSED
-        ]
+        cascades = [b for b in compact.breaks if b.kind is BreakKind.CASCADE_SUPPRESSED]
         assert len(cascades) == 1
         # The total compact-mode break list is shorter than the
         # verbose-mode list — the whole point of A11.
@@ -643,9 +824,7 @@ class TestA14SentinelDocumented:
             chain.append(_entry(f"e{i}"))
 
         # Verify under a *different* secret — every entry self-mismatches.
-        wrong_ring = KeyRing(
-            active=Key(key_id="k1", secret=b"x" * 32)
-        )
+        wrong_ring = KeyRing(active=Key(key_id="k1", secret=b"x" * 32))
         report = ChainVerifier(backend, wrong_ring).verify()
         assert not report.ok
         assert report.last_known_good_index == -1
@@ -667,9 +846,7 @@ class TestA10ArchiveFormatInvalidNoSyntheticLink:
     One corruption, two breaks. v0.1.7 suppresses the synthetic
     follow-up so the report stays canonical."""
 
-    def test_corrupt_archive_does_not_emit_synthetic_link_break(
-        self, tmp_path: Path
-    ) -> None:
+    def test_corrupt_archive_does_not_emit_synthetic_link_break(self, tmp_path: Path) -> None:
         from signet.audit.compactor import compact_audit_log
         from signet.audit.verifier import BreakKind, verify_with_archives
 
@@ -719,12 +896,8 @@ class TestA10ArchiveFormatInvalidNoSyntheticLink:
         # marker. With A10, that synthetic break is suppressed.
         # The verifier may still report deeper breaks if any, but the
         # immediate downstream synthetic one should not be there.
-        format_breaks = [
-            b for b in report.breaks if b.kind is BreakKind.ARCHIVE_FORMAT_INVALID
-        ]
-        link_breaks = [
-            b for b in report.breaks if b.kind is BreakKind.LINK_MISMATCH
-        ]
+        format_breaks = [b for b in report.breaks if b.kind is BreakKind.ARCHIVE_FORMAT_INVALID]
+        link_breaks = [b for b in report.breaks if b.kind is BreakKind.LINK_MISMATCH]
         # The post-A10 contract: at most one link_mismatch is acceptable
         # if subsequent unrelated tampering is present, but with our
         # clean post-marker writes there should be ZERO synthetic

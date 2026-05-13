@@ -147,9 +147,7 @@ class VerificationReport:
     last_known_good_index: int = -1
     last_known_good_hmac: str = ""
     signet_version: str = _SIGNET_VERSION
-    verified_at: str = field(
-        default_factory=lambda: datetime.now(UTC).isoformat()
-    )
+    verified_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     @property
     def ok(self) -> bool:
@@ -260,15 +258,52 @@ class ChainVerifier:
                     # A clean link ends any active cascade.
                     _flush_cascade()
 
-                # Identify which key signed this entry
+                # Identify which key signed this entry. The legitimate
+                # absence path is ``metadata`` carries no
+                # ``_signing_key_id`` at all (None) or the empty string
+                # sentinel: surface as ``MISSING_KEY_ID``. Any present-
+                # but-not-a-string value (list, dict, int, etc.) is a
+                # tampered row -- see F-R25-1 closure below.
                 key_id = entry.metadata.get(KEY_ID_FIELD)
-                if not key_id:
+                if key_id is None or key_id == "":
                     breaks.append(
                         ChainBreak(
                             index=index,
                             entry_id=entry.entry_id,
                             kind=BreakKind.MISSING_KEY_ID,
                             detail=f"entry has no {KEY_ID_FIELD!r} field in metadata",
+                        )
+                    )
+                    prev_hmac = entry.hmac
+                    continue
+
+                # Round 25 MED (F-R25-1): a tampered ``_signing_key_id``
+                # of unhashable type (list, dict, set) would crash
+                # ``KeyRing.get`` with a raw ``TypeError: unhashable
+                # type`` traceback, bypassing the structured-break
+                # channel that R23-5 closed for top-level fields. Reject
+                # any non-string ``key_id`` here and surface as a
+                # ``MALFORMED_LINE`` break -- the same routing
+                # tampered-on-disk lines already get via
+                # ``MalformedAuditEntry``. This also catches empty
+                # containers (``[]``, ``{}``) that the falsy check
+                # above intentionally narrows past, since they're
+                # tamper shapes that don't match the
+                # ``MISSING_KEY_ID`` semantics. Hashable-but-wrong-type
+                # cases (int=42) used to route through ``UNKNOWN_KEY``
+                # via ``legacy.get(<int>) -> None`` -- they now route
+                # through ``MALFORMED_LINE`` so the schema invariant
+                # is uniform: ``_signing_key_id`` is always either
+                # absent or a non-empty ``str``.
+                if not isinstance(key_id, str):
+                    breaks.append(
+                        ChainBreak(
+                            index=index,
+                            entry_id=entry.entry_id,
+                            kind=BreakKind.MALFORMED_LINE,
+                            detail=(
+                                f"{KEY_ID_FIELD!r} must be a string, got {type(key_id).__name__}"
+                            ),
                         )
                     )
                     prev_hmac = entry.hmac
@@ -322,10 +357,7 @@ class ChainVerifier:
                     index=total_entries,
                     entry_id="",
                     kind=BreakKind.MALFORMED_LINE,
-                    detail=(
-                        f"line {exc.line_number}: cannot parse as JSON: "
-                        f"{exc.parse_error}"
-                    ),
+                    detail=(f"line {exc.line_number}: cannot parse as JSON: {exc.parse_error}"),
                 )
             )
         finally:
@@ -363,13 +395,29 @@ def _verify_entry_self(
     last-known-good bookkeeping behave correctly.
     """
     key_id = entry.metadata.get(KEY_ID_FIELD)
-    if not key_id:
+    if key_id is None or key_id == "":
         breaks.append(
             ChainBreak(
                 index=index,
                 entry_id=entry.entry_id,
                 kind=BreakKind.MISSING_KEY_ID,
                 detail=f"entry has no {KEY_ID_FIELD!r} field in metadata",
+            )
+        )
+        return False
+    # Round 25 MED (F-R25-1): same defense as the live-only walker --
+    # a non-string ``_signing_key_id`` (unhashable list/dict/set, or
+    # an empty container the falsy check intentionally narrows past)
+    # would crash ``KeyRing.get`` with a raw traceback. Surface as a
+    # structured ``MALFORMED_LINE`` break instead. See the live walker
+    # for full rationale.
+    if not isinstance(key_id, str):
+        breaks.append(
+            ChainBreak(
+                index=index,
+                entry_id=entry.entry_id,
+                kind=BreakKind.MALFORMED_LINE,
+                detail=(f"{KEY_ID_FIELD!r} must be a string, got {type(key_id).__name__}"),
             )
         )
         return False
@@ -471,7 +519,7 @@ def verify_with_archives(
     from signet.audit.compactor import (
         COMPACTION_MARKER_FIELD,
         MerkleTree,
-        is_compaction_marker,
+        _has_marker_shape,
         read_archive,
     )
 
@@ -521,7 +569,20 @@ def verify_with_archives(
 
     try:
         for entry in backend.iter_entries():
-            if not is_compaction_marker(entry):
+            # Round 7 LOW-1 / Round 9 HIGH-2: dispatch on marker SHAPE
+            # so a marker whose MAC can no longer be verified (e.g.
+            # the marker's signing key was revoked from the ring)
+            # still switches into archive-walking mode. Otherwise the
+            # marker would be treated as a plain live entry, its
+            # ``prev_hmac`` (which points at the last archived entry's
+            # hmac, not the empty-chain sentinel) would mis-fire as a
+            # phantom ``LINK_MISMATCH``, and every subsequent live
+            # entry would cascade off the wrong ``expected_prev``.
+            # The MAC check then runs *inside* the marker branch and
+            # surfaces as an actionable ``UNKNOWN_KEY`` break on the
+            # marker so the operator can re-add the marker's signing
+            # key (or accept the marker as a known-orphan).
+            if not _has_marker_shape(entry):
                 # Plain live entry: standard self + link checks.
                 link_break_at_this_index = False
                 if entry.prev_hmac != expected_prev:
@@ -624,7 +685,13 @@ def verify_with_archives(
 
             try:
                 header, tree, archived_entries = read_archive(archive_path)
-            except ValueError as exc:
+            except (ValueError, KeyError, TypeError) as exc:
+                # Round 7 HIGH-2: ``_read_archive`` now routes
+                # ``KeyError`` / ``TypeError`` through ``ValueError``, but
+                # widen the catch here as defense-in-depth so any future
+                # surface that escapes the inner wrapper still surfaces as
+                # a structured ``ARCHIVE_FORMAT_INVALID`` break rather
+                # than a raw Python traceback.
                 breaks.append(
                     ChainBreak(
                         index=logical_index,
@@ -780,10 +847,7 @@ def verify_with_archives(
                 index=logical_index,
                 entry_id="",
                 kind=BreakKind.MALFORMED_LINE,
-                detail=(
-                    f"line {exc.line_number}: cannot parse as JSON: "
-                    f"{exc.parse_error}"
-                ),
+                detail=(f"line {exc.line_number}: cannot parse as JSON: {exc.parse_error}"),
             )
         )
     finally:

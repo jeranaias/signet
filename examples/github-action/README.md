@@ -41,8 +41,11 @@ env:
 ## Adjusting the gates
 
 - **p95 / p99 thresholds**: edit the `--gate` argument in the bench
-  step. Format is `p95=<duration>,p99=<duration>` with `ms` / `us`
-  suffixes. The bench command also supports `mean=` and `max=`.
+  step. Format is `pN=<duration>` where `N` is an integer percentile
+  in 1..99, with `ms` / `s` / `us` (or `μs`) suffixes -- e.g.
+  `p50=5ms,p95=10ms,p99=20ms` or `p99=0.02s`. The `--gate` flag accepts
+  percentile thresholds only; `mean=` and `max=` are NOT supported and
+  will be rejected by the parser.
 - **Trigger paths**: by default the workflow only runs when
   `pipeline.py` changes. Add more files (the check registry, custom
   plugins, etc.) under `on.pull_request.paths` if your policy lives in

@@ -85,16 +85,13 @@ class _FakeStreamResponse:
         # Default content-type: SSE. The S7 content-type guard rejects
         # non-SSE upstream responses; tests that exercise that guard
         # pass a different type (e.g. application/octet-stream).
-        self.headers: dict[str, str] = headers if headers is not None else {
-            "content-type": "text/event-stream"
-        }
+        self.headers: dict[str, str] = (
+            headers if headers is not None else {"content-type": "text/event-stream"}
+        )
 
     async def aiter_bytes(self) -> AsyncIterator[bytes]:
         for i, chunk in enumerate(self._chunks):
-            if (
-                self._raise_mid_stream is not None
-                and i >= self._raise_after_chunks
-            ):
+            if self._raise_mid_stream is not None and i >= self._raise_after_chunks:
                 # httpx.RemoteProtocolError takes (message, request=...);
                 # we don't have a real request handle so use a 1-arg form
                 # supported by both 0.27 and 0.28+ shapes.
@@ -103,10 +100,7 @@ class _FakeStreamResponse:
         # Allow the test to schedule a torn-down stream AFTER the
         # configured chunks have all been yielded (raise_after_chunks
         # equal to len(chunks)).
-        if (
-            self._raise_mid_stream is not None
-            and self._raise_after_chunks >= len(self._chunks)
-        ):
+        if self._raise_mid_stream is not None and self._raise_after_chunks >= len(self._chunks):
             raise self._raise_mid_stream("upstream tore down the stream")
 
 
@@ -121,6 +115,36 @@ class _FakeStreamCM:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         return None
+
+
+class _FailingStreamCM:
+    """Async context manager that raises inside ``__aenter__``.
+
+    Mirrors the real-world failure mode F1.5 fixes: DNS resolution,
+    TLS handshake, ConnectError, or a misconfigured-transport
+    RuntimeError surface from ``httpx.AsyncClient.stream``'s
+    ``@asynccontextmanager`` *before* the body of the ``async with``
+    runs. Test harness reproduces that shape so the proxy's outer
+    try/except is the only thing that can catch the exception.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def __aenter__(self):
+        raise self._exc
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:  # pragma: no cover
+        return None
+
+
+def _patch_upstream_stream_init_fails(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> None:
+    """Patch ``httpx.AsyncClient.stream`` so ``__aenter__`` raises ``exc``."""
+
+    def fake_stream(_self, _method, _url, **_kwargs):
+        return _FailingStreamCM(exc)
+
+    monkeypatch.setattr(httpx.AsyncClient, "stream", fake_stream)
 
 
 def _patch_upstream_stream(
@@ -235,9 +259,7 @@ class _TokenBudgetStubCheck(Check):
     def __init__(self, *, char_cap: int = 40) -> None:
         self.char_cap = char_cap
 
-    async def inspect_response_chunk(
-        self, ctx: ResponseContext, _chunk: str
-    ) -> CheckResult:
+    async def inspect_response_chunk(self, ctx: ResponseContext, _chunk: str) -> CheckResult:
         if len(ctx.accumulated_text) > self.char_cap:
             return CheckResult.block(
                 f"output exceeded budgeted chars ({self.char_cap})",
@@ -269,9 +291,7 @@ class TestCleanStream:
     """A 10-chunk happy-path stream passes through unchanged."""
 
     def test_no_abort_frame_emitted(self, monkeypatch, tmp_path) -> None:
-        chunks = [_content_chunk(f"part-{i} ") for i in range(10)] + [
-            b"data: [DONE]\n\n"
-        ]
+        chunks = [_content_chunk(f"part-{i} ") for i in range(10)] + [b"data: [DONE]\n\n"]
         _patch_upstream_stream(monkeypatch, chunks=chunks)
 
         _app, client = _make_app(Pipeline(checks=[]), audit_log_path=tmp_path / "audit.jsonl")
@@ -332,10 +352,7 @@ class TestClassificationLeak:
         # abort frame's reason field in verbose mode (that's the
         # contract; the marker IS the policy explanation), but it must
         # NOT appear in any forwarded content frame.
-        content_frames = [
-            p for p in payloads
-            if p != "[DONE]" and "signet_abort" not in p
-        ]
+        content_frames = [p for p in payloads if p != "[DONE]" and "signet_abort" not in p]
         assert not any("(S//NF)" in p for p in content_frames)
         assert not any("classified bit follows" in p for p in content_frames)
 
@@ -363,9 +380,7 @@ class TestClassificationLeak:
 
         # Audit row captures partial state.
         entries = list(JsonlBackend(log).iter_entries())
-        inspection_rows = [
-            e for e in entries if e.check_name == "pipeline.inspection"
-        ]
+        inspection_rows = [e for e in entries if e.check_name == "pipeline.inspection"]
         assert len(inspection_rows) == 1
         meta = inspection_rows[0].metadata
         # 3 chunks delivered before the leaking one (chunk 4 was not).
@@ -418,9 +433,7 @@ class TestTokenBudget:
 
         # Audit row carries the firing check name.
         entries = list(JsonlBackend(log).iter_entries())
-        inspection_rows = [
-            e for e in entries if e.check_name == "pipeline.inspection"
-        ]
+        inspection_rows = [e for e in entries if e.check_name == "pipeline.inspection"]
         assert len(inspection_rows) == 1
         assert inspection_rows[0].metadata.get("_check_name") == "token_budget"
 
@@ -428,9 +441,7 @@ class TestTokenBudget:
 class TestUpstreamMalformed:
     """Upstream tears down the stream mid-flight → abort frame, clean close."""
 
-    def test_remote_protocol_error_yields_abort_frame(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_remote_protocol_error_yields_abort_frame(self, monkeypatch, tmp_path) -> None:
         # Two chunks succeed, then upstream raises RemoteProtocolError.
         chunks = [_content_chunk("clean "), _content_chunk("text")]
         _patch_upstream_stream(
@@ -459,9 +470,7 @@ class TestUpstreamMalformed:
 
         # Audit row notes the failure.
         entries = list(JsonlBackend(log).iter_entries())
-        upstream_rows = [
-            e for e in entries if e.check_name == "pipeline.upstream"
-        ]
+        upstream_rows = [e for e in entries if e.check_name == "pipeline.upstream"]
         assert len(upstream_rows) == 1
         meta = upstream_rows[0].metadata
         assert meta.get("abort_stage") == "upstream"
@@ -487,9 +496,7 @@ class TestUpstream5xx:
         assert payloads[-1] == "[DONE]"
 
         entries = list(JsonlBackend(log).iter_entries())
-        upstream_rows = [
-            e for e in entries if e.check_name == "pipeline.upstream"
-        ]
+        upstream_rows = [e for e in entries if e.check_name == "pipeline.upstream"]
         assert len(upstream_rows) == 1
         meta = upstream_rows[0].metadata
         assert meta.get("upstream_status") == 503
@@ -499,9 +506,7 @@ class TestUpstream5xx:
 class TestShadowMode:
     """Shadow mode: INSPECTION non-allow results pass through, no abort frame."""
 
-    def test_shadow_does_not_abort_inspection_block(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_shadow_does_not_abort_inspection_block(self, monkeypatch, tmp_path) -> None:
         chunks = [
             _content_chunk("Briefing summary: "),
             _content_chunk("(S//NF) classified marker."),
@@ -538,9 +543,9 @@ class TestShadowMode:
         # Audit row captures the would-have-blocked decision with shadow=True.
         entries = list(JsonlBackend(log).iter_entries())
         shadow_rows = [
-            e for e in entries
-            if e.check_name == "pipeline.inspection"
-            and e.metadata.get("shadow") is True
+            e
+            for e in entries
+            if e.check_name == "pipeline.inspection" and e.metadata.get("shadow") is True
         ]
         assert len(shadow_rows) >= 1
 
@@ -555,9 +560,7 @@ class TestUpstreamGenericException:
     and the SDK saw an opaque hang instead of a parseable terminal frame.
     """
 
-    def test_runtime_error_yields_upstream_exception_abort(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_runtime_error_yields_upstream_exception_abort(self, monkeypatch, tmp_path) -> None:
         chunks = [_content_chunk("clean ")]
         _patch_upstream_stream(
             monkeypatch,
@@ -584,9 +587,7 @@ class TestUpstreamGenericException:
 
         # Audit row records the exception class + message for forensics.
         entries = list(JsonlBackend(log).iter_entries())
-        upstream_rows = [
-            e for e in entries if e.check_name == "pipeline.upstream"
-        ]
+        upstream_rows = [e for e in entries if e.check_name == "pipeline.upstream"]
         assert len(upstream_rows) == 1
         meta = upstream_rows[0].metadata
         assert meta.get("_exception_class") == "RuntimeError"
@@ -595,9 +596,7 @@ class TestUpstreamGenericException:
         # No tracing escapes the generator: the test would have raised
         # if the proxy had let the exception propagate.
 
-    def test_strict_mode_preserves_upstream_exception_reason(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_strict_mode_preserves_upstream_exception_reason(self, monkeypatch, tmp_path) -> None:
         """v0.1.7 S2: strict redaction preserves the transport reason
         (``upstream_exception``) so SDKs can branch on retry semantics."""
         chunks = [_content_chunk("hello")]
@@ -626,9 +625,7 @@ class TestUpstreamGenericException:
         # with policy-blocked aborts.
         assert "check" not in frame
 
-    def test_strict_mode_preserves_protocol_violation_reason(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_strict_mode_preserves_protocol_violation_reason(self, monkeypatch, tmp_path) -> None:
         """v0.1.7 S2: strict mode preserves ``upstream_protocol_violation``."""
         chunks = [_content_chunk("hello")]
         _patch_upstream_stream(
@@ -651,9 +648,7 @@ class TestUpstreamGenericException:
         assert frame["reason"] == "upstream_protocol_violation"
         assert "check" not in frame
 
-    def test_strict_mode_coarsens_policy_block(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_strict_mode_coarsens_policy_block(self, monkeypatch, tmp_path) -> None:
         """v0.1.7 S2 control: a policy block under strict still becomes
         ``refused`` — the transport-preservation rule does NOT leak
         check identity for policy decisions."""
@@ -692,14 +687,9 @@ class TestClassificationLeakAfterPad:
     coordination flag in the report will surface that.
     """
 
-    def test_marker_after_long_prefix_blocks(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_marker_after_long_prefix_blocks(self, monkeypatch, tmp_path) -> None:
         # Pad with 50 chunks of benign filler then a leak.
-        chunks = [
-            _content_chunk("benign payload chunk " * 5)
-            for _ in range(50)
-        ]
+        chunks = [_content_chunk("benign payload chunk " * 5) for _ in range(50)]
         chunks.append(_content_chunk("(S//NF) classified marker"))
         chunks.append(_content_chunk(" must not appear"))
         chunks.append(b"data: [DONE]\n\n")
@@ -719,10 +709,7 @@ class TestClassificationLeakAfterPad:
         payloads = _split_sse(r.text)
         # Forwarded content frames must NOT carry the marker, regardless
         # of how long the benign prefix was.
-        content_frames = [
-            p for p in payloads
-            if p != "[DONE]" and "signet_abort" not in p
-        ]
+        content_frames = [p for p in payloads if p != "[DONE]" and "signet_abort" not in p]
         assert not any("(S//NF)" in p for p in content_frames)
         assert not any("must not appear" in p for p in content_frames)
         # Abort frame fired.
@@ -743,9 +730,7 @@ class TestUpstreamContentTypeGuard:
     strict mode preserves it.
     """
 
-    def test_octet_stream_aborts_with_transport_reason(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_octet_stream_aborts_with_transport_reason(self, monkeypatch, tmp_path) -> None:
         # 90KB of binary garbage on a 200 + octet-stream content-type.
         garbage = [b"\x00\x01\x02\x03" * 1024 for _ in range(20)]
         _patch_upstream_stream(
@@ -773,15 +758,11 @@ class TestUpstreamContentTypeGuard:
         # The audit row records the upstream attribution so operators
         # can pivot from the abort to the misconfigured backend.
         entries = list(JsonlBackend(log).iter_entries())
-        upstream_rows = [
-            e for e in entries if e.check_name == "pipeline.upstream"
-        ]
+        upstream_rows = [e for e in entries if e.check_name == "pipeline.upstream"]
         assert len(upstream_rows) == 1
         assert "application/octet-stream" in upstream_rows[0].reason
 
-    def test_strict_mode_preserves_content_type_invalid_reason(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_strict_mode_preserves_content_type_invalid_reason(self, monkeypatch, tmp_path) -> None:
         """Strict redaction would normally coarsen reasons, but the new
         token is in ``_TRANSPORT_ABORT_REASONS`` so it survives — SDKs
         need to distinguish "retry against a different upstream" from
@@ -806,9 +787,7 @@ class TestUpstreamContentTypeGuard:
         assert frame["reason"] == "upstream_content_type_invalid"
         assert "check" not in frame  # strict still drops check field
 
-    def test_text_plain_content_type_passes_through(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_text_plain_content_type_passes_through(self, monkeypatch, tmp_path) -> None:
         """Some upstreams ship SSE with ``text/plain`` content-type
         (notably older OpenAI-compatible proxies); the guard accepts
         it so we don't break legitimate traffic."""
@@ -829,9 +808,7 @@ class TestUpstreamContentTypeGuard:
         assert _find_abort_frame(payloads) is None
         assert any("hello" in p for p in payloads)
 
-    def test_event_stream_content_type_passes_through(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_event_stream_content_type_passes_through(self, monkeypatch, tmp_path) -> None:
         """The canonical SSE content type is the default fixture; this
         test pins the explicit positive case."""
         chunks = [_content_chunk("hello"), b"data: [DONE]\n\n"]
@@ -850,9 +827,7 @@ class TestUpstreamContentTypeGuard:
         assert _find_abort_frame(payloads) is None
         assert any("hello" in p for p in payloads)
 
-    def test_missing_content_type_passes_through(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_missing_content_type_passes_through(self, monkeypatch, tmp_path) -> None:
         """An upstream that omits Content-Type (older mocks, tests with
         bare-bones stubs) gets the historical pass-through. The guard
         only fires on an *explicit* non-SSE declaration."""
@@ -870,3 +845,204 @@ class TestUpstreamContentTypeGuard:
         assert r.status_code == 200
         payloads = _split_sse(r.text)
         assert _find_abort_frame(payloads) is None
+
+
+class TestF15StreamInitFailures:
+    """v0.1.8 F1.5: ``httpx.AsyncClient.stream.__aenter__`` failures.
+
+    F1.5 is the streaming-path equivalent of F1 for the sync path.
+    ``httpx.AsyncClient.stream`` is an ``@asynccontextmanager`` that
+    issues the HTTP request inside ``__aenter__``. Pre-fix, any
+    exception there (DNS failure, ``httpx.ConnectError``, TLS
+    handshake error, ``RuntimeError`` from a misconfigured transport)
+    leaked through the ``StreamingResponse`` generator. The SDK saw
+    an opaque ASGI exception instead of a structured abort frame, and
+    the ``finally`` branch wrote a ``pipeline.complete`` row tagged
+    ``finish_reason="client_disconnect"`` -- wrong cause attribution,
+    no ``pipeline.upstream`` row, no ``_refusal_kind`` discriminator.
+
+    Post-fix, an outer ``try/except`` around the ``async with`` emits
+    a structured abort frame and writes a ``pipeline.upstream`` audit
+    row with the same ``_check_name`` contract the inner mid-stream
+    handlers use. No spurious ``pipeline.complete`` row with
+    ``client_disconnect`` cause attribution.
+    """
+
+    def test_f15_stream_init_connect_error_abort_frame(self, monkeypatch, tmp_path) -> None:
+        """ConnectError from stream() __aenter__ produces abort frame + audit row."""
+        exc = httpx.ConnectError("connection refused")
+        _patch_upstream_stream_init_fails(monkeypatch, exc)
+
+        log = tmp_path / "audit.jsonl"
+        _app, client = _make_app(
+            Pipeline(checks=[]),
+            audit_log_path=log,
+        )
+        r = _post_stream(client, {"model": "test", "messages": []})
+
+        # SSE handshake already shipped before __aenter__ was awaited.
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        frame = _find_abort_frame(payloads)
+        # Client receives a structured abort frame -- NOT an opaque
+        # ASGI traceback or a hung connection.
+        assert frame is not None
+        assert frame["signet_abort"] is True
+        assert frame["reason"] == "upstream_protocol_violation"
+        assert frame["stage"] == "inspection"
+        # ``[DONE]`` sentinel closes the stream cleanly.
+        assert payloads[-1] == "[DONE]"
+
+        entries = list(JsonlBackend(log).iter_entries())
+        upstream_rows = [e for e in entries if e.check_name == "pipeline.upstream"]
+        # Exactly one pipeline.upstream row -- the audit chain pins
+        # cause attribution to the upstream init failure.
+        assert len(upstream_rows) == 1
+        meta = upstream_rows[0].metadata
+        assert meta.get("_exception_class") == "ConnectError"
+        assert meta.get("_exception_message")
+        assert meta.get("abort_stage") == "upstream"
+        # Reason text references the actual exception type so operators
+        # don't have to chase down the metadata for a quick triage.
+        assert "ConnectError" in upstream_rows[0].reason
+
+        # NO spurious pipeline.complete row tagged with
+        # ``client_disconnect`` -- the upstream-aborted branch in the
+        # ``finally`` correctly suppresses the terminal row.
+        complete_rows = [e for e in entries if e.check_name == "pipeline.complete"]
+        assert len(complete_rows) == 0
+        # Defense-in-depth: even if a future regression re-adds the
+        # row, it MUST NOT carry client_disconnect attribution.
+        for row in complete_rows:  # pragma: no cover -- empty above
+            assert row.metadata.get("finish_reason") != "client_disconnect"
+
+    def test_f15_stream_init_tls_handshake_error(self, monkeypatch, tmp_path) -> None:
+        """TLS handshake failure on __aenter__ produces structured abort."""
+        # httpx.ConnectError is the parent class httpx raises for
+        # most TLS failures; some installations raise the more
+        # specific ssl.SSLError. We exercise the httpx-family path
+        # here because the proxy's except clause keys on
+        # ``httpx.HTTPError`` (which covers ConnectError and its
+        # TLS-y siblings).
+        exc = httpx.ConnectError("TLS handshake failed: certificate verify failed")
+        _patch_upstream_stream_init_fails(monkeypatch, exc)
+
+        log = tmp_path / "audit.jsonl"
+        _app, client = _make_app(
+            Pipeline(checks=[]),
+            audit_log_path=log,
+        )
+        r = _post_stream(client, {"model": "test", "messages": []})
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        frame = _find_abort_frame(payloads)
+        assert frame is not None
+        assert frame["reason"] == "upstream_protocol_violation"
+        assert payloads[-1] == "[DONE]"
+
+        entries = list(JsonlBackend(log).iter_entries())
+        upstream_rows = [e for e in entries if e.check_name == "pipeline.upstream"]
+        assert len(upstream_rows) == 1
+        # Verbatim exception detail captured in the audit row for
+        # incident response.
+        assert "TLS handshake failed" in upstream_rows[0].metadata.get("_exception_message", "")
+
+    def test_f15_stream_init_generic_runtime_error(self, monkeypatch, tmp_path) -> None:
+        """RuntimeError from a misconfigured transport produces abort + audit."""
+        exc = RuntimeError("misconfigured transport: invalid proxy URL")
+        _patch_upstream_stream_init_fails(monkeypatch, exc)
+
+        log = tmp_path / "audit.jsonl"
+        _app, client = _make_app(
+            Pipeline(checks=[]),
+            audit_log_path=log,
+        )
+        r = _post_stream(client, {"model": "test", "messages": []})
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        frame = _find_abort_frame(payloads)
+        # Non-httpx exceptions get the ``upstream_exception`` reason
+        # token (matches the in-body generic-exception handler) so
+        # SDKs can split protocol violations from generic transport
+        # failures.
+        assert frame is not None
+        assert frame["reason"] == "upstream_exception"
+        assert frame["stage"] == "inspection"
+        assert payloads[-1] == "[DONE]"
+
+        entries = list(JsonlBackend(log).iter_entries())
+        upstream_rows = [e for e in entries if e.check_name == "pipeline.upstream"]
+        assert len(upstream_rows) == 1
+        meta = upstream_rows[0].metadata
+        assert meta.get("_exception_class") == "RuntimeError"
+        assert "misconfigured transport" in meta.get("_exception_message", "")
+        assert meta.get("abort_stage") == "upstream"
+
+        # No spurious pipeline.complete row -- upstream_aborted flag
+        # suppressed the terminal row in the ``finally``.
+        complete_rows = [e for e in entries if e.check_name == "pipeline.complete"]
+        assert len(complete_rows) == 0
+
+    def test_f15_mid_stream_error_unchanged(self, monkeypatch, tmp_path) -> None:
+        """Mid-stream errors (errors AFTER __aenter__ succeeded) still work
+        the same as the pre-F1.5 contract.
+
+        Pin: introducing the outer try/except must NOT change behavior
+        for exceptions raised inside the ``async with`` body. The inner
+        handlers already write the row + emit the abort frame and
+        ``return`` cleanly; the outer except sees nothing.
+        """
+        chunks = [_content_chunk("clean ")]
+        _patch_upstream_stream(
+            monkeypatch,
+            chunks=chunks,
+            raise_mid_stream=httpx.RemoteProtocolError,
+            raise_after_chunks=1,
+        )
+
+        log = tmp_path / "audit.jsonl"
+        _app, client = _make_app(
+            Pipeline(checks=[]),
+            audit_log_path=log,
+        )
+        r = _post_stream(client, {"model": "test", "messages": []})
+
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        # Pre-error chunk delivered (proves __aenter__ succeeded and
+        # we entered the inner streaming loop).
+        assert any("clean" in p for p in payloads)
+        frame = _find_abort_frame(payloads)
+        assert frame is not None
+        # Mid-stream RemoteProtocolError still maps to
+        # ``upstream_protocol_violation`` per the existing contract.
+        assert frame["reason"] == "upstream_protocol_violation"
+        assert payloads[-1] == "[DONE]"
+
+        # Exactly one pipeline.upstream row -- the outer except did NOT
+        # write a duplicate.
+        entries = list(JsonlBackend(log).iter_entries())
+        upstream_rows = [e for e in entries if e.check_name == "pipeline.upstream"]
+        assert len(upstream_rows) == 1
+
+    def test_f15_strict_mode_preserves_reason(self, monkeypatch, tmp_path) -> None:
+        """Under strict redaction, the F1.5 transport reason survives
+        coarsening so SDKs can distinguish retry semantics."""
+        exc = httpx.ConnectError("connection refused")
+        _patch_upstream_stream_init_fails(monkeypatch, exc)
+
+        _app, client = _make_app(
+            Pipeline(checks=[]),
+            audit_log_path=tmp_path / "audit.jsonl",
+            strict_error_redaction=True,
+        )
+        r = _post_stream(client, {"model": "test", "messages": []})
+        assert r.status_code == 200
+        payloads = _split_sse(r.text)
+        frame = _find_abort_frame(payloads)
+        assert frame is not None
+        # ``upstream_protocol_violation`` is in
+        # ``_TRANSPORT_ABORT_REASONS`` so strict mode preserves it.
+        assert frame["reason"] == "upstream_protocol_violation"
+        # Strict still drops firing-check identity.
+        assert "check" not in frame

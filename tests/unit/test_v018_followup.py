@@ -202,9 +202,7 @@ class TestN2TruncationTailBypass:
         truncation channel."""
         check = PromptInjectionCheck()
 
-        benign_ctx = _request(
-            body={"messages": [{"role": "user", "content": "hello world"}]}
-        )
+        benign_ctx = _request(body={"messages": [{"role": "user", "content": "hello world"}]})
         benign = await check.pre_request(benign_ctx)
         assert benign.is_allow
         assert benign.metadata.get("scan_truncated") is None
@@ -332,9 +330,7 @@ class TestS1ScopeDriftChunkDirectScan:
             accumulated_text_cap=1024,
             accumulated_text_truncated=True,
         )
-        result = await check.inspect_response_chunk(
-            rctx, "leaked: (S//NF) classified marker"
-        )
+        result = await check.inspect_response_chunk(rctx, "leaked: (S//NF) classified marker")
         assert result.is_block, (
             "S1 regression: a classification marker in a single chunk "
             "after the accumulated-text cap was hit was not caught. The "
@@ -353,12 +349,8 @@ class TestS1ScopeDriftChunkDirectScan:
         ctx = _scope_request()
         # Simulate what the proxy does: extract content into
         # accumulated_text BEFORE invoking inspect_response_chunk.
-        rctx = ResponseContext(
-            request=ctx, accumulated_text="first chunk (SECRET) text"
-        )
-        result = await check.inspect_response_chunk(
-            rctx, "data: first chunk (SECRET) text\n\n"
-        )
+        rctx = ResponseContext(request=ctx, accumulated_text="first chunk (SECRET) text")
+        result = await check.inspect_response_chunk(rctx, "data: first chunk (SECRET) text\n\n")
         assert result.is_block
         assert result.metadata["drift_kind"] == "classification"
 
@@ -399,9 +391,7 @@ class TestS1ScopeDriftChunkDirectScan:
             request=ctx,
             accumulated_text="prefix (TS//SCI) suffix",
         )
-        result = await check.inspect_response_chunk(
-            rctx, "data: prefix (TS//SCI) suffix\n\n"
-        )
+        result = await check.inspect_response_chunk(rctx, "data: prefix (TS//SCI) suffix\n\n")
         assert result.is_block
         assert result.metadata["marker"] == "(TS//SCI)"
 
@@ -415,10 +405,7 @@ class TestS1ScopeDriftChunkDirectScan:
         rctx = ResponseContext(request=ctx, accumulated_text="benign text here")
         result = await check.inspect_response_chunk(rctx, "benign chunk")
         assert result.is_allow
-        assert (
-            rctx.scratch.get(ScopeDriftCheck._LAST_POS_KEY)
-            == len("benign text here")
-        )
+        assert rctx.scratch.get(ScopeDriftCheck._LAST_POS_KEY) == len("benign text here")
 
     async def test_overlap_window_catches_boundary_straddle(self) -> None:
         """A marker straddling the boundary between previously-scanned
@@ -719,8 +706,7 @@ class TestNF1PreflightRefusal:
         entries = list(JsonlBackend(log).iter_entries())
         preflight = [e for e in entries if e.check_name == "pipeline.preflight"]
         assert len(preflight) == 1, (
-            "exactly one preflight row per refused request; got "
-            f"{[e.check_name for e in entries]}"
+            f"exactly one preflight row per refused request; got {[e.check_name for e in entries]}"
         )
         row = preflight[0]
         assert row.decision.value == "block"

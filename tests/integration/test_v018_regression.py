@@ -86,9 +86,7 @@ def _build_strict_app(
 # ---------------------------------------------------------------------------
 
 
-def test_n1_rot13_english_prefix_bypass_http(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
+def test_n1_rot13_english_prefix_bypass_http(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     """End-to-end: a stop-word-prefixed ROT13 attack must produce a
     403 refusal at the gate, never reaching the (mock) upstream."""
     _fake_upstream(monkeypatch)
@@ -148,9 +146,7 @@ def test_n2_truncation_tail_bypass_default_blocks_http(
     assert "leak" not in r.text
 
 
-def test_n2_truncation_allow_opt_in_passes_http(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
+def test_n2_truncation_allow_opt_in_passes_http(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     """When operators explicitly opt into the v0.1.7 shape via
     ``on_scan_truncated='allow'``, the same payload that would
     fail-closed under defaults gets through to the (mock) upstream."""
@@ -235,9 +231,7 @@ class _FakeStreamCM:
         return None
 
 
-def _patch_upstream_stream(
-    monkeypatch: pytest.MonkeyPatch, chunks: list[bytes]
-) -> None:
+def _patch_upstream_stream(monkeypatch: pytest.MonkeyPatch, chunks: list[bytes]) -> None:
     def fake_stream(_self, _method, _url, **_kwargs):
         return _FakeStreamCM(_FakeStreamResponse(chunks=list(chunks)))
 
@@ -278,9 +272,7 @@ def _find_abort_frame(payloads: list[str]) -> dict[str, Any] | None:
     return None
 
 
-def test_s1_classification_leak_after_cap(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
+def test_s1_classification_leak_after_cap(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     """v0.1.6 / v0.1.7 P0: ``accumulated_text_cap`` bypass.
 
     Pad the response stream with > 1 MiB of benign content so the
@@ -323,10 +315,7 @@ def test_s1_classification_leak_after_cap(
     payloads = _split_sse(r.text)
 
     # The leaked marker must never appear in a forwarded content frame.
-    content_frames = [
-        p for p in payloads
-        if p != "[DONE]" and "signet_abort" not in p
-    ]
+    content_frames = [p for p in payloads if p != "[DONE]" and "signet_abort" not in p]
     assert not any("(S//NF)" in p for p in content_frames), (
         "S1 regression: classification marker after cap saturation "
         "leaked to the client. The chunk-direct scan path is missing."
@@ -336,20 +325,15 @@ def test_s1_classification_leak_after_cap(
     # mid-stream BLOCK.
     abort = _find_abort_frame(payloads)
     assert abort is not None, (
-        "S1 regression: ScopeDriftCheck did not BLOCK the leak; no "
-        "signet_abort frame on the wire."
+        "S1 regression: ScopeDriftCheck did not BLOCK the leak; no signet_abort frame on the wire."
     )
 
     # Audit chain records the block.
     entries = list(JsonlBackend(log_path).iter_entries())
     decisions = [(e.check_name, e.decision) for e in entries]
     assert any(
-        e.decision == Decision.BLOCK and e.check_name == "pipeline.inspection"
-        for e in entries
-    ), (
-        f"S1 regression: no BLOCK audit row for the inspection-stage "
-        f"abort. Got: {decisions!r}"
-    )
+        e.decision == Decision.BLOCK and e.check_name == "pipeline.inspection" for e in entries
+    ), f"S1 regression: no BLOCK audit row for the inspection-stage abort. Got: {decisions!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -395,17 +379,14 @@ def test_v2_concurrent_appenders_no_fork(tmp_path) -> None:
             errors.append(exc)
 
     threads = [
-        threading.Thread(target=worker, args=(i,), name=f"appender-{i}")
-        for i in range(N_THREADS)
+        threading.Thread(target=worker, args=(i,), name=f"appender-{i}") for i in range(N_THREADS)
     ]
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=30)
 
-    assert not errors, (
-        f"V2 regression: appender threads raised: {errors!r}"
-    )
+    assert not errors, f"V2 regression: appender threads raised: {errors!r}"
 
     report = ChainVerifier(backend, keyring).verify()
     assert report.ok, (
@@ -413,8 +394,7 @@ def test_v2_concurrent_appenders_no_fork(tmp_path) -> None:
         f"appenders. breaks={report.breaks!r}"
     )
     assert report.total_entries == N_THREADS * PER_THREAD, (
-        f"V2 regression: expected {N_THREADS * PER_THREAD} entries, "
-        f"got {report.total_entries}."
+        f"V2 regression: expected {N_THREADS * PER_THREAD} entries, got {report.total_entries}."
     )
 
 
@@ -516,9 +496,7 @@ def test_a13_verify_json_payload_shape(tmp_path) -> None:
     """
     log_path = tmp_path / "audit.jsonl"
     secret = b"x" * 32
-    _confidence_hunt_build_chain(
-        log_path, secret, n=3, decision=Decision.ALLOW
-    )
+    _confidence_hunt_build_chain(log_path, secret, n=3, decision=Decision.ALLOW)
 
     runner = CliRunner()
     result = runner.invoke(
@@ -547,9 +525,7 @@ def test_a13_verify_json_payload_shape(tmp_path) -> None:
         "breaks",
     }
     missing = expected_keys - set(payload.keys())
-    assert not missing, (
-        f"v0.1.7 A13/F2 regressed: missing keys {missing!r}"
-    )
+    assert not missing, f"v0.1.7 A13/F2 regressed: missing keys {missing!r}"
     assert payload["signet_version"] == _signet.__version__
     assert _re.match(
         r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?\+00:00$",
@@ -580,9 +556,7 @@ def test_f1_compact_stacked_marker_clean_error(tmp_path) -> None:
 
     runner = CliRunner()
     archive1 = tmp_path / "archive-1.bin"
-    first_cutoff = (
-        (base_dt + timedelta(seconds=5)).isoformat().replace("+00:00", "Z")
-    )
+    first_cutoff = (base_dt + timedelta(seconds=5)).isoformat().replace("+00:00", "Z")
     r1 = runner.invoke(
         _cli_main,
         [
@@ -633,8 +607,7 @@ def test_f1_compact_stacked_marker_clean_error(tmp_path) -> None:
     )
     assert r2.exit_code != 0
     assert "Traceback" not in r2.output, (
-        f"v0.1.7 F1 regressed: raw traceback leaked into operator "
-        f"output:\n{r2.output}"
+        f"v0.1.7 F1 regressed: raw traceback leaked into operator output:\n{r2.output}"
     )
     assert "previous compaction marker" in r2.output
     assert "Error:" in r2.output
@@ -657,12 +630,9 @@ def test_f3_init_scaffold_registers_prompt_injection_check(tmp_path) -> None:
     from signet.cli import _load_pipeline_from_path
 
     pipeline = _load_pipeline_from_path(pipeline_path)
-    has_prompt_injection = any(
-        isinstance(c, PromptInjectionCheck) for c in pipeline.checks
-    )
+    has_prompt_injection = any(isinstance(c, PromptInjectionCheck) for c in pipeline.checks)
     assert has_prompt_injection, (
-        "v0.1.7 F3 regressed: init scaffold no longer registers "
-        "PromptInjectionCheck."
+        "v0.1.7 F3 regressed: init scaffold no longer registers PromptInjectionCheck."
     )
 
 
@@ -716,8 +686,7 @@ class TestNF1MalformedBodyAuditRow:
         entries = list(JsonlBackend(tmp_path / "audit.jsonl").iter_entries())
         preflight = [e for e in entries if e.check_name == "pipeline.preflight"]
         assert len(preflight) == 1, (
-            "exactly one preflight row per refused request; got "
-            f"{[e.check_name for e in entries]}"
+            f"exactly one preflight row per refused request; got {[e.check_name for e in entries]}"
         )
         row = preflight[0]
         assert row.decision.value == "block"
@@ -787,11 +756,13 @@ class TestNF2NonFiniteFloatRejection:
             headers={"Content-Type": "application/json"},
         )
         assert r.status_code == 400, (
-            f"NaN body should produce a 400 client error, got "
-            f"{r.status_code}: {r.text}"
+            f"NaN body should produce a 400 client error, got {r.status_code}: {r.text}"
         )
         body = r.json()
-        assert "non-finite float" in body.get("error", "")
+        # Round 9 ``preflight-error-label-inconsistency``: ``error``
+        # is the stable token; the prose moved to ``description``.
+        assert body.get("error") == "non_finite_float"
+        assert "non-finite float" in body.get("description", "")
 
     def test_positive_infinity_in_top_level_returns_400(
         self, tmp_path, monkeypatch: pytest.MonkeyPatch

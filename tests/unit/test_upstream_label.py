@@ -45,9 +45,7 @@ def upstream_response_body() -> dict[str, Any]:
 
 
 @pytest.fixture
-def label_app_factory(
-    monkeypatch: pytest.MonkeyPatch, upstream_response_body: dict[str, Any]
-):
+def label_app_factory(monkeypatch: pytest.MonkeyPatch, upstream_response_body: dict[str, Any]):
     """Build a SignetApp + TestClient with a caller-supplied ServerConfig.
 
     Mirrors ``app_factory`` in test_server_app.py but lets the caller
@@ -55,9 +53,7 @@ def label_app_factory(
     upstream_url to whatever shape it needs.
     """
 
-    def _make(
-        pipeline: Pipeline, config: ServerConfig
-    ) -> tuple[SignetApp, TestClient]:
+    def _make(pipeline: Pipeline, config: ServerConfig) -> tuple[SignetApp, TestClient]:
         async def fake_post(_self, _url, **_kwargs):
             class FakeResp:
                 status_code = 200

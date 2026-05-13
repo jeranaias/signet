@@ -130,9 +130,7 @@ def runner() -> CliRunner:
 
 
 class TestSingleLoadedPlugin:
-    def test_list_reports_loaded(
-        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_list_reports_loaded(self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_entry_points(
             monkeypatch,
             {
@@ -159,9 +157,7 @@ class TestSingleLoadedPlugin:
         assert loaded[0]["status"] == "loaded"
         assert loaded[0]["package"] == "fake-pkg"
 
-    def test_doctor_exit_zero(
-        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_doctor_exit_zero(self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_entry_points(
             monkeypatch,
             {
@@ -223,9 +219,7 @@ class TestDuplicateName:
         for entry in dups:
             assert entry["status"] == "duplicate_name"
 
-    def test_doctor_exits_nonzero(
-        self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_doctor_exits_nonzero(self, runner: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_entry_points(
             monkeypatch,
             {

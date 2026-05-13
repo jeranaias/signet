@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import unicodedata
 from dataclasses import dataclass
 
 from signet.core.check import Check, CheckResult
@@ -76,10 +77,18 @@ _LEVEL_ALIASES: dict[str, ClassificationLevel] = {
 
 
 def _parse_level(value: str | None, default: ClassificationLevel) -> ClassificationLevel | None:
-    """Return the parsed level, or ``None`` if the value is unrecognized."""
+    """Return the parsed level, or ``None`` if the value is unrecognized.
+
+    R7 MED (classification-gate-no-nfkc-on-headers): values are NFKC-
+    normalized before alias lookup so fullwidth Latin letters
+    (Unicode block U+FF21..U+FF3A, the visual fullwidth "SECRET" et al.)
+    and other compatibility variants collapse to canonical ASCII.
+    Without normalization, a legitimate caller whose browser / proxy
+    emits fullwidth would silently be blocked as ``unrecognized``.
+    """
     if not value:
         return default
-    norm = value.strip().upper()
+    norm = unicodedata.normalize("NFKC", value).strip().upper()
     return _LEVEL_ALIASES.get(norm)
 
 
@@ -125,8 +134,7 @@ class ClassificationGateCheck(Check):
             and self._raw_header_is_whitespace_only(h)
         ):
             logger.info(
-                "%s header present but whitespace-only; mapping to default %s "
-                "(clearance=%s)",
+                "%s header present but whitespace-only; mapping to default %s (clearance=%s)",
                 self.classification_header,
                 self.default_classification.name,
                 clr_level_for_log.name,

@@ -66,6 +66,7 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from fastapi import WebSocket
@@ -88,6 +89,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger("signet.server.realtime")
 
 
+# Round 13 ``realtime-ws-default-deny`` closure: a UUID-shaped sanity
+# check for the realtime ``call_id`` echo path. The realtime API uses
+# call_id as the per-tool-call request handle and SDKs that surface it
+# to operators should not be passed arbitrary upstream-controlled
+# bytes (e.g. a hostile upstream stamping ``call_id="(S//NF)"`` on a
+# tool call that signet then BLOCKs would cause signet itself to echo
+# the marker back to the client via the refusal frame). UUIDs, hex-
+# hashes, base64url IDs, and any conventional opaque identifier match
+# this pattern; arbitrary text does not.
+_REALTIME_CALL_ID_RE: Any = None  # lazy-compiled in _is_safe_call_id
+
+
+def _is_safe_call_id(value: Any) -> bool:
+    """Return True when ``value`` is a printable-token call_id.
+
+    Accepts UUID-shape, hex-shape, base64url-shape, and similar
+    structured identifiers. Refuses values that contain text outside
+    ``[A-Za-z0-9_.:\\-]`` (the same charset used for
+    ``X-Signet-Session`` -- a deliberate symmetry across the realtime
+    + HTTP surfaces).
+    """
+    global _REALTIME_CALL_ID_RE
+    import re as _re
+
+    if _REALTIME_CALL_ID_RE is None:
+        _REALTIME_CALL_ID_RE = _re.compile(r"^[A-Za-z0-9_.:\-]{1,256}$")
+    if not isinstance(value, str):
+        return False
+    return bool(_REALTIME_CALL_ID_RE.match(value))
+
+
 # WebSocket close codes used by the handler. Defined here so the audit
 # rows and tests can refer to them by name rather than by magic number.
 WS_CLOSE_NORMAL = 1000
@@ -101,6 +133,29 @@ non-shadow mode."""
 WS_CLOSE_INTERNAL_ERROR = 1011
 """Server error. Used when the proxy encounters an unexpected failure
 mid-session (pipeline crash, etc.)."""
+
+
+# Round 9 cross-domain ``realtime-ws-admission-no-session-caps``
+# closure: the unary HTTP path applied the ``_MAX_SESSION_ID_BYTES``
+# (256) and ``_SESSION_ID_RE`` (``[A-Za-z0-9_.:-]+``) caps before
+# touching the session store, but the WebSocket admission preamble
+# read the handshake's ``X-Signet-Session`` header unchecked. A 64-KB
+# session ID would land in the LRU session store (10 GB exhaustion
+# risk); a null-byte / control-char ID would persist verbatim into
+# operator log tails. Import the canonical constants from
+# :mod:`signet.server.app` so the two paths agree on the policy,
+# rather than maintaining a parallel definition.
+def _get_session_id_constants() -> tuple[int, Any]:
+    """Lazy import to avoid an import cycle.
+
+    :mod:`signet.server.app` imports this module's
+    :class:`RealtimeHandler` from inside :meth:`SignetApp._handle_realtime`
+    (also lazy); pulling the constants at module load would create a
+    circular import. Defer the lookup until first use.
+    """
+    from signet.server.app import _MAX_SESSION_ID_BYTES, _SESSION_ID_RE
+
+    return _MAX_SESSION_ID_BYTES, _SESSION_ID_RE
 
 
 # Periodic-flush interval. Long sessions write a checkpoint row every
@@ -171,6 +226,11 @@ class RealtimeHandler:
         self.function_calls_escalated = 0
         self.audio_chunks_passed_through = 0
         self.text_chunks_inspected = 0
+        # N1 (v0.1.8.1): binary WS frames previously dropped silently.
+        # Each binary frame now writes an audit row and increments this
+        # counter, which surfaces in the session-end audit metadata so
+        # operators can see the volume of binary traffic per session.
+        self.binary_frames_received = 0
 
     # ------------------------------------------------------------------
     # Top-level lifecycle
@@ -260,15 +320,76 @@ class RealtimeHandler:
         ``None`` on allow (handler should proceed to the session
         loop). Side effect: populates ``self.ctx`` so the session
         loop has the resolved owner.
+
+        Round 9 cross-domain ``realtime-ws-admission-no-session-caps``
+        closure: the same ``_MAX_SESSION_ID_BYTES`` (256) and
+        ``_SESSION_ID_RE`` (``[A-Za-z0-9_.:-]+``) caps the unary HTTP
+        path enforces are applied here. A handshake with an oversize
+        or invalid-charset ``X-Signet-Session`` header synthesizes a
+        BLOCK :class:`CheckResult` keyed to ``pipeline.admission`` so
+        the caller's close path runs (1008 policy violation) and an
+        audit row is written.
         """
         # Header dict: starlette gives a Headers object with
         # case-insensitive lookup; coerce to a plain dict so the same
         # case-insensitive helper that HTTP uses works here too.
         headers = dict(self.websocket.headers.items())
-        client_ip = (
-            self.websocket.client.host if self.websocket.client is not None else None
-        )
-        session_id = get_header_ci(headers, SESSION_HEADER) or None
+        client_ip = self.websocket.client.host if self.websocket.client is not None else None
+        session_id_raw = get_header_ci(headers, SESSION_HEADER) or None
+        session_id = session_id_raw.strip() if session_id_raw else None
+        if not session_id:
+            session_id = None
+
+        # Round 9: validate session-ID length + charset BEFORE the
+        # session store ever sees it. Synthesize a BLOCK CheckResult
+        # so the caller's existing refusal-close path (1008 with an
+        # audit row) handles it exactly like a pipeline-driven block.
+        # We don't touch the session store on a refused handshake.
+        from signet.core.check import CheckResult as _CR
+
+        if session_id is not None:
+            max_bytes, sid_re = _get_session_id_constants()
+            if len(session_id.encode("utf-8")) > max_bytes:
+                # Synthesize a ctx so the refusal-handler can write
+                # the audit row with realtime-shape metadata.
+                self.ctx = RequestContext(
+                    owner=Owner.unresolved(),
+                    headers=headers,
+                    body={},
+                    path="/v1/realtime",
+                    method="GET",
+                    client_ip=client_ip,
+                    # Don't index the LRU under the offending ID.
+                    session_id=None,
+                )
+                self.ctx.scratch["_request_fingerprint"] = f"realtime-session:{self.session_id}"
+                self.ctx.scratch["_realtime_session_id"] = self.session_id
+                return _CR.block(
+                    f"X-Signet-Session header exceeds {max_bytes} bytes",
+                    _check_name="pipeline.admission",
+                    _stage="admission",
+                    _refusal_kind="session_id_too_long",
+                    session_id_bytes=len(session_id.encode("utf-8")),
+                    limit_bytes=max_bytes,
+                )
+            if not sid_re.match(session_id):
+                self.ctx = RequestContext(
+                    owner=Owner.unresolved(),
+                    headers=headers,
+                    body={},
+                    path="/v1/realtime",
+                    method="GET",
+                    client_ip=client_ip,
+                    session_id=None,
+                )
+                self.ctx.scratch["_request_fingerprint"] = f"realtime-session:{self.session_id}"
+                self.ctx.scratch["_realtime_session_id"] = self.session_id
+                return _CR.block(
+                    "X-Signet-Session contains characters outside [A-Za-z0-9_.:-]",
+                    _check_name="pipeline.admission",
+                    _stage="admission",
+                    _refusal_kind="session_id_invalid_charset",
+                )
 
         # No body on a WebSocket handshake; checks that scan body
         # content (RegexContentCheck etc.) see an empty dict and
@@ -320,9 +441,7 @@ class RealtimeHandler:
         event is the only carrier.
         """
         assert self.ctx is not None
-        entry = self.app._record_decision(
-            self.ctx, result=result, check_name="pipeline.admission"
-        )
+        entry = self.app._record_decision(self.ctx, result=result, check_name="pipeline.admission")
 
         if self.app.config.shadow:
             self.app._stash_shadow_headers(self.ctx, result, entry, decision="block")
@@ -369,9 +488,7 @@ class RealtimeHandler:
         # WebSocket close-reason field is capped at 123 bytes by RFC
         # 6455. Coarsen unconditionally on the wire; the audit row has
         # the full reason.
-        await self.websocket.close(
-            code=WS_CLOSE_POLICY_VIOLATION, reason="signet refused"
-        )
+        await self.websocket.close(code=WS_CLOSE_POLICY_VIOLATION, reason="signet refused")
 
     # ------------------------------------------------------------------
     # Session loop
@@ -396,15 +513,26 @@ class RealtimeHandler:
             mtype = message.get("type")
             if mtype == "websocket.disconnect":
                 # Starlette's TestClient delivers disconnect this way.
-                raise WebSocketDisconnect(
-                    code=int(message.get("code", WS_CLOSE_NORMAL))
-                )
+                raise WebSocketDisconnect(code=int(message.get("code", WS_CLOSE_NORMAL)))
             if mtype != "websocket.receive":
                 # ``websocket.connect`` is consumed by accept(); any
                 # other ASGI control message is ignored.
                 continue
 
             self.client_event_count += 1
+
+            # N1 (v0.1.8.1): binary WS frames were silently dropped --
+            # no audit row, no counter, no pass-through. Detect them
+            # explicitly BEFORE the JSON parse so they get an audit row
+            # with frame size, then forward to the upstream (matching
+            # the audio-event pass-through contract). Operators who
+            # want to refuse binary frames can subclass and override
+            # ``_handle_binary_frame``.
+            binary_payload = message.get("bytes")
+            if binary_payload is not None:
+                await self._handle_binary_frame(binary_payload)
+                continue
+
             event = self._parse_message(message)
             if event is None:
                 # Non-JSON, non-text payload -- pass through silently
@@ -414,7 +542,9 @@ class RealtimeHandler:
             await self._dispatch_client_event(event)
 
     @staticmethod
-    def _parse_message(message: dict[str, Any]) -> dict[str, Any] | None:
+    def _parse_message(
+        message: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
         """Pull a JSON event out of the ASGI websocket.receive message.
 
         Realtime API events are JSON over text frames; binary frames
@@ -631,9 +761,28 @@ class RealtimeHandler:
             "tool_name": str(event.get("name", "")),
             "correlation_id": entry_id,
         }
+        # Round 13 ``realtime-ws-default-deny`` closure: sanitize
+        # ``call_id`` before echoing. Pre-fix any upstream-controlled
+        # bytes (including classification markers) on ``event.call_id``
+        # were echoed verbatim back to the client via the refusal frame
+        # -- paradoxically, a BLOCK decision would leak the smuggled
+        # marker via the very frame that announced the block. Validate
+        # against a UUID/hex/base64url-shaped charset; replace non-
+        # conforming values with the synthetic correlation_id so SDKs
+        # still get a per-refusal handle without echoing hostile input.
         call_id = event.get("call_id")
-        if call_id:
-            payload["call_id"] = call_id
+        if call_id is not None:
+            if _is_safe_call_id(call_id):
+                payload["call_id"] = call_id
+            elif entry_id is not None:
+                # Fall back to the audit-row entry_id so SDK clients
+                # still get a stable per-refusal handle. The full
+                # offending call_id is captured in the audit metadata
+                # (see ``_handle_function_call``'s ``_record_decision``
+                # call) for forensics.
+                payload["call_id"] = f"sanitized:{entry_id}"
+            # else: chain disabled and value is unsafe -- omit
+            # call_id entirely rather than echo or invent.
         if self.app.config.strict_error_redaction:
             payload["reason"] = "refused"
         else:
@@ -655,11 +804,236 @@ class RealtimeHandler:
         delta string. Non-allow result in non-shadow blocks the
         forward and emits a refusal-status event. Shadow mode forwards
         the chunk and tags the audit row.
+
+        Round 13 ``realtime-ws-default-deny`` closure: prior to v0.1.x
+        this handler only inspected ``event.delta`` and forwarded every
+        other sibling field (``event_id``, ``response_id``, ``item_id``,
+        ``content_index``, ``output_index``, ``error.message``, any
+        non-standard sibling a future API version adds) verbatim via
+        ``_send_to_client``. None of those reached
+        ``pipeline.inspect_response_chunk``. The same default-deny
+        recursive walk the HTTP-streaming path uses is now applied to
+        the full event dict so a hostile upstream that stuffs a
+        classification marker into a sibling field is caught before
+        the bytes reach the client. The check is done in addition to
+        the ``delta``-specific inspection so the per-chunk text
+        contract still drives the primary inspection path.
+
+        Why this still matters even though the in-tree realtime is
+        loopback-only: ``_recv_from_upstream`` and
+        ``_forward_to_upstream`` are documented as subclass-override
+        hooks for live-bridge implementations. The subclass contract
+        promises ADMISSION/INSPECTION/COMMITMENT parity with the HTTP
+        path; shipping a known gap that the HTTP path closed two
+        rounds ago would land the gap in every live-bridge subclass.
         """
         assert self.ctx is not None
         assert self.rctx is not None
 
+        # Lazy import to avoid an import cycle with
+        # :mod:`signet.server.app`. The HTTP-streaming path's
+        # recursive-walk helper is the canonical implementation; reuse
+        # it so the WS path's default-deny posture and the HTTP path's
+        # stay in lockstep without a parallel implementation.
+        from signet.server.app import (
+            _SSE_EVENT_STRUCTURAL_KEYS,
+            _STRUCTURAL_ABORT,
+            _collect_inspectable_strings,
+            _DepthSentinelList,
+            _validate_event_top_level_structural_field,
+        )
+
         delta = event.get("delta")
+
+        # Round 19 ``realtime-ws-uses-delta-level-skip-set-on-event-top``
+        # (F-R19-1) closure: pre-fix this call passed ``_top_level=True``,
+        # which activates the **delta-level** structural skip set
+        # (``_SSE_DELTA_STRUCTURAL_KEYS = {role, index, id, type,
+        # function_call_id, tool_call_id, stop, object, finish_reason}``).
+        # But the input here is the **event** dict, not a delta dict. At
+        # event scope the correct skip set is ``_SSE_EVENT_STRUCTURAL_KEYS``
+        # (only ``object``), which is what the HTTP ``_SSEBuffer._flush_event``
+        # path uses. The mismatch let a hostile upstream stamp a marker
+        # onto ``event.type`` / ``event.id`` / ``event.stop`` /
+        # ``event.tool_call_id`` / ``event.function_call_id`` /
+        # ``event.object`` as a clean ASCII string -- those keys satisfied
+        # the delta-level open-string validators (or routed via
+        # ``_STRUCTURAL_ABORT`` for ``object`` while the abort path on
+        # this WS handler was missing), the walker skipped them, and the
+        # bytes forwarded to the client verbatim. Mirror the HTTP event-
+        # level contract: pass ``_event_top_level=True`` so only
+        # ``object`` is structural at this layer, and add the pre-walk
+        # event-level abort loop (below) so a hostile wrong-VALUE in
+        # ``event.object`` aborts the frame instead of slipping through.
+        #
+        # Run the recursive walker against the full event dict. Any
+        # inspectable string reachable from a non-structural key
+        # (``event_id``, ``response_id``, ``item_id``, ``error.message``,
+        # ``event.type``, ``event.id``, ``event.stop``,
+        # ``event.tool_call_id``, ``event.function_call_id``, etc.) is
+        # fed through ``inspect_response_chunk`` so a hostile upstream
+        # cannot smuggle a marker past INSPECTION via a sibling field.
+        #
+        # Round 15 ``realtime-walker-depth-sentinel-swallowed`` (F-R15-4)
+        # closure: the HTTP path's ``_SSEBuffer._flush_event`` checks
+        # ``isinstance(collected, _DepthSentinelList)`` and aborts the
+        # stream via ``upstream_delta_too_deep`` (R11 closure). The R14
+        # walker addition here originally treated the return as a
+        # vanilla list, so an event nested deeper than ``_MAX_JSON_DEPTH``
+        # (64) yielded zero sibling strings, the loop iterated zero
+        # times, and the event flowed to the client unblocked. Mirror
+        # the HTTP path's sentinel check: a depth-cap-tripped walker
+        # result refuses the WS frame with a sanitized refusal and
+        # stops forwarding.
+        sibling_strings: list[str] = []
+        sibling_too_deep = False
+        # Round 19 (F-R19-1): mirror the HTTP path's pre-walk event-level
+        # abort loop (``_SSEBuffer._flush_event``). A wrong-VALUE in an
+        # event-level structural field (e.g. ``event.object="NOT.A.VALID
+        # .OBJECT"``) must abort the frame as malformed rather than
+        # slipping through with the marker intact.
+        saw_event_structural_abort = False
+        for ek, ev in event.items():
+            if (
+                isinstance(ek, str)
+                and ek in _SSE_EVENT_STRUCTURAL_KEYS
+                and _validate_event_top_level_structural_field(ek, ev) == _STRUCTURAL_ABORT
+            ):
+                saw_event_structural_abort = True
+                break
+        try:
+            sibling_strings = _collect_inspectable_strings(event, _event_top_level=True)
+            if isinstance(sibling_strings, _DepthSentinelList):
+                sibling_too_deep = True
+        except Exception:  # pragma: no cover -- walker is hardened
+            logger.exception("realtime sibling-walker crashed")
+
+        if sibling_too_deep:
+            # Defense in depth: mirror the HTTP path's
+            # ``upstream_delta_too_deep`` abort. Write an audit row
+            # (so the failure is operator-visible), send a sanitized
+            # refusal frame, and return without forwarding.
+            entry = self.app._record_decision(
+                self.ctx,
+                result=None,
+                check_name="pipeline.realtime",
+                metadata={
+                    "session_id": self.session_id,
+                    "chunk_count_at_block": self.rctx.chunk_count,
+                    "abort_stage": "inspection",
+                    "abort_reason": "upstream_delta_too_deep",
+                    "smuggled_via_sibling_field": True,
+                },
+            )
+            if self.app.config.shadow:
+                # Shadow mode: forward despite the would-be abort.
+                await self._send_to_client(event)
+                return
+            refusal_too_deep: dict[str, Any] = {
+                "type": "signet.refusal",
+                "stage": "inspection",
+                "decision": "block",
+                "reason": "refused",
+                "correlation_id": entry.entry_id if entry is not None else None,
+            }
+            await self.websocket.send_json(refusal_too_deep)
+            return
+
+        if saw_event_structural_abort:
+            # Round 19 (F-R19-1) closure: mirror the HTTP path's
+            # ``_SSEBuffer._flush_event`` malformed-event abort. A
+            # wrong-VALUE in an event-level structural field (e.g.
+            # ``event.object="NOT.A.VALID.OBJECT"``) means the frame
+            # cannot be trusted at all -- it doesn't conform to the
+            # documented wire contract, so any sibling string we
+            # collected from it could be smuggling a marker via a key
+            # the walker thought was structural. Abort the frame as
+            # malformed rather than forwarding any of its bytes.
+            entry = self.app._record_decision(
+                self.ctx,
+                result=None,
+                check_name="pipeline.realtime",
+                metadata={
+                    "session_id": self.session_id,
+                    "chunk_count_at_block": self.rctx.chunk_count,
+                    "abort_stage": "inspection",
+                    "abort_reason": "upstream_malformed_event",
+                    "smuggled_via_sibling_field": True,
+                },
+            )
+            if self.app.config.shadow:
+                # Shadow mode: forward despite the would-be abort.
+                await self._send_to_client(event)
+                return
+            refusal_malformed: dict[str, Any] = {
+                "type": "signet.refusal",
+                "stage": "inspection",
+                "decision": "block",
+                "reason": "refused",
+                "correlation_id": entry.entry_id if entry is not None else None,
+            }
+            await self.websocket.send_json(refusal_malformed)
+            return
+
+        # Inspect sibling strings (everything other than ``delta``,
+        # which is handled below). A non-allow result on a sibling
+        # string aborts the forward via the same refusal frame the
+        # delta-driven block uses.
+        sibling_marker_text = None
+        for s in sibling_strings:
+            if delta is not None and s == delta:
+                # The delta itself is walked below; skip the duplicate
+                # so a single marker doesn't produce two inspection
+                # rows. This is a no-op when ``delta`` is None.
+                continue
+            try:
+                sib_result = await self.app.pipeline.inspect_response_chunk(self.rctx, s)
+            except Exception as exc:
+                self.app._record_exception(self.ctx, exc, check_name="pipeline.inspection")
+                logger.exception("realtime sibling-field INSPECTION pipeline crashed")
+                continue
+            if not sib_result.is_allow:
+                sibling_marker_text = s
+                check_name = str(sib_result.metadata.get("_check_name", "pipeline.inspection"))
+                entry = self.app._record_decision(
+                    self.ctx,
+                    result=sib_result,
+                    check_name="pipeline.inspection",
+                    metadata={
+                        "session_id": self.session_id,
+                        "chunk_count_at_block": self.rctx.chunk_count,
+                        "abort_stage": "inspection",
+                        "smuggled_via_sibling_field": True,
+                    },
+                )
+                if self.app.config.shadow:
+                    # Shadow: forward despite the would-be block; the
+                    # audit row already recorded shadow=True via
+                    # _record_decision (because config.shadow is True
+                    # and the result is non-allow).
+                    break
+                refusal: dict[str, Any] = {
+                    "type": "signet.refusal",
+                    "stage": "inspection",
+                    "decision": "block",
+                    "correlation_id": entry.entry_id if entry is not None else None,
+                }
+                if self.app.config.strict_error_redaction:
+                    refusal["reason"] = "refused"
+                else:
+                    refusal["reason"] = sib_result.reason
+                    if check_name:
+                        refusal["check"] = check_name
+                await self.websocket.send_json(refusal)
+                return
+        # If shadow mode triggered a would-be block above, fall
+        # through; the event is forwarded after delta inspection (if
+        # any).
+        if sibling_marker_text is not None and not self.app.config.shadow:
+            # Defensive: should be unreachable -- the non-shadow
+            # branch above returns.
+            return
+
         if not isinstance(delta, str) or not delta:
             await self._send_to_client(event)
             return
@@ -696,7 +1070,7 @@ class RealtimeHandler:
             await self._send_to_client(event)
             return
 
-        refusal: dict[str, Any] = {
+        refusal = {
             "type": "signet.refusal",
             "stage": "inspection",
             "decision": "block",
@@ -709,6 +1083,47 @@ class RealtimeHandler:
             if check_name:
                 refusal["check"] = check_name
         await self.websocket.send_json(refusal)
+
+    async def _handle_binary_frame(self, payload: bytes) -> None:
+        """Audit + pass a binary WebSocket frame to the client (N1).
+
+        Realtime API events are normally JSON over text frames; binary
+        frames are reserved for forward compatibility (raw audio,
+        opaque codec frames, etc.). Prior to v0.1.8.1 we silently
+        dropped them, which left a gap in the audit trail: a misbehaving
+        client could ship arbitrary bytes through the gate with no
+        operator-visible record.
+
+        This handler writes one audit row per binary frame tagged
+        ``binary_frame_received=True`` and ``frame_size_bytes=N`` so
+        operators can quantify the volume / size of binary traffic.
+        Frames pass through to the client (mirroring the audio
+        pass-through contract); subclasses that want to refuse binary
+        can override this method.
+        """
+        assert self.ctx is not None
+        self.binary_frames_received += 1
+        size = len(payload) if payload is not None else 0
+        self.app._record_decision(
+            self.ctx,
+            result=None,
+            check_name="pipeline.realtime.binary",
+            metadata={
+                "session_id": self.session_id,
+                "binary_frame_received": True,
+                "frame_size_bytes": size,
+            },
+        )
+        # Pass through to the client. Live-bridge subclasses override
+        # this method if they want to push the bytes onward to a real
+        # upstream rather than loopback-echoing them.
+        if self.websocket.application_state is WebSocketState.DISCONNECTED:
+            return
+        try:
+            await self.websocket.send_bytes(payload)
+        except Exception:  # pragma: no cover -- defensive
+            logger.exception("realtime send_bytes failed")
+        self.upstream_event_count += 1
 
     async def _handle_audio_passthrough(self, event: dict[str, Any]) -> None:
         """Forward an audio event with an audit row recording the skip.
@@ -786,6 +1201,7 @@ class RealtimeHandler:
                 "upstream_event_count": self.upstream_event_count,
                 "audio_chunks_passed_through": self.audio_chunks_passed_through,
                 "text_chunks_inspected": self.text_chunks_inspected,
+                "binary_frames_received": self.binary_frames_received,
                 "ended_normally": ended_normally,
                 "close_code": close_code,
             },
@@ -819,6 +1235,7 @@ class RealtimeHandler:
                         "upstream_event_count": self.upstream_event_count,
                         "audio_chunks_passed_through": self.audio_chunks_passed_through,
                         "text_chunks_inspected": self.text_chunks_inspected,
+                        "binary_frames_received": self.binary_frames_received,
                         "interim": True,
                     },
                 )

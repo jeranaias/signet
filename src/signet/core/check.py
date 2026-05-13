@@ -204,8 +204,7 @@ class Check:
         # ``Check`` doesn't count.
         if not _explicitly_declared("name") or not getattr(cls, "name", ""):
             raise TypeError(
-                f"Check subclass {cls.__name__!r} must set a non-empty "
-                "`name` class attribute"
+                f"Check subclass {cls.__name__!r} must set a non-empty `name` class attribute"
             )
         # ``stage`` must be set somewhere in the subclass chain. Merely
         # inheriting ``Check.stage = Stage.ADMISSION`` doesn't count --
@@ -217,9 +216,7 @@ class Check:
                 "be explicit about lifecycle)."
             )
         if not isinstance(getattr(cls, "stage", None), Stage):
-            raise TypeError(
-                f"Check subclass {cls.__name__!r} `stage` must be a Stage enum value"
-            )
+            raise TypeError(f"Check subclass {cls.__name__!r} `stage` must be a Stage enum value")
 
     async def pre_request(self, ctx: RequestContext) -> CheckResult:
         """Called before the request is forwarded upstream.

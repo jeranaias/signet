@@ -42,7 +42,7 @@ Pyros engine, not in this OSS release.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from signet.plugins.discovery import (
     ENTRY_POINT_GROUP,
@@ -96,12 +96,9 @@ def resolve(name: str, *, group: str = "signet.checks") -> type[Check]:
     plugins = discover_plugins()
     matches = [p for p in plugins if p.group == group and p.name == name]
     if not matches:
-        known = sorted({p.name for p in plugins if p.group == group}) or [
-            "(none registered)"
-        ]
+        known = sorted({p.name for p in plugins if p.group == group}) or ["(none registered)"]
         raise KeyError(
-            f"no signet plugin named {name!r} in group {group!r}; "
-            f"known plugins: {', '.join(known)}"
+            f"no signet plugin named {name!r} in group {group!r}; known plugins: {', '.join(known)}"
         )
     plugin = matches[0]
     if plugin.status == "duplicate_name":
@@ -116,7 +113,10 @@ def resolve(name: str, *, group: str = "signet.checks") -> type[Check]:
             f"[status={plugin.status}]: {plugin.error}"
         )
     assert plugin.obj is not None  # status == "loaded" implies obj set
-    return plugin.obj
+    # ``plugin.obj`` is ``Any`` on the dataclass. The status check above
+    # guarantees discovery validated it as a ``type[Check]``; the cast
+    # makes the return-type narrowing explicit for mypy.
+    return cast("type[Check]", plugin.obj)
 
 
 __all__ = [

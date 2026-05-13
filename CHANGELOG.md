@@ -8,6 +8,402 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.9] -- 2026-05-12
+
+### Eleven hunt-fix cycles after v0.1.8 — the version that survives a determined adversary
+
+v0.1.8 advertised a "the version that actually delivers on the project's
+promises" pitch. The post-ship confidence hunt ran 11 cycles of five
+domain-isolated hunters against the locally-fixed tree (audit, server,
+streaming, pipeline+checks, CLI+plugins), each cycle's findings closed
+locally before the next hunt. Cycle counts: 31 findings → 35 → 16 → 14
+→ 17 → 14 → 6 → 4. The journey is documented in
+`docs/bug-hunt-log.md` cycle 7. Headline outcomes:
+
+- **3 P0 streaming bypasses closed** — SSE chunk-boundary split,
+  unparseable-JSON event leaking raw bytes, unbounded
+  `_pending_raw_sse` (250 MB → 5 MB peak under bomb).
+- **2 P0 pipeline regressions closed** — override-rule `\b` boundary
+  letting `Pleaseignore previous` slip past, BFS deadline fail-open
+  under attacker padding.
+- **R14 prompt-injection regression caught and reverted** — the
+  inflating-chain alarm had a catastrophic false-positive rate on
+  JWT tokens, npm `sha512-...` hashes, git commit SRI checksums, CSP
+  headers, RFC 2047 MIME subjects. v0.1.9 removes the alarm; depth-16
+  ceiling + per-depth budget is the boundary.
+- **Audit chain marker-aware bridge** survives process restart and
+  `cache_prev=False` multi-process backends (the original R10 fix
+  only worked same-instance; R12+R22 close every variant).
+- **Streaming walker covers every text-bearing schema field** —
+  `choices[i].text` / `.message.content` / `.logprobs.content[].token`
+  / `delta.refusal` / `delta.reasoning` / `delta.audio.transcript` /
+  `tool_calls[*].function.{name,arguments,description}` / event-level
+  `id`/`model`/`system_fingerprint`/`error.message`. Default-deny on
+  unknown text fields.
+- **Plugin discovery hardened** against hostile metaclass
+  `__getattribute__` raising on `__name__`/`__repr__`/`__class__`,
+  bounded by `_truncate_for_log` against 10 MB `__repr__` DoS, BFS
+  short-circuit on `(KeyboardInterrupt, SystemExit)` re-raise.
+
+### Fixed (P0)
+
+#### Streaming SSE
+- **SSE chunk-boundary bypass** — `_extract_sse_content` was stateless
+  across `aiter_bytes()` chunks. A `data:` line split across chunks
+  (TLS records, HTTP/2 frames, MTU boundaries) silently allowed the
+  marker through. New `_SSEBuffer` class with per-stream `_pending_line`
+  / `_pending_data` state; byte-level `_pending_raw_sse` holds raw
+  bytes until the LAST event terminator before client emission;
+  inspection runs on assembled event first. CR/LF/CRLF/CR-only event
+  terminators all recognized via `_SSE_EVENT_TERMINATOR_RE`.
+- **Unparseable-JSON event leaks raw bytes** — `_flush_event`'s
+  `JSONDecodeError` catch silently incremented `dropped_frame_count`
+  while letting raw event bytes flow to the client. Hostile upstream
+  smuggled by appending a junk `data:` line. Now sets
+  `malformed_event_seen=True`; `_forward_stream` polls it and aborts
+  via `_emit_upstream_error_abort(reason="upstream_sse_malformed")`.
+- **`_pending_raw_sse` unbounded** — no size cap meant 250 MB upstream
+  / 720 MB peak under unterminated stream. New
+  `_MAX_PENDING_RAW_SSE_BYTES = 4 MiB` cap; exceeded triggers
+  `upstream_sse_unterminated` abort with audit row.
+- **SSE depth-recursion bypass** — `_collect_inspectable_strings` cap
+  at depth 6 silently returned `[]` for content at depth 7+. Cap raised
+  to `_MAX_JSON_DEPTH` (64); overflow returns `_DepthSentinelList`
+  sentinel; `_flush_event` detects and aborts via
+  `upstream_delta_too_deep` reason token.
+
+#### Server admission
+- **Invalid UTF-8 body → 500-no-audit** — non-UTF-8 bodies (gzip-encoded,
+  latin-1, any high-bit byte) raised `UnicodeDecodeError` past the
+  JSON-decode `except` tuple, surfacing as bare 500 with no audit row,
+  no `correlation_id`, no signet shape. `_admit` now catches
+  `UnicodeDecodeError`+`LookupError`; routes through
+  `_record_preflight_refusal` with `_refusal_kind="invalid_encoding"`.
+
+#### Pipeline checks
+- **`/v1/completions` + `/v1/embeddings` unscanned** —
+  `PromptInjectionCheck._extract_text` read only `body["messages"]`.
+  Two of three gated endpoints had zero prompt-injection defense;
+  embeddings are a common indirect-injection vector via RAG.
+  `_extract_text` now also walks `body["prompt"]` (string or list),
+  `body["input"]` (string or list), plus `tools[*].function.{name,
+  description, parameters}`, `tool_choice` (string or object),
+  `messages[*].{name, tool_calls[*].function.arguments}`,
+  `response_format.json_schema.schema`, `metadata` (recursive walk).
+- **Override-rule `\b` boundary bypass** — leading `\b` on
+  `ignore_previous` / `disregard` / `forget_prompt` / `jailbreak_keyword`
+  / `developer_mode` / `no_restrictions` let an attacker glue a single
+  letter onto the verb (`Pleaseignore previous instructions`,
+  `xyzzyjailbreak`). LLM tokenizers split the glued prefix back into
+  `[X, ignore]` so the model still saw the verb. Leading `\b` dropped;
+  trailing `\b` retained so `igniter` still doesn't match `ignore`.
+- **BFS deadline fail-open** — when the 2-second wall-clock deadline
+  burned under attacker padding (20-80 KB high-entropy noise prepended
+  to a depth-14 b64 cascade), the silent-allow path let depth-N
+  attacks through. Now configurable `on_decode_budget_exceeded:
+  Literal["block","escalate","audit_warn"]` defaults to `"block"`.
+  `_refusal_kind="decode_budget_exceeded"` audit row records the
+  deadline burn.
+
+### Fixed (HIGH)
+
+#### Streaming
+- **Tool-call args + reasoning + audio transcript + refusal +
+  logprobs tokens uninspected** — `_extract_sse_content` read only
+  `delta.content`. Now harvests `delta.tool_calls[*].function.{name,
+  arguments, description}`, `delta.refusal`, `delta.reasoning`,
+  `delta.reasoning_content`, `delta.audio.transcript`. Default-deny
+  via `_collect_inspectable_strings` recursive walk over all string
+  values; structural-key skip list (`_SSE_DELTA_STRUCTURAL_KEYS`)
+  scoped to TOP-LEVEL `delta` only; nested keys always inspected.
+- **`choices[i]` sibling fields uninspected** — `_flush_event` walked
+  only `choices[i].delta`. `choices[i].text` (`/v1/completions`
+  legacy), `choices[i].message.content` (buffered-as-SSE),
+  `choices[i].logprobs.content[].token` all bypassed inspection. New
+  `_SSE_CHOICE_STRUCTURAL_KEYS` (`{finish_reason, index, object}`)
+  with choice-level structural validation; recursive walk on remaining
+  fields.
+- **Event-level fields uninspected** — `id`, `system_fingerprint`,
+  `model`, `error.message`, `usage.*` skipped inspection. New
+  `_SSE_EVENT_STRUCTURAL_KEYS` with `_validate_event_top_level_
+  structural_field` checking enum values for `object`.
+- **Realtime WS used wrong structural skip set** —
+  `_collect_inspectable_strings(event, _top_level=True)` activated
+  the DELTA-level skip on an EVENT-level dict, so `event.type` /
+  `event.id` / `event.stop` / `event.tool_call_id` /
+  `event.function_call_id` / `event.object` smuggled markers through.
+  Now passes `_event_top_level=True`; mirrors the HTTP path's
+  structural pre-abort loop.
+- **Realtime walker mishandled `_DepthSentinelList`** — treated as
+  regular empty list. Deep-nested (>64) events yielded zero sibling
+  strings. Now refuses the frame with sanitized refusal frame and
+  `pipeline.realtime` audit row.
+
+#### Audit chain
+- **`AuditEntry.from_dict` lacked type validation** — `hmac` /
+  `prev_hmac` tampered to non-string (null, true, 42) crashed
+  `ChainVerifier.verify()` with raw `TypeError`. Now tightened: `hmac`
+  / `prev_hmac` must be `str`, `ts_ns` must be `int` in `[0, 10**19]`;
+  bad types route through `MalformedAuditEntry` and
+  `BreakKind.MALFORMED_LINE`.
+- **`_read_archive` except clause too narrow** — caught only
+  `JSONDecodeError`; `KeyError`/`TypeError`/`ValueError` from
+  `AuditEntry.from_dict` crashed verify. Widened to all four;
+  `verify_with_archives` outer except matches.
+- **Compaction marker MAC signature** — `is_compaction_marker` was a
+  pure shape check; any caller writing an entry with
+  `check_name="_compaction"` permanently blocked compactions
+  (persistent DoS). Now `is_compaction_marker(entry, *, keyring=)`
+  verifies an HMAC-SHA256 MAC over the marker's identifying fields
+  with the active key, domain-separated by
+  `b"signet-compaction-marker-v1\x00"`. `_has_marker_shape(entry)`
+  is the unsigned shape check used for verifier dispatch and
+  compactor A2 DoS guard; `is_compaction_marker` adds the MAC for
+  trust decisions. Split closes both the fail-open on key revocation
+  and the user-controllable DoS surface.
+- **Marker-aware tail read** — `_read_prev_hmac` / `_read_tail_hmac`
+  return `last.prev_hmac` (the bridge value the marker commits to
+  under its own signed HMAC) when the tail is a compaction marker.
+  Works regardless of `cache_prev` state, survives process restart,
+  closes the post-full-sweep LINK_MISMATCH across `cache_prev=False`
+  multi-process backends.
+
+#### Pipeline checks (encoding arms race)
+- **Bounded-depth iterative BFS replaces single-pass decoder.**
+  `_extract_decoded` BFS with `_MAX_DECODE_DEPTH = 16`, `_PER_DEPTH_
+  BUDGET = 16 KiB`, total budget 256 KiB, cycle detection via
+  `seen: set[bytes]`. Every decoded blob re-fed into
+  `_decode_one_pass`. Per-depth budget allocation prevents tier-0/1
+  noise overlays from starving deeper layers; tier-2 cipher overlays
+  drop when their slot is exhausted.
+- **Per-depth budget exhaustion bypass** (R11/R13) — original FIFO
+  budget let depth-0 overlay products saturate the global cap before
+  depth-1 attack candidates surfaced. Per-depth slots + smallest-first
+  prioritization within each depth.
+- **18 encoding channels** — base64 (padded/unpadded/MIME-with-
+  newlines), base32 (upper/lower/base32hex), base36, base58, base62,
+  base85, ASCII85, hex (with separators, `0x` prefix, xxd-style), URL
+  percent-encoding, HTML entities (decimal+hex), Unicode `\uXXXX` +
+  ES6 `\u{...}` + `\x{...}`, ROT13, Caesar-N (1-25 excluding 13),
+  Atbash, reverse-string, punycode (`OverflowError`/`LookupError`/
+  `UnicodeError`-safe + printable-ratio gate), quoted-printable,
+  gzip+hex / zlib+base64 (bomb-safe via `_safe_gzip_decompress` /
+  `_safe_zlib_decompress` with 64 KiB input + 1 MiB output caps),
+  UUencode, decimal-codepoint chr() runs.
+- **Confusables map expanded** to ~80 entries across Cyrillic, Greek
+  (uppercase + lowercase), Armenian, Coptic, IPA, Tamil, Kannada,
+  Malayalam, Devanagari, NKO digit-zero, Roman-numeral, small-cap
+  blocks. Covers i/n/u/t/c/o/r/a/d/e/g/l/k/m/p/v/s.
+- **`scope_drift` output marker scan NFKC + zero-width strip** —
+  fullwidth `ＳＥＣＲＥＴ//ＮＯＦＯＲＮ`, ZWSP-interleaved
+  `S​E​C​R​E​T//NOFORN`, circled-letter `ⓢⓔⓒⓡⓔⓣ//ⓝⓞⓕⓞⓡⓝ` all now
+  block under UNCLASS request.
+- **Markdown emphasis + backslash split** —
+  `i*g*n*o*r*e previous` and `i\g\n\o\r\e previous` now block via
+  `_strip_markdown_split` parallel scan.
+- **`pipeline.post_complete` catches `BaseException`** with
+  `asyncio.CancelledError` re-raise. SystemExit/KeyboardInterrupt
+  from RECORD plugins no longer kills the batch; CancelledError
+  propagates so graceful shutdown works.
+
+#### Server
+- **Non-dict upstream JSON crashes** — top-level array/scalar/null,
+  or `{"choices": "string"}`, or `{"choices": [1,2,3]}` raised
+  `AttributeError` past the outer `except`. Now defensively coerced;
+  non-dict / non-list `choices` / non-dict `choices[0]` route through
+  `_record_upstream_failure` with
+  `refusal_kind="upstream_protocol_violation"`.
+- **3xx upstream redirects → bypass** — sync + streaming both
+  forwarded 3xx verbatim to client. Now: audit row + signet-shaped
+  502 with `upstream_redirected` reason, no raw body / Location URL
+  in response.
+- **413 oversize body → no audit row** — direct return without
+  `_record_preflight_refusal`. Now routes through helper with
+  `_refusal_kind="body_too_large"`; `correlation_id` + attribution
+  headers.
+- **Forwarded-header CRLF/non-ASCII injection** — Authorization /
+  OpenAI-Beta / OpenAI-Organization values were forwarded without
+  validation; `\r\n` / `\0` / 0x80-0xFF bytes triggered 502
+  misattribution at httpx. New `_header_value_is_safe` ASCII-strict
+  validator; 400 at admit with
+  `_refusal_kind="header_invalid_charset"`.
+- **`pipeline.post_complete` in `_forward_unary` unwrapped** —
+  a crashing RECORD plugin returned 502 after upstream 200. Now
+  wrapped (matches streaming twin); outer fallback hides exception
+  classname under strict mode, always emits `correlation_id` +
+  `X-Signet-Upstream`.
+- **All preflight 4xx responses unified shape** — single
+  `_preflight_response()` wrapper + `_upstream_attribution_headers`.
+  Every refusal carries `correlation_id`, `X-Signet-Upstream`,
+  signet-shaped JSON with stable snake_case `error` tokens:
+  `{empty_body, json_decode_error, invalid_encoding, non_object_body,
+  non_finite_float, session_id_too_long, session_id_invalid_charset,
+  body_too_large, json_too_deeply_nested, header_invalid_charset}`.
+- **Method-not-allowed routing asymmetry** — `GET /v1/<unknown>`
+  returned 405 advertising POST; `POST /v1/<unknown>` returned 404
+  catch-all. `_method_not_allowed` now swaps to the catch-all body
+  via `_REGISTERED_V1_PATHS`.
+- **Session-ID length + charset caps** — `_MAX_SESSION_ID_BYTES = 256`
+  + `_SESSION_ID_RE = ^[A-Za-z0-9_.:\-]+$`. Realtime WS admission
+  parity (was previously HTTP-only).
+- **`ServerConfig` immutability + validate-first `__setattr__`** —
+  `_VALIDATED_FIELDS` covers `upstream_url`, `port`,
+  `request_timeout_s`, `max_request_body_bytes`, `audit_log_path`,
+  `hmac_secret`, `shutdown_grace_seconds`, `extra_forward_headers`,
+  pool fields. Scheme validator rejects non-http/https. NaN/Inf
+  rejected on floats. HMAC secret 32-byte floor (NIST SP 800-107).
+  Header-name token-charset enforced. Pool keepalive ≤ max
+  cross-field check. Re-validation runs BEFORE `super().__setattr__`
+  so rejected values don't persist.
+
+#### CLI
+- **Audit-log path symlink refusal** — new `AuditLogSymlinkError` +
+  `_assert_not_symlink` + `_open_audit_log_append` (POSIX
+  `O_NOFOLLOW` + Windows `os.path.islink` pre-check). Centralized
+  `_open_jsonl_backend` helper across every chain-walking CLI
+  command.
+- **Windows reserved device names rejected at parse time** —
+  `_reject_windows_reserved_device_name` covers
+  `{CON, NUL, PRN, AUX, COM1-9, LPT1-9}`, case-insensitive, including
+  trailing-space and trailing-dot variants (`CON `, `CON.`,
+  `CON .txt`). Applied to `--audit-log`, `--out`, `--public-out`,
+  `--output`, `signet init <target>`.
+- **`_sanitize_for_terminal` covers Unicode bidi / C1 / BOM /
+  LSEP/PSEP** — was ASCII-only; now strips bidi overrides
+  (U+202A-202E, U+2066-2069), C1 controls (U+0080-009F), BOM
+  (U+FEFF), line/paragraph separators (U+2028-2029) in addition to
+  ASCII <0x20 and 0x7F.
+- **20+ sanitization sites swept** — `audit verify` pretty mode
+  (entry_id, detail, last_known_good_hmac), `audit tail`/`count`/
+  `report` (markdown + JSON), `replay`, `plugins list`/`doctor`,
+  `doctor --self`/`--probe-injection`, serve banner, bench markdown/
+  CSV, `keys generate-ed25519` key-id (parse-time strict charset),
+  pipeline-loader exceptions, malformed-audit-line echo. AST sweep
+  test enforces the discipline.
+
+#### Plugin discovery hardening
+- **Hostile `__repr__` / `__str__` / `__name__` defended** — new
+  `_safe_repr`, `_safe_str`, `_safe_name` helpers catch
+  `BaseException` from plugin-controlled accessors. Helper fallback
+  strings themselves use `_safe_name(exc)` so a hostile metaclass
+  `__getattribute__` raising on `__name__` doesn't defeat the
+  fallback. `_truncate_for_log(max_chars=1024)` bounds 10 MB
+  `__repr__` DoS.
+- **`(KeyboardInterrupt, SystemExit)` re-raise before
+  `BaseException`** — plugin import raising operator-intent signals
+  propagates; `GeneratorExit` / `MemoryError` / etc. caught and
+  recorded as load failure, later plugins still loaded.
+- **AST sweep test** — `tests/unit/test_round19_cli_hunt.py`
+  programmatically walks `discovery.py`; any future bare `repr(obj)` /
+  `str(exc)` / `obj.__name__` / `type(obj).__name__` /
+  `obj.__class__.__name__` on plugin-controlled locals trips the
+  test.
+
+### Fixed (MED / LOW)
+
+- **HTTP client `trust_env=False`** — httpx default `trust_env=True`
+  let process-env `HTTPS_PROXY` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE`
+  silently MITM upstream. Now explicitly `trust_env=False, verify=True`
+  with configurable pool limits.
+- **`from_env` Unicode whitespace + bidi rejected** —
+  `SIGNET_UPSTREAM_URL` env value strip rejects C1 controls, Cf/Zl/Zp
+  Unicode categories, NBSP, bidi marks/overrides, BOM.
+- **`anchor.py` `AnchorProtocolError`** — defensive extraction with
+  named exception type instead of raw `AttributeError`/`TypeError`.
+- **`signet doctor --self` corpus drift WARN line** — stale install
+  detection (compares against `_CANONICAL_PROBE_IDS`); WARN, not
+  FAIL.
+- **`signet bench --gate p100=`/`p0=` rejected** — gate parser
+  enforces `0 < pct < 100`.
+- **`signet bench --requests` capped at 1_000_000** — memory bound
+  on the task-allocation up-front.
+- **`pipeline.record.error` synthetic audit row** — RECORD-stage
+  check that raises now appends a structured `pipeline.record.error`
+  row with the failing check name + exception type; sibling RECORD
+  checks still run.
+
+### Added — corpus expansion
+
+- **Probe corpus 11 → 60 positive entries.** New entries cover every
+  R7-R18 hunt finding: nested b64 depths 2/3/4/7/12, polyglot
+  compositions (b64+rot13, b85+b64+rot13, rot13+b85+b64),
+  base32hex / base36 / base58 / base62 / base85 / ASCII85,
+  MIME-base64 with newlines, hex-with-separators, hex-`0x`-comma,
+  URL-percent, HTML decimal + hex entities, Unicode escape, ES6
+  `\u{}` + `\x{}` curly braces, gzip+hex / zlib+b64,
+  gzip+url-percent, Greek-cluster + non-Latin homoglyph variants,
+  reverse-string, atbash, Caesar-5, markdown-emphasis,
+  backslash-split, punycode, quoted-printable, UUencode,
+  decimal-codepoint, byte-budget-exhaustion (60 KB pad),
+  boundary-bypass for each override rule, jailbreak space-split,
+  jailbreak standalone, devanagari-zero, greek-lambda,
+  non-latin-homoglyph.
+- **`PROMPT_INJECTION_BENIGN_CORPUS` (11 entries)** — must-ALLOW
+  regression suite for production-shape inputs the R14 inflating-chain
+  alarm false-positived: JWT tokens, npm `sha512-...` hashes, SHA-512
+  SRI, git commit messages, CSP `sha256-...` headers, RFC 2047 MIME
+  encoded-word subjects, nested b64 of English. Pairs with the
+  positive corpus to lock the FP rate at zero.
+
+### Changed
+
+- `PromptInjectionCheck._MAX_DECODE_DEPTH` raised from 8 to 16 (R14
+  introduced 8; R18 raises to 16 with `_PER_DEPTH_BUDGET = 16 KiB`
+  keeping total at 256 KiB).
+- `PromptInjectionCheck.base64_min_length` from 24 to 4 (short
+  attacks like `DAN`, `god mode on`, `disregard above` were escaping
+  encoded channels).
+- `ServerConfig.inspect_all_sse_lines` default `False → True`
+  (`retry:`, `event:`, `id:` SSE field values now inspected by
+  default).
+- `httpx.AsyncClient` constructed with explicit `trust_env=False,
+  verify=True, limits=...` (was: defaults).
+- `ServerConfig` is now effectively frozen post-`__post_init__`:
+  `__setattr__` re-runs validation; rejected values don't persist.
+- Override-rule regex family in `prompt_injection.py` no longer
+  anchors with leading `\b` (closes glued-prefix bypass; trailing
+  `\b` retained so `igniter` doesn't match `ignore`).
+- `pipeline.post_complete` now catches `BaseException` with explicit
+  `asyncio.CancelledError: raise` to preserve cooperative
+  cancellation while protecting against hostile RECORD plugins.
+
+### Documented out-of-scope
+
+The following encoding channels are knowingly NOT covered by the
+default `PromptInjectionCheck` and live in LLM-judge-plugin
+territory:
+
+- Morse code, NATO phonetic alphabet, Pig Latin
+- Brainfuck source
+- Whitespace cipher (Tab/Space/Newline encoding bits)
+- Vigenère / other key-required ciphers
+
+The check is defense-in-depth, not a hard boundary. The corpus
+documents what we catch; the absence list documents what we don't.
+Operators wanting these covered should add a COMMITMENT-stage
+LLM-judge check.
+
+### Tests
+
+- 763 → 1738 total tests (+975 across cycle 7): the largest test
+  expansion in the project's history. Every closure has a regression
+  test; `tests/unit/test_round{4,7,9,11,13,14,15,16,17,18,19,21}_
+  hunt.py` files document each cycle's findings.
+- Probe corpus: 60/60 positive blocked, 11/11 benign allowed.
+- `ruff check src tests`: clean.
+
+### Acknowledgments
+
+The 11-round hunt-fix discipline was made possible by Claude Code's
+parallel subagent dispatch — five domain-isolated hunters per cycle
+attacking the local tree, findings rolled up, fixes dispatched as
+narrow-scope agents, integrated suite verified between cycles. The
+public bug-hunt log (`docs/bug-hunt-log.md` cycle 7) is the
+chronological record. Several R14-era fixes introduced their own
+regressions (the inflating-chain FP rate disaster being the most
+visible); R16-R18 reverted and rebuilt with negative-corpus
+regression tests so the FP class can't return silently.
+
 ## [0.1.8] -- 2026-05-10
 
 ### The version that actually delivers on the project's promises

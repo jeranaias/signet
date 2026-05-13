@@ -122,6 +122,139 @@ def exclusive_log_lock(path: Path) -> Iterator[None]:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
+# Round 9 LOW: ``--audit-log`` opens previously used ``Path.open("a", ...)``
+# unconditionally, which follows symlinks. A local attacker (or a hostile
+# CI runner co-tenant) who plants a symlink at the operator's audit-log
+# path can redirect every append to a system file. The threat model
+# matches the ``signet init`` symlink gap Round 8 closed: loud
+# corruption (operator surely notices) but still a foothold worth
+# refusing at the file-open boundary.
+#
+# Defense strategy:
+# * On POSIX: prefer ``os.open`` with ``O_NOFOLLOW`` so the kernel
+#   refuses the open atomically. The pre-check below also gives the
+#   operator a clearer ``ClickException`` message than a bare
+#   ``ELOOP`` ``OSError``.
+# * On Windows: ``O_NOFOLLOW`` does not exist, so ``Path.is_symlink``
+#   (which uses ``GetFileAttributesW`` under the hood and detects
+#   reparse points) is the pragmatic guard. There's a narrow TOCTOU
+#   window between the check and the open, but the realistic local-
+#   tenancy threat (a pre-planted symlink) is closed.
+class AuditLogSymlinkError(Exception):
+    """Raised when an audit-log path is a symlink.
+
+    Surfaced to the CLI via :func:`_open_audit_log_append` so the
+    operator gets a clear "refusing to follow symlink" error instead of
+    the audit chain silently re-routing through a planted link.
+    """
+
+
+def _assert_not_symlink(path: Path) -> None:
+    """Refuse to operate on an audit-log path that is a symlink.
+
+    ``os.path.islink`` returns True for both reparse points (Windows)
+    and POSIX symlinks, AND for dangling symlinks (where
+    ``Path.exists`` returns False), so it's the right primitive for
+    the pre-check. The atomic ``O_NOFOLLOW`` guard inside
+    :func:`_open_audit_log_append` closes the TOCTOU race on POSIX.
+
+    Scope (Round 11 INFO): both ``os.path.islink`` here and POSIX
+    ``O_NOFOLLOW`` in :func:`_open_audit_log_append` check the
+    **final component** of ``path`` only. Intermediate directory
+    components are resolved through symlinks as usual. The defense's
+    threat model is "attacker plants a symlink AT the operator's
+    audit-log path" (a co-tenant with write access to the leaf), which
+    a final-component check fully addresses. A parent-directory
+    symlink bypass requires write access to a parent directory, which
+    is a strictly higher capability and a different threat -- in that
+    case the attacker can simply redirect the audit log by writing the
+    parent directory directly, so guarding against parent symlinks
+    here would not meaningfully raise the bar. Operators with
+    legitimate use cases for symlinked parent directories (containers,
+    chroots, build sandboxes) are also unaffected.
+
+    Hardlinks (Round 14 INFO): hardlinks are intentionally NOT
+    detected. A hardlink is a legitimate alternate name for the same
+    inode -- the file IS what it appears to be, and ``os.stat`` cannot
+    distinguish the "primary" name from any other reference. An
+    attacker with parent-directory write access can create hardlinks
+    to the audit log, but the same parent-directory-write capability
+    already allows replacing the audit log entirely, so detecting
+    hardlinks here would not raise the attacker's bar. ``st_nlink > 1``
+    is also race-prone (a link can be created between check and open)
+    and operationally noisy (legitimate snapshot / backup tooling
+    relies on hardlinks). This is the same out-of-scope rationale the
+    parent-symlink case uses.
+    """
+    if os.path.islink(path):
+        raise AuditLogSymlinkError(f"refusing to follow symlink at audit log path: {path}")
+
+
+def _open_audit_log_append(path: Path, encoding: str = "utf-8") -> Any:
+    """Open ``path`` for appending, refusing to follow symlinks.
+
+    Returns a text-mode file object with the same semantics as
+    ``path.open("a", encoding=encoding)``. Raises
+    :class:`AuditLogSymlinkError` when ``path`` is a symlink.
+
+    On POSIX this uses ``os.open`` with ``O_NOFOLLOW`` so the kernel
+    refuses to follow a final-component symlink atomically (closing
+    the TOCTOU race between the pre-check and the open). On Windows
+    we rely on the pre-check alone -- ``O_NOFOLLOW`` is not available.
+
+    Scope (Round 11 INFO): the ``O_NOFOLLOW`` flag and the
+    :func:`_assert_not_symlink` pre-check both apply to the **final
+    path component only**. Per the Linux ``open(2)`` man page,
+    ``O_NOFOLLOW`` fails with ``ELOOP`` "if the trailing component
+    (i.e., basename) of pathname is a symbolic link"; intermediate
+    components are resolved through symlinks normally. See
+    :func:`_assert_not_symlink` for the rationale on why this scope
+    matches the threat model.
+    """
+    _assert_not_symlink(path)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+    try:
+        fd = os.open(path, flags, 0o644)
+    except OSError as exc:
+        # ``O_NOFOLLOW`` triggers ELOOP on POSIX when a final-component
+        # symlink was planted between the pre-check and ``os.open``.
+        # Surface that as the same clear "refusing to follow symlink"
+        # error the pre-check produces.
+        if nofollow and getattr(exc, "errno", None) == 40:  # ELOOP
+            raise AuditLogSymlinkError(
+                f"refusing to follow symlink at audit log path: {path}"
+            ) from exc
+        raise
+    return os.fdopen(fd, "a", encoding=encoding)
+
+
+def _reject_non_finite_json_constants(value: str) -> float:
+    """parse_constant callback that rejects ``NaN`` / ``Infinity`` / ``-Infinity``.
+
+    Python's ``json.loads`` accepts these three non-standard JSON
+    constants by default and yields Python floats (``float("nan")``,
+    ``float("inf")``, ``float("-inf")``). The writer side
+    (:meth:`JsonlBackend.append` and friends) uses ``allow_nan=False``
+    so signet never *emits* them, but a tampered or malformed audit
+    line could carry one and silently slip past the schema validator.
+
+    Downstream consumers convert ``ts_ns`` via
+    ``datetime.fromtimestamp(ts_ns / 1e9, ...)`` which raises
+    ``OverflowError`` / ``ValueError`` on ``inf`` -- a raw Python
+    traceback escaping ``audit verify`` / ``audit tail`` instead of the
+    structured ``MalformedAuditEntry`` channel the rest of the
+    iter_entries pipeline guarantees.
+
+    Fail-closed at the JSON boundary: any non-finite constant raises
+    ``ValueError`` here, which ``iter_entries`` already catches and
+    converts to a :class:`MalformedAuditEntry`. F-R4-1 (v0.1.8.2).
+    """
+    raise ValueError(f"non-finite JSON constant in audit log: {value!r}")
+
+
 class MalformedAuditEntry(Exception):
     """Raised when a JSONL audit line cannot be parsed.
 
@@ -204,6 +337,12 @@ class JsonlBackend:
                 ephemeral use; production must keep fsync on.
         """
         self._path = Path(path)
+        # Round 9 LOW: refuse to operate on a symlinked audit-log path.
+        # ``Path.touch`` would otherwise follow a pre-planted symlink at
+        # construction. Mirrors the ``signet init`` symlink guard from
+        # Round 8 -- same threat model (local attacker plants a symlink
+        # to redirect the audit chain into a system file).
+        _assert_not_symlink(self._path)
         self._path.touch(exist_ok=True)
         self._fsync = fsync_after_append
 
@@ -220,7 +359,10 @@ class JsonlBackend:
             allow_nan=False,
             ensure_ascii=False,
         )
-        with self._path.open("a", encoding="utf-8") as f:
+        # Round 9 LOW: open with ``O_NOFOLLOW`` (POSIX) or pre-checked
+        # ``is_symlink`` (Windows) so a symlink planted after the
+        # backend was constructed still refuses to follow.
+        with _open_audit_log_append(self._path) as f:
             f.write(line + "\n")
             if self._fsync:
                 f.flush()
@@ -229,26 +371,76 @@ class JsonlBackend:
     def iter_entries(self) -> Iterator[AuditEntry]:
         if not self._path.exists():
             return
-        # ``utf-8-sig`` strips a single optional BOM at the start of the
-        # file. Editors that helpfully prepend a BOM on save would
-        # otherwise wedge the verifier on the first line.
-        with self._path.open("r", encoding="utf-8-sig") as f:
-            for line_number, raw in enumerate(f, start=1):
-                stripped = raw.strip()
+        # Read in binary mode so a single bad UTF-8 byte inside ONE
+        # line doesn't poison the whole iterator with an unrecoverable
+        # ``UnicodeDecodeError`` raised mid-read by the text wrapper.
+        # We strip an optional leading BOM (the same single byte
+        # sequence ``utf-8-sig`` would have removed) and then decode
+        # each line independently so the bad line surfaces as a
+        # ``MalformedAuditEntry`` with a line number, not a traceback.
+        # NF-R2-1 (v0.1.8): every parse-failure mode -- invalid UTF-8,
+        # JSON syntax, missing schema field, bad enum value, wrong
+        # type -- becomes a structured ``MalformedAuditEntry`` so the
+        # verifier and CLI surfaces can turn it into a
+        # ``BreakKind.MALFORMED_LINE`` / ``ClickException`` instead of
+        # leaking a Python traceback.
+        with self._path.open("rb") as f:
+            first = f.read(3)
+            if first != b"\xef\xbb\xbf":
+                f.seek(0)
+            for line_number, raw_bytes in enumerate(f, start=1):
+                try:
+                    stripped = raw_bytes.decode("utf-8").strip()
+                except UnicodeDecodeError as exc:
+                    raise MalformedAuditEntry(
+                        line_number=line_number,
+                        raw_line=repr(raw_bytes[:200]),
+                        parse_error=f"line is not valid UTF-8: {exc}",
+                    ) from exc
                 if not stripped:
                     # Blank lines (including a trailing newline) are
                     # tolerated; they're a common artifact of editors
                     # and don't carry an entry.
                     continue
                 try:
-                    data = json.loads(stripped)
+                    data = json.loads(
+                        stripped,
+                        parse_constant=_reject_non_finite_json_constants,
+                    )
                 except json.JSONDecodeError as exc:
                     raise MalformedAuditEntry(
                         line_number=line_number,
                         raw_line=stripped,
                         parse_error=str(exc),
                     ) from exc
-                yield AuditEntry.from_dict(data)
+                except ValueError as exc:
+                    # F-R4-1 (v0.1.8.2): ``parse_constant`` raised on a
+                    # ``NaN`` / ``Infinity`` / ``-Infinity`` token. Same
+                    # operational meaning as malformed JSON -- the line
+                    # cannot be safely consumed -- so route it through
+                    # the same structured channel.
+                    raise MalformedAuditEntry(
+                        line_number=line_number,
+                        raw_line=stripped,
+                        parse_error=str(exc),
+                    ) from exc
+                try:
+                    yield AuditEntry.from_dict(data)
+                except (KeyError, ValueError, TypeError) as exc:
+                    # KeyError: required schema field missing
+                    # (e.g. ``owner_type``, ``decision``, ``entry_id``).
+                    # ValueError: enum coercion failed on a mutated
+                    # value (e.g. ``Decision("alloS")``,
+                    # ``OwnerType("policn")``).
+                    # TypeError: a JSON-typed value (e.g. ``null``)
+                    # reached a slot that demands a string. All three
+                    # are operationally equivalent to a malformed
+                    # line; route them through the same channel.
+                    raise MalformedAuditEntry(
+                        line_number=line_number,
+                        raw_line=stripped,
+                        parse_error=(f"schema validation failed: {type(exc).__name__}: {exc}"),
+                    ) from exc
 
     def last_entry(self) -> AuditEntry | None:
         # JSONL doesn't support efficient seek-to-last without indexing.
@@ -309,9 +501,11 @@ class FileLockingJsonlBackend(JsonlBackend):
         to keep multi-process appenders serialized between
         themselves.
         """
+        # Round 9 LOW: O_NOFOLLOW / is_symlink guard around the append-mode
+        # open, same as :meth:`JsonlBackend.append`.
         with (
             exclusive_log_lock(self._path),
-            self._path.open("a", encoding="utf-8") as f,
+            _open_audit_log_append(self._path) as f,
         ):
             _LOCK_IMPL.acquire(f.fileno())
             try:
@@ -375,7 +569,8 @@ class FileLockingJsonlBackend(JsonlBackend):
         with exclusive_log_lock(self._path):
             prev_hmac = self._read_tail_hmac()
             linked = link_fn(prev_hmac)
-            with self._path.open("a", encoding="utf-8") as f:
+            # Round 9 LOW: O_NOFOLLOW / is_symlink guard.
+            with _open_audit_log_append(self._path) as f:
                 _LOCK_IMPL.acquire(f.fileno())
                 try:
                     line = json.dumps(
@@ -394,7 +589,7 @@ class FileLockingJsonlBackend(JsonlBackend):
                     _LOCK_IMPL.release(f.fileno())
 
     def _read_tail_hmac(self) -> str:
-        """Return the HMAC of the last entry in the log, or ``""`` if empty.
+        """Return the HMAC the next append must link to, or ``""`` if empty.
 
         Intended for use only inside the cross-process lock of
         :meth:`append_locked_with_link`. Performs a linear scan via
@@ -402,11 +597,30 @@ class FileLockingJsonlBackend(JsonlBackend):
         (single-host, low-to-medium throughput) the cost is acceptable.
         High-throughput multi-writer deployments should plug in a
         database-backed backend with O(1) tail access.
+
+        Round 11 HIGH-1: marker-aware tail read. When the on-disk tail
+        is a compaction marker (full-sweep result: the live log contains
+        only the marker), the next live append must link to the LAST
+        ARCHIVED entry's hmac -- the bridge value -- not to the marker's
+        hmac. That bridge value is exactly ``last.prev_hmac`` because
+        the compactor set ``marker.prev_hmac = eligible[-1].hmac`` and
+        signed it into the marker's chain HMAC. The marker payload is
+        on-disk, so this works for the multi-process / ``cache_prev=False``
+        path that bypasses the in-memory cache-seed in
+        :func:`compact_audit_log`.
         """
         last: AuditEntry | None = None
         for entry in self.iter_entries():
             last = entry
-        return last.hmac if last is not None else ""
+        if last is None:
+            return ""
+        # Lazy import: backend → compactor would otherwise cycle through
+        # ``compactor`` importing ``JsonlBackend`` at module load.
+        from signet.audit.compactor import _has_marker_shape
+
+        if _has_marker_shape(last):
+            return last.prev_hmac
+        return last.hmac
 
     def append(self, entry: AuditEntry) -> None:
         """Single-writer append under cross-process lock.

@@ -74,6 +74,8 @@ end-to-end::
 
 from __future__ import annotations
 
+import unicodedata
+
 from signet.core.check import Check, CheckResult
 from signet.core.context import RequestContext, get_header_ci
 from signet.core.owner import Owner
@@ -107,12 +109,37 @@ def _sanitize_principal(value: str) -> str | None:
       (regular ASCII space is preserved only in the interior of the
       principal -- leading / trailing whitespace is stripped first)
     * exceeds :data:`_MAX_PRINCIPAL_LEN` characters
+
+    R7 LOW (owner-principal-not-nfkc): the surviving principal is
+    NFKC-normalized so visual-twin variants of the same identifier
+    (Cyrillic U+0430 in ``alice`` vs. Latin U+0061 in ``alice``) do
+    NOT silently produce different owner IDs at the audit layer.
+    Owner attribution is caller-asserted (SECURITY.md trust model)
+    but downstream dashboards that group by ``owner_id`` should not
+    double-count or be vulnerable to homoglyph audit-row spoofing.
+    NFKC alone won't fold Cyrillic U+0430 to Latin U+0061 (NFKC keeps
+    script identity), so we ALSO run the principal through the
+    prompt-injection confusables fold so the load-bearing
+    "indistinguishable in a dashboard" case collapses to the canonical
+    Latin form. We import the table lazily to avoid a circular
+    dependency at module-load time.
     """
     if not value:
         return None
     stripped = value.strip()
     if not stripped:
         return None
+    # NFKC first: collapses fullwidth / compatibility variants before
+    # the length / character-class checks so a fullwidth identifier
+    # doesn't sneak past via decomposed-form gymnastics.
+    stripped = unicodedata.normalize("NFKC", stripped)
+    # Confusables fold so Cyrillic-vs-Latin homoglyph pairs collapse
+    # to one canonical identifier. Imported lazily because
+    # ``signet.checks.prompt_injection`` imports from ``signet.core``,
+    # which imports from us via the ADMISSION pipeline.
+    from signet.checks.prompt_injection import _CONFUSABLES
+
+    stripped = "".join(_CONFUSABLES.get(ch, ch) for ch in stripped)
     if len(stripped) > _MAX_PRINCIPAL_LEN:
         return None
     if any(c in _FORBIDDEN_OWNER_CHARS for c in stripped):

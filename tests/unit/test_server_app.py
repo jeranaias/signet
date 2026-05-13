@@ -300,7 +300,11 @@ class TestErrorPaths:
             headers={"Content-Type": "application/json"},
         )
         assert r.status_code == 400
-        assert "invalid JSON" in r.json()["error"]
+        # Round 9 ``preflight-error-label-inconsistency``: ``error``
+        # is the stable token; ``description`` carries the human text.
+        body = r.json()
+        assert body["error"] == "json_decode_error"
+        assert "invalid JSON" in body["description"]
 
 
 class TestRegexOutputBlocksRequest:
@@ -395,6 +399,10 @@ class TestBodySizeLimit:
             upstream_url="http://upstream-mock/v1",
             allow_ephemeral_key=True,
             max_request_body_bytes=1024,
+            # Verbose mode: keeps ``limit_bytes`` in the response body
+            # (Round 9 moved it into ``verbose_extras`` of
+            # ``_preflight_body``).
+            strict_error_redaction=False,
         )
         signet_app = SignetApp(config=config, pipeline=Pipeline(checks=[]))
         client = TestClient(signet_app.app)
@@ -405,7 +413,16 @@ class TestBodySizeLimit:
             headers={"Content-Type": "application/json"},
         )
         assert r.status_code == 413
-        assert r.json()["limit_bytes"] == 1024
+        body = r.json()
+        # Round 9 ``413-oversize-body-skips-audit-and-correlation_id``:
+        # the 413 now routes through ``_preflight_body`` so the body
+        # carries ``error`` token + ``correlation_id`` and the
+        # response includes the ``X-Signet-Upstream`` attribution
+        # header that every other refusal already had.
+        assert body["error"] == "body_too_large"
+        assert "correlation_id" in body
+        assert body["limit_bytes"] == 1024
+        assert "X-Signet-Upstream" in r.headers
 
 
 class TestRedactAndEscalate:
@@ -518,10 +535,20 @@ class TestPipelineCrashAudit:
                 raise RuntimeError("kaboom")
 
         log = tmp_path / "audit.jsonl"
+        # Use verbose mode so the response body surfaces the Python
+        # class name. Round 13 ``admission-pipeline-crash-leaks-classname``
+        # closure made the admission-crash 500 honor
+        # ``strict_error_redaction`` (default True): under strict the
+        # ``exception`` field is omitted to avoid leaking internals; the
+        # ``correlation_id`` field carries the audit-row entry_id
+        # instead so operators can still pivot to the crash row. Verbose
+        # mode keeps the historical class-name shape for SDK ergonomics
+        # -- which is what this test asserts.
         config = ServerConfig(
             upstream_url="http://upstream-mock/v1",
             allow_ephemeral_key=True,
             audit_log_path=log,
+            strict_error_redaction=False,
         )
         signet_app = SignetApp(config=config, pipeline=Pipeline(checks=[_Boom()]))
         client = TestClient(signet_app.app)
@@ -674,7 +701,12 @@ class TestEmptyBody:
             headers={"Content-Type": "application/json"},
         )
         assert r.status_code == 400
-        assert r.json()["error"] == "empty request body"
+        # Round 9 ``preflight-error-label-inconsistency``: ``error``
+        # field is now a stable snake_case token; the human-readable
+        # text moved to ``description`` in verbose mode.
+        body = r.json()
+        assert body["error"] == "empty_body"
+        assert body["description"] == "empty request body"
 
 
 class TestSessionWiring:
@@ -1174,9 +1206,7 @@ class TestShadowMode:
         )
         signet_app = SignetApp(
             config=cfg,
-            pipeline=Pipeline(
-                checks=[OwnerResolutionCheck(require_owner=True), _AlwaysEscalate()]
-            ),
+            pipeline=Pipeline(checks=[OwnerResolutionCheck(require_owner=True), _AlwaysEscalate()]),
         )
         client = TestClient(signet_app.app)
         r = client.post(
@@ -1188,9 +1218,7 @@ class TestShadowMode:
         assert r.status_code == 200
         assert r.headers.get("X-Signet-Shadow-Decision") == "escalate"
 
-    def test_shadow_counter_increments(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path
-    ) -> None:
+    def test_shadow_counter_increments(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
         self._patch_upstream(monkeypatch)
         cfg = ServerConfig(
             upstream_url="http://upstream-mock/v1",
@@ -1219,11 +1247,14 @@ class TestShadowMode:
         # any label ordering deterministically).
         hit = False
         for line in text.splitlines():
-            if line.startswith("signet_shadow_would_have_blocked_total{") and 'decision="block"' in line:
+            if (
+                line.startswith("signet_shadow_would_have_blocked_total{")
+                and 'decision="block"' in line
+            ):
                 value = float(line.rsplit(" ", 1)[-1])
                 assert value >= 1.0
                 hit = True
-        assert hit, "expected a signet_shadow_would_have_blocked_total{decision=\"block\"} sample"
+        assert hit, 'expected a signet_shadow_would_have_blocked_total{decision="block"} sample'
 
     def test_shadow_correlation_id_matches_audit_entry(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path
@@ -1311,7 +1342,10 @@ class TestNonDictBody:
         )
         assert r.status_code == 400
         body = r.json()
-        assert body["error"] == "request body must be a JSON object"
+        # Round 9 ``preflight-error-label-inconsistency``: stable
+        # token; description carries the human text.
+        assert body["error"] == "non_object_body"
+        assert body["description"] == "request body must be a JSON object"
         assert "got_type" in body
         assert "expected" in body
 
@@ -1323,7 +1357,8 @@ class TestNonDictBody:
             headers={"Content-Type": "application/json"},
         )
         assert r.status_code == 400
-        assert r.json()["error"] == "request body must be a JSON object"
+        # Round 9: ``error`` is the stable token, not the prose.
+        assert r.json()["error"] == "non_object_body"
 
     def test_embeddings_non_dict_body_returns_400(self, app_factory) -> None:
         _, client = app_factory(Pipeline(checks=[]))
@@ -1333,7 +1368,7 @@ class TestNonDictBody:
             headers={"Content-Type": "application/json"},
         )
         assert r.status_code == 400
-        assert r.json()["error"] == "request body must be a JSON object"
+        assert r.json()["error"] == "non_object_body"
 
     def test_empty_body_message_is_actionable(self, app_factory) -> None:
         """L4: empty-body 400 carries an ``expected`` hint so callers
@@ -1346,20 +1381,30 @@ class TestNonDictBody:
         )
         assert r.status_code == 400
         body = r.json()
-        assert body["error"] == "empty request body"
+        # Round 9: stable token; the human description moved to a
+        # dedicated ``description`` key.
+        assert body["error"] == "empty_body"
+        assert body["description"] == "empty request body"
         assert "messages" in body["expected"]
 
 
 class TestUpstreamNonJsonAttribution:
-    """v0.1.7 H2: upstream non-JSON returns 502 WITH attribution headers.
+    """v0.1.7 H2 / v0.1.8.1 F1: upstream non-JSON returns 502 WITH
+    attribution headers AND a signet-shaped body.
 
-    Without the headers, callers can't distinguish a 502 the upstream
-    caused (a misconfigured backend, a 302 to an HTML login page, etc.)
-    from a 502 signet itself produced.
+    v0.1.7 H2 added the attribution headers (X-Signet-Upstream /
+    X-Signet-Upstream-Status) so callers could distinguish a 502 the
+    upstream caused from a 502 signet itself produced.
+
+    v0.1.8.1 F1 tightens the body contract: the upstream's raw bytes
+    are NO LONGER passed through (an HTML error page from the upstream
+    could carry inline scripts or sensitive markup). The 502 response
+    is now a signet-shaped JSONResponse with a ``refusal_kind``
+    discriminator and a correlation ID pointing into the audit chain.
     """
 
     def test_502_carries_upstream_attribution_headers(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
     ) -> None:
         async def fake_post(_self, _url, **_kwargs):
             class FakeResp:
@@ -1374,10 +1419,13 @@ class TestUpstreamNonJsonAttribution:
             return FakeResp()
 
         monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+        log = tmp_path / "audit.jsonl"
         config = ServerConfig(
             upstream_url="http://upstream-mock/v1",
             upstream_label="test-upstream",
             allow_ephemeral_key=True,
+            audit_log_path=log,
+            strict_error_redaction=False,
         )
         signet_app = SignetApp(
             config=config,
@@ -1394,8 +1442,22 @@ class TestUpstreamNonJsonAttribution:
         # Both attribution headers fire so callers can blame upstream.
         assert r.headers.get("X-Signet-Upstream") == "test-upstream"
         assert r.headers.get("X-Signet-Upstream-Status") == "200"
-        # Body is the upstream's verbatim non-JSON content.
-        assert b"maintenance window" in r.content
+        # F1: body is signet-shaped JSON, NOT raw upstream HTML.
+        assert r.headers.get("content-type", "").startswith("application/json")
+        body = r.json()
+        assert body["error"] == "upstream forward failed"
+        assert body["refusal_kind"] == "upstream_content_type_invalid"
+        assert body["correlation_id"]
+        assert b"maintenance window" not in r.content
+
+        # F1: audit row written with pipeline.upstream + refusal_kind.
+        from signet.audit.backend import JsonlBackend
+
+        entries = list(JsonlBackend(log).iter_entries())
+        upstream_rows = [e for e in entries if e.check_name == "pipeline.upstream"]
+        assert len(upstream_rows) == 1
+        assert upstream_rows[0].decision.value == "block"
+        assert upstream_rows[0].metadata.get("_refusal_kind") == ("upstream_content_type_invalid")
 
 
 class TestUnsupportedEndpointVersion:
@@ -1606,9 +1668,7 @@ class TestCorsCredentialsWildcardWarn:
     catches the misconfig before it reaches a real user.
     """
 
-    def test_wildcard_with_credentials_logs_warning(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_wildcard_with_credentials_logs_warning(self, caplog: pytest.LogCaptureFixture) -> None:
         import logging
 
         cfg = ServerConfig(
@@ -1621,9 +1681,9 @@ class TestCorsCredentialsWildcardWarn:
             SignetApp(config=cfg, pipeline=Pipeline(checks=[]))
         # The warning fires once at startup.
         warnings = [
-            r for r in caplog.records
-            if "cors_allow_credentials" in r.getMessage()
-            and "*" in r.getMessage()
+            r
+            for r in caplog.records
+            if "cors_allow_credentials" in r.getMessage() and "*" in r.getMessage()
         ]
         assert len(warnings) >= 1
 
@@ -1641,10 +1701,7 @@ class TestCorsCredentialsWildcardWarn:
         with caplog.at_level(logging.WARNING, logger="signet.server"):
             SignetApp(config=cfg, pipeline=Pipeline(checks=[]))
         # No CORS misconfig warning emitted.
-        warnings = [
-            r for r in caplog.records
-            if "cors_allow_credentials" in r.getMessage()
-        ]
+        warnings = [r for r in caplog.records if "cors_allow_credentials" in r.getMessage()]
         assert len(warnings) == 0
 
 
@@ -1776,23 +1833,24 @@ class TestInspectAllSseLines:
     def test_inspect_all_lines_extracts_id_and_comment(self) -> None:
         from signet.server.app import _extract_sse_content
 
-        chunk = (
-            "id: 42-secret\n"
-            ": comment-line (S//NF)\n"
-            "retry: 5000\n"
-            "data: {}\n"
-            "\n"
-        )
+        chunk = "id: 42-secret\n: comment-line (S//NF)\nretry: 5000\ndata: {}\n\n"
         out = _extract_sse_content(chunk, inspect_all_lines=True)
         assert "42-secret" in out
         assert "(S//NF)" in out
         assert "5000" in out
 
-    def test_config_default_is_false(self) -> None:
+    def test_config_default_is_true(self) -> None:
+        # Round 9 ``sse-non-data-fields-default-skip`` closure flipped
+        # the default from False to True: operators are unlikely to
+        # know they need to opt into inspecting ``event:`` / ``id:``
+        # / ``retry:`` lines, and the cost is negligible vs the
+        # side-channel bypass the opt-in closes.
         cfg = ServerConfig()
-        assert cfg.inspect_all_sse_lines is False
+        assert cfg.inspect_all_sse_lines is True
 
     def test_config_env_parses(self) -> None:
+        cfg = ServerConfig.from_env({"SIGNET_INSPECT_ALL_SSE_LINES": "0"})
+        assert cfg.inspect_all_sse_lines is False
         cfg = ServerConfig.from_env({"SIGNET_INSPECT_ALL_SSE_LINES": "1"})
         assert cfg.inspect_all_sse_lines is True
 
@@ -2046,9 +2104,7 @@ class TestMethodNotAllowed:
         _, c = app_factory(Pipeline(checks=[]))
         return c
 
-    def test_get_on_chat_completions_returns_405_signet_shape(
-        self, client: TestClient
-    ) -> None:
+    def test_get_on_chat_completions_returns_405_signet_shape(self, client: TestClient) -> None:
         r = client.get("/v1/chat/completions")
         assert r.status_code == 405
         body = r.json()
@@ -2061,9 +2117,7 @@ class TestMethodNotAllowed:
         allow = r.headers.get("Allow", "")
         assert "POST" in allow
 
-    def test_options_on_chat_completions_returns_405_signet_shape(
-        self, client: TestClient
-    ) -> None:
+    def test_options_on_chat_completions_returns_405_signet_shape(self, client: TestClient) -> None:
         r = client.options("/v1/chat/completions")
         assert r.status_code == 405
         body = r.json()

@@ -123,9 +123,7 @@ class TestMerkleTree:
 
 
 class TestArchiveByteStability:
-    def test_archive_round_trips_byte_stable(
-        self, tmp_path: Path, keyring: KeyRing
-    ) -> None:
+    def test_archive_round_trips_byte_stable(self, tmp_path: Path, keyring: KeyRing) -> None:
         """Same input → same archive bytes. This is the determinism
         guarantee that makes archives safe to ship to external auditors
         or transparency logs."""
@@ -154,12 +152,8 @@ class TestArchiveByteStability:
         cutoff = datetime(2099, 1, 1, tzinfo=UTC)
         archive_a = tmp_path / "a.bin"
         archive_b = tmp_path / "b.bin"
-        compact_audit_log(
-            chain=chain_a, backend=backend_a, before=cutoff, output=archive_a
-        )
-        compact_audit_log(
-            chain=chain_b, backend=backend_b, before=cutoff, output=archive_b
-        )
+        compact_audit_log(chain=chain_a, backend=backend_a, before=cutoff, output=archive_a)
+        compact_audit_log(chain=chain_b, backend=backend_b, before=cutoff, output=archive_b)
 
         assert archive_a.read_bytes() == archive_b.read_bytes()
 
@@ -337,9 +331,7 @@ class TestRoundTripVerification:
         assert not live_only.ok
 
         # Full-chain verification with archives must be clean.
-        report = verify_with_archives(
-            backend=backend, keyring=keyring, archive_dir=archive_dir
-        )
+        report = verify_with_archives(backend=backend, keyring=keyring, archive_dir=archive_dir)
         assert report.ok, f"breaks: {report.breaks[:5]}"
         assert report.total_entries == N + 1  # +1 for the marker
 
@@ -379,9 +371,7 @@ class TestTamperDetection:
         ee = raw.find(_ENTRIES_END)
         gz_blob = raw[es:ee]
         jsonl = gzip.decompress(gz_blob).decode("utf-8")
-        tampered_jsonl = jsonl.replace(
-            '"reason":"e2"', '"reason":"e2-TAMPERED"', 1
-        )
+        tampered_jsonl = jsonl.replace('"reason":"e2"', '"reason":"e2-TAMPERED"', 1)
         # Re-gzip the tampered JSONL — but with the same deterministic
         # parameters used by the writer, so structurally it's a valid
         # archive. The Merkle root over the entries' .hmac fields is
@@ -390,7 +380,9 @@ class TestTamperDetection:
         # tamper with the hmac field directly to force MERKLE_MISMATCH.
         del tampered_jsonl
         tampered_jsonl = jsonl.replace(
-            '"hmac":"', '"hmac":"0' * 0 + '"', 0  # no-op, we'll do something else
+            '"hmac":"',
+            '"hmac":"0' * 0 + '"',
+            0,  # no-op, we'll do something else
         )
         # Simpler: find the first occurrence of `"hmac":"X` and replace
         # the first hex digit with a different one.
@@ -399,9 +391,7 @@ class TestTamperDetection:
         digest_start = idx + len('"hmac":"')
         original_char = jsonl[digest_start]
         new_char = "0" if original_char != "0" else "1"
-        tampered_jsonl = (
-            jsonl[:digest_start] + new_char + jsonl[digest_start + 1 :]
-        )
+        tampered_jsonl = jsonl[:digest_start] + new_char + jsonl[digest_start + 1 :]
 
         from signet.audit.compactor import _gzip_bytes_deterministic
 
@@ -409,9 +399,7 @@ class TestTamperDetection:
         new_raw = raw[:es] + new_gz + raw[ee:]
         archive_path.write_bytes(new_raw)
 
-        report = verify_with_archives(
-            backend=backend, keyring=keyring, archive_dir=archive_dir
-        )
+        report = verify_with_archives(backend=backend, keyring=keyring, archive_dir=archive_dir)
         assert not report.ok
         kinds = {b.kind for b in report.breaks}
         assert BreakKind.MERKLE_MISMATCH in kinds
@@ -433,9 +421,7 @@ class TestTamperDetection:
         )
         archive_path.unlink()
 
-        report = verify_with_archives(
-            backend=backend, keyring=keyring, archive_dir=archive_dir
-        )
+        report = verify_with_archives(backend=backend, keyring=keyring, archive_dir=archive_dir)
         assert not report.ok
         kinds = {b.kind for b in report.breaks}
         assert BreakKind.ARCHIVE_MISSING in kinds
@@ -460,9 +446,7 @@ class TestTamperDetection:
         raw = archive_path.read_bytes()
         archive_path.write_bytes(b"NOPE-NOT-AN-ARCHIVE\n" + raw[20:])
 
-        report = verify_with_archives(
-            backend=backend, keyring=keyring, archive_dir=archive_dir
-        )
+        report = verify_with_archives(backend=backend, keyring=keyring, archive_dir=archive_dir)
         assert not report.ok
         kinds = {b.kind for b in report.breaks}
         assert BreakKind.ARCHIVE_FORMAT_INVALID in kinds
@@ -522,9 +506,7 @@ class TestCorruptArchiveBody:
         bad[midpoint] ^= 0xFF
         archive_path.write_bytes(bytes(bad))
 
-        report = verify_with_archives(
-            backend=backend, keyring=keyring, archive_dir=archive_dir
-        )
+        report = verify_with_archives(backend=backend, keyring=keyring, archive_dir=archive_dir)
         # Must not crash. Must report ARCHIVE_FORMAT_INVALID.
         assert not report.ok
         kinds = {b.kind for b in report.breaks}
@@ -549,9 +531,7 @@ class TestStackedCompactionRefusal:
         base_dt = datetime(2026, 1, 1, tzinfo=UTC)
         base_ns = int(base_dt.timestamp() * 1_000_000_000)
         for i in range(10):
-            chain.append(
-                _make_entry(f"e{i}", ts_ns=base_ns + i * 1_000_000_000)
-            )
+            chain.append(_make_entry(f"e{i}", ts_ns=base_ns + i * 1_000_000_000))
         archive1 = tmp_path / "archive-1.bin"
         compact_audit_log(
             chain=chain,
@@ -582,14 +562,10 @@ class TestStackedCompactionRefusal:
         base_dt = datetime(2026, 1, 1, tzinfo=UTC)
         base_ns = int(base_dt.timestamp() * 1_000_000_000)
         for i in range(5):
-            chain.append(
-                _make_entry(f"e{i}", ts_ns=base_ns + i * 1_000_000_000)
-            )
+            chain.append(_make_entry(f"e{i}", ts_ns=base_ns + i * 1_000_000_000))
         cutoff = base_dt + timedelta(seconds=3)
         archive1 = tmp_path / "archive-1.bin"
-        compact_audit_log(
-            chain=chain, backend=backend, before=cutoff, output=archive1
-        )
+        compact_audit_log(chain=chain, backend=backend, before=cutoff, output=archive1)
         # Second invocation with same cutoff: the existing marker
         # has ts_ns at the time of the FIRST compaction (now), but the
         # remaining entries past the cutoff are still after it. The
@@ -657,9 +633,7 @@ class TestCompactionLockingHook:
     block on the lock instead of silently racing into the
     ``os.replace`` window."""
 
-    def test_compactor_holds_sidecar_lock(
-        self, tmp_path: Path
-    ) -> None:
+    def test_compactor_holds_sidecar_lock(self, tmp_path: Path) -> None:
         from signet.audit.backend import (
             FileLockingJsonlBackend,
             exclusive_log_lock,

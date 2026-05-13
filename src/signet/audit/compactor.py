@@ -50,6 +50,7 @@ from pathlib import Path
 
 from signet.audit.backend import JsonlBackend, exclusive_log_lock
 from signet.audit.chain import HmacChain
+from signet.audit.keyring import KeyRing
 from signet.core.audit import AuditEntry, Decision
 from signet.core.owner import Owner
 
@@ -67,6 +68,23 @@ COMPACTION_CHECK_NAME = "_compaction"
 #: payload (merkle root, archive path, count, range, format version)
 #: lives. Stable across versions.
 COMPACTION_MARKER_FIELD = "_compaction_marker"
+
+#: Sub-key inside a compaction-marker payload that carries a
+#: keyring-MAC over the marker's identifying fields. Round 7 LOW-1:
+#: without this, ``is_compaction_marker`` was a pure shape check on
+#: user-controllable fields, so any caller able to append a tampered
+#: entry with ``check_name == "_compaction"`` could permanently block
+#: future compactions via the A2 guard in :func:`compact_audit_log`.
+#: The MAC is computed with the active key's secret over the marker's
+#: ``(merkle_root, archive_path, compacted_count, range_start,
+#: range_end, archive_format_version)`` tuple, so a user-crafted entry
+#: cannot produce a valid signature without the HMAC key.
+COMPACTION_MARKER_SIG_FIELD = "_marker_signature"
+
+#: Stable domain-separation prefix mixed into the marker MAC so the
+#: same key cannot be confused with chain HMACs or other future MAC
+#: surfaces. Treat as part of the format version contract.
+_MARKER_SIG_DOMAIN = b"signet-compaction-marker-v1\x00"
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,9 +318,21 @@ _ENTRIES_END = b"\nENTRIES-END\n"
 def _ts_ns_to_iso(ts_ns: int) -> str:
     """Convert nanoseconds-since-epoch to an ISO 8601 UTC string with
     ``Z`` suffix, microsecond precision (Python's datetime ceiling).
+
+    Round 7 MED-2: absurd integer ``ts_ns`` values (well past year
+    2286, e.g. 10**20) crash :func:`datetime.fromtimestamp` with a
+    raw ``OSError [Errno 22]`` on some libcs. Catch that family and
+    re-raise as :class:`ValueError` so the caller surface (compactor's
+    range-formatting path) can refuse fail-closed with a clean error
+    instead of leaking the platform error out. The HIGH-1 ``ts_ns``
+    bound in :meth:`AuditEntry.from_dict` (>= 0, <= 10**19) is the
+    primary line of defense; this is belt-and-braces.
     """
     seconds = ts_ns / 1_000_000_000
-    dt = datetime.fromtimestamp(seconds, tz=UTC)
+    try:
+        dt = datetime.fromtimestamp(seconds, tz=UTC)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ValueError(f"ts_ns={ts_ns} is outside the platform's representable range") from exc
     # Python's isoformat appends +00:00; we normalize to Z for compactness.
     return dt.isoformat().replace("+00:00", "Z")
 
@@ -474,8 +504,7 @@ def _read_archive(path: Path) -> tuple[ArchiveHeader, MerkleTree, list[AuditEntr
         jsonl = gzip.decompress(gz_blob).decode("utf-8")
     except (zlib.error, gzip.BadGzipFile, UnicodeDecodeError, OSError) as exc:
         raise ValueError(
-            f"archive {path}: entries section is corrupt: "
-            f"{type(exc).__name__}: {exc}"
+            f"archive {path}: entries section is corrupt: {type(exc).__name__}: {exc}"
         ) from exc
     entries: list[AuditEntry] = []
     for line in jsonl.splitlines():
@@ -483,9 +512,15 @@ def _read_archive(path: Path) -> tuple[ArchiveHeader, MerkleTree, list[AuditEntr
             continue
         try:
             entries.append(AuditEntry.from_dict(json.loads(line)))
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+            # Round 7 HIGH-2: broaden the except to cover the schema-
+            # validation failures ``AuditEntry.from_dict`` raises -- a
+            # tampered archive with valid JSON but missing-required-key
+            # or wrong-typed entries would otherwise crash the verifier
+            # with raw ``KeyError`` / ``TypeError`` instead of routing
+            # through ``ARCHIVE_FORMAT_INVALID``.
             raise ValueError(
-                f"archive {path}: archived JSONL is corrupt: {exc}"
+                f"archive {path}: archived entry is invalid: {type(exc).__name__}: {exc}"
             ) from exc
 
     if len(entries) != header.entry_count:
@@ -592,8 +627,7 @@ def compact_audit_log(
     # be the only non-tampered copy of those entries.
     if output.exists() and not force:
         raise FileExistsError(
-            f"refusing to overwrite existing archive {output}; "
-            f"pass force=True to override"
+            f"refusing to overwrite existing archive {output}; pass force=True to override"
         )
 
     # Normalize cutoff to UTC. Naive datetimes are assumed UTC for
@@ -648,9 +682,21 @@ def compact_audit_log(
         # so the operator can either widen ``--before`` past it or skip
         # it. Phase 2: implement marker-bridge logic in
         # ``verify_with_archives`` and lift this guard.
+        #
+        # Round 7 LOW-1 / Round 9 HIGH-2: use the shape check for the
+        # guard dispatch so a marker-shaped entry whose MAC fails to
+        # verify (e.g. key revoked from the ring) still refuses
+        # re-compaction -- the alternative is to silently archive the
+        # marker into a corrupting second archive. After dispatch, use
+        # the keyring-aware ``is_compaction_marker`` to distinguish
+        # "valid marker, can't re-compact" from "marker-shaped entry
+        # but MAC failed, possible key revocation; refusing fail-
+        # closed" so the operator can act on either signal.
         for entry in eligible:
-            if is_compaction_marker(entry):
-                marker_ts_iso = _ts_ns_to_iso(entry.ts_ns)
+            if not _has_marker_shape(entry):
+                continue
+            marker_ts_iso = _ts_ns_to_iso(entry.ts_ns)
+            if is_compaction_marker(entry, keyring=chain._keyring):
                 raise ValueError(
                     f"compaction range includes a previous compaction marker "
                     f"(entry_id={entry.entry_id}, ts={marker_ts_iso}); "
@@ -661,6 +707,15 @@ def compact_audit_log(
                     f"latter is a Phase-2 feature). Idempotent re-compaction "
                     f"with the same cutoff also trips this guard, by design."
                 )
+            raise ValueError(
+                f"compaction range includes a marker-shaped entry whose MAC "
+                f"does not verify under any key in the ring "
+                f"(entry_id={entry.entry_id}, ts={marker_ts_iso}). If you "
+                f"rotated or revoked keys, re-add the marker's signing key "
+                f"as a legacy entry in the keyring before compacting. "
+                f"Refusing fail-closed to avoid corrupting the archive "
+                f"bridge by sweeping a marker into a second archive."
+            )
 
         # Build the Merkle tree over the eligible entries' HMAC fields.
         tree = MerkleTree.from_entries(eligible)
@@ -721,7 +776,25 @@ def compact_audit_log(
         # append should link to whatever the *new* last entry is in the
         # rewritten file, not whatever the chain happened to cache from a
         # previous append. Invalidate it.
-        chain._cached_prev = None
+        #
+        # Round 9 HIGH-1 (full-sweep bridge fix): when ``retained`` is
+        # empty, the new live log contains ONLY the marker. The
+        # verifier's archive-bridge rule (see ``verify_with_archives``
+        # docstring near "Bridge from archive back to live log") says
+        # the next live entry's ``prev_hmac`` MUST equal the LAST
+        # ARCHIVED entry's hmac, NOT the marker's. If we cleared the
+        # cache to ``None`` here, the next ``chain.append`` would call
+        # ``backend.last_entry()`` and link to the marker, producing
+        # a permanent ``LINK_MISMATCH`` from ``verify_with_archives``
+        # for the rest of the chain. Seed the cache with the bridge
+        # value (``eligible[-1].hmac``) so the next append links
+        # correctly. The half-compaction path (``retained`` non-empty)
+        # is unaffected: ``backend.last_entry()`` returns the last
+        # retained entry, whose hmac is the correct predecessor.
+        if retained:
+            chain._cached_prev = None
+        else:
+            chain._cached_prev = eligible[-1].hmac
 
         return CompactionResult(
             archive_path=output,
@@ -730,6 +803,52 @@ def compact_audit_log(
             range=(range_start, range_end),
             marker_entry_id=appended_marker.entry_id,
         )
+
+
+def _compute_marker_signature(
+    *,
+    secret: bytes,
+    archive_format_version: int,
+    archive_path: str,
+    compacted_count: int,
+    merkle_root: str,
+    range_start: str,
+    range_end: str,
+) -> str:
+    """Compute the keyring-MAC stamped into a compaction marker (LOW-1).
+
+    HMAC-SHA256 over a canonical JSON encoding of the marker's
+    identifying fields, with a fixed domain-separation prefix. The
+    inputs match the marker payload (less the signature itself) so
+    verification is byte-for-byte deterministic.
+
+    A user-supplied entry cannot produce a matching signature without
+    the keyring secret. The compactor's A2 guard runs the verified
+    form (:func:`is_compaction_marker`), so an attacker-crafted marker
+    can no longer DoS future compactions.
+    """
+    import hashlib
+    import hmac as _hmac
+
+    canonical = json.dumps(
+        {
+            "archive_format_version": archive_format_version,
+            "archive_path": archive_path,
+            "compacted_count": compacted_count,
+            "merkle_root": merkle_root,
+            "range_end": range_end,
+            "range_start": range_start,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return _hmac.new(
+        secret,
+        _MARKER_SIG_DOMAIN + canonical,
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _sign_compaction_marker(
@@ -749,6 +868,11 @@ def _sign_compaction_marker(
     last live-log entry). The chain's anchor backend is invoked just
     like a normal append, so the marker carries a real anchor receipt
     when one is configured.
+
+    Round 7 LOW-1: stamp a keyring-MAC into the marker payload under
+    :data:`COMPACTION_MARKER_SIG_FIELD` so external callers can't
+    forge markers (a forged marker would otherwise DoS future
+    compactions via the A2 guard).
     """
     import hashlib
     import hmac as _hmac
@@ -757,6 +881,18 @@ def _sign_compaction_marker(
     from signet.audit.anchor import ANCHOR_FIELD, AnchorReceipt
     from signet.audit.chain import KEY_ID_FIELD, _serialize_for_signing
 
+    active = chain._keyring.active
+
+    marker_signature = _compute_marker_signature(
+        secret=active.secret,
+        archive_format_version=ARCHIVE_FORMAT_VERSION,
+        archive_path=str(archive_path),
+        compacted_count=compacted_count,
+        merkle_root=merkle_root,
+        range_start=range_start,
+        range_end=range_end,
+    )
+
     marker_payload = {
         "archive_format_version": ARCHIVE_FORMAT_VERSION,
         "archive_path": str(archive_path),
@@ -764,6 +900,7 @@ def _sign_compaction_marker(
         "merkle_root": merkle_root,
         "range_end": range_end,
         "range_start": range_start,
+        COMPACTION_MARKER_SIG_FIELD: marker_signature,
     }
     marker_entry = AuditEntry(
         owner=Owner.policy("audit-compactor"),
@@ -772,8 +909,6 @@ def _sign_compaction_marker(
         reason=f"compacted {compacted_count} entries into {archive_path.name}",
         metadata={COMPACTION_MARKER_FIELD: marker_payload},
     )
-
-    active = chain._keyring.active
 
     # First pass: tentative HMAC for anchor submission.
     tentative = replace(
@@ -851,7 +986,12 @@ def _atomic_rewrite_live_log(*, backend: JsonlBackend, new_entries: list[AuditEn
         raise
 
 
-def trim_before_index(backend: JsonlBackend, index: int) -> int:
+def trim_before_index(
+    backend: JsonlBackend,
+    index: int,
+    *,
+    chain: HmacChain | None = None,
+) -> int:
     """Remove the first ``index`` entries from the backend's live log.
 
     Returns the new entry count. This is provided as a free function
@@ -862,6 +1002,15 @@ def trim_before_index(backend: JsonlBackend, index: int) -> int:
 
     Atomicity: same temp-file + ``os.replace`` pattern used elsewhere
     in this module.
+
+    Round 7 MED-1: when ``chain`` is supplied, its ``_cached_prev`` is
+    invalidated AFTER the rewrite so a subsequent
+    :meth:`HmacChain.append` re-reads the chain head from disk-truth
+    rather than linking the next entry to a hmac that no longer exists
+    in the trimmed log. Operators reusing a chain across a trim MUST
+    pass ``chain=`` here -- omitting it silently forks the chain on the
+    next append (the cached prev points to an entry that was just
+    removed).
     """
     if index < 0:
         raise ValueError(f"trim_before_index: index must be >= 0, got {index}")
@@ -873,15 +1022,134 @@ def trim_before_index(backend: JsonlBackend, index: int) -> int:
     else:
         retained = entries[index:]
     _atomic_rewrite_live_log(backend=backend, new_entries=retained)
+    # Round 7 MED-1: clear the chain's stale prev cache so the next
+    # ``append`` re-reads the (now-truncated) tail from disk. Mirrors
+    # ``compact_audit_log``'s post-rewrite invalidation at the bottom of
+    # the with-lock block.
+    if chain is not None:
+        chain._cached_prev = None
     return len(retained)
 
 
-def is_compaction_marker(entry: AuditEntry) -> bool:
-    """True if ``entry`` is a compaction-marker entry."""
-    return (
-        entry.check_name == COMPACTION_CHECK_NAME
-        and COMPACTION_MARKER_FIELD in entry.metadata
-    )
+def _has_marker_shape(entry: AuditEntry) -> bool:
+    """Cheap structural check: True if ``entry`` has compaction-marker
+    shape, regardless of MAC validity.
+
+    Round 9 HIGH-2: marker recognition is split into two layers so
+    callers can choose between *recognition* and *trust*.
+
+    * **Shape** (this function): same fields the pre-Round-8 shape-only
+      :func:`is_compaction_marker` required -- ``check_name`` is the
+      marker sentinel, ``_compaction_marker`` metadata is a dict, and
+      a ``_marker_signature`` string is present. Used by:
+
+      - :func:`verify_with_archives` to dispatch into archive-walking
+        mode even if the marker's MAC can no longer be verified (e.g.
+        the signing key was revoked from the ring). Without the
+        dispatch the verifier would mis-report a phantom
+        ``LINK_MISMATCH`` cascade on legitimate post-revocation
+        chains.
+      - :func:`compact_audit_log`'s A2 guard to refuse re-compaction
+        across a marker-shaped entry even when MAC verification fails
+        (otherwise A2 silently fails open and the marker is archived
+        into a corrupting second archive).
+
+    * **MAC trust** (:func:`is_compaction_marker` with ``keyring=``):
+      verifies the marker's MAC against the ring's keys. Used when a
+      caller needs to *trust* the marker's claimed ``merkle_root`` /
+      ``archive_path`` / ``compacted_count``.
+
+    A shape-only check is safe for dispatch/guard purposes because an
+    attacker-crafted marker-shaped entry that fails MAC verification
+    is treated identically to a legitimately-signed marker whose key
+    was revoked: the chain refuses further compaction and the
+    verifier surfaces an actionable ``UNKNOWN_KEY``-style break on
+    that entry instead of silently miscarrying.
+    """
+    if entry.check_name != COMPACTION_CHECK_NAME:
+        return False
+    marker = entry.metadata.get(COMPACTION_MARKER_FIELD)
+    if not isinstance(marker, dict):
+        return False
+    # Round 23 F-R23-8: an empty string passes ``isinstance(..., str)`` but
+    # is never a legitimate marker signature (real markers carry a
+    # 64-character hex HMAC). Accepting ``""`` here would let an attacker
+    # spoof a marker shape with a signature the MAC verifier trivially
+    # rejects but the A2 guard / verifier dispatch still honors -- a
+    # cheap DoS primitive against future compactions. Require non-empty.
+    sig = marker.get(COMPACTION_MARKER_SIG_FIELD)
+    return isinstance(sig, str) and len(sig) > 0
+
+
+def is_compaction_marker(
+    entry: AuditEntry,
+    *,
+    keyring: KeyRing | None = None,
+) -> bool:
+    """True if ``entry`` is a compaction-marker entry.
+
+    Round 7 LOW-1: when ``keyring`` is supplied, the marker's
+    :data:`COMPACTION_MARKER_SIG_FIELD` is recomputed against the
+    keyring's keys (active + legacy) and the function returns ``True``
+    only when one of them produces a matching MAC. This closes the
+    user-crafted-fake-compaction-marker DoS where any caller able to
+    append an entry with ``check_name == "_compaction"`` and the
+    matching shape could permanently block future compactions via
+    the A2 guard.
+
+    Without ``keyring`` the legacy shape-only check is performed --
+    callers walking entries without crypto context (e.g. external
+    tools listing markers) still need a way to recognize the form,
+    and the security-critical caller (the A2 guard in
+    :func:`compact_audit_log`) explicitly passes the keyring.
+
+    Round 9 HIGH-2: this function answers "should I TRUST this marker"
+    (used for downstream merkle/archive decisions). For "is this
+    marker-shaped" (dispatch + DoS-guard), use :func:`_has_marker_shape`,
+    which does not depend on the ring containing the marker's signing
+    key. The split keeps key revocation from collapsing the verifier's
+    bridge dispatch and the compactor's A2 guard at the same time.
+    """
+    if entry.check_name != COMPACTION_CHECK_NAME:
+        return False
+    marker = entry.metadata.get(COMPACTION_MARKER_FIELD)
+    if not isinstance(marker, dict):
+        return False
+    if keyring is None:
+        return True
+    # Keyring-aware path: verify the marker signature with the active key
+    # and any legacy keys (a marker written under a previous era's key
+    # must still be recognized).
+    expected = marker.get(COMPACTION_MARKER_SIG_FIELD)
+    if not isinstance(expected, str):
+        return False
+    try:
+        archive_format_version = int(marker["archive_format_version"])
+        archive_path = str(marker["archive_path"])
+        compacted_count = int(marker["compacted_count"])
+        merkle_root = str(marker["merkle_root"])
+        range_start = str(marker["range_start"])
+        range_end = str(marker["range_end"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    import hmac as _hmac
+
+    for key_id in keyring.all_known_ids():
+        key = keyring.get(key_id)
+        if key is None:
+            continue
+        candidate = _compute_marker_signature(
+            secret=key.secret,
+            archive_format_version=archive_format_version,
+            archive_path=archive_path,
+            compacted_count=compacted_count,
+            merkle_root=merkle_root,
+            range_start=range_start,
+            range_end=range_end,
+        )
+        if _hmac.compare_digest(candidate, expected):
+            return True
+    return False
 
 
 def _signet_version() -> str:
@@ -904,6 +1172,7 @@ __all__ = [
     "ARCHIVE_FORMAT_VERSION",
     "COMPACTION_CHECK_NAME",
     "COMPACTION_MARKER_FIELD",
+    "COMPACTION_MARKER_SIG_FIELD",
     "ArchiveHeader",
     "CompactionResult",
     "MerkleTree",

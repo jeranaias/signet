@@ -184,9 +184,7 @@ class TestForgedInsertion:
         forged["metadata"] = {"_signing_key_id": "k1"}
 
         lines = _read_lines(backend.path)
-        lines.insert(
-            1, json.dumps(forged, separators=(",", ":"), sort_keys=True)
-        )
+        lines.insert(1, json.dumps(forged, separators=(",", ":"), sort_keys=True))
         _write_lines(backend.path, lines)
 
         report = ChainVerifier(backend, keyring).verify()
@@ -343,9 +341,7 @@ class TestCorruptedArchiveGzipFormatInvalid:
 
         # verify_with_archives must report this as ARCHIVE_FORMAT_INVALID
         # rather than letting BadGzipFile escape.
-        report = verify_with_archives(
-            backend, keyring, archive_dir=tmp_path
-        )
+        report = verify_with_archives(backend, keyring, archive_dir=tmp_path)
         assert not report.ok
         kinds = {b.kind for b in report.breaks}
         assert BreakKind.ARCHIVE_FORMAT_INVALID in kinds
@@ -440,9 +436,7 @@ class TestConcurrentCompactionAppenderLock:
         t.join(timeout=2.0)
         assert worker_acquired.is_set(), "worker never acquired after release"
 
-    def test_compaction_creates_sidecar_and_archives_clean(
-        self, tmp_path: Path
-    ) -> None:
+    def test_compaction_creates_sidecar_and_archives_clean(self, tmp_path: Path) -> None:
         """Compaction smoke: a FileLockingJsonlBackend chain compacts
         successfully, the sidecar lockfile exists afterwards (proving
         the compactor went through ``exclusive_log_lock``), and the
@@ -478,6 +472,246 @@ class TestConcurrentCompactionAppenderLock:
 
         # Live log + archive verify cleanly together.
         report = verify_with_archives(backend, ring, archive_dir=tmp_path)
-        assert report.ok, (
-            f"chain should verify clean post-compact; breaks={report.breaks}"
+        assert report.ok, f"chain should verify clean post-compact; breaks={report.breaks}"
+
+
+# ---------------------------------------------------------------------------
+# NF-R2-1: byte-level and schema-level corruptions all funnel through
+# MALFORMED_LINE rather than leaking raw Python tracebacks.
+# ---------------------------------------------------------------------------
+
+
+class TestNFR21InvalidUtf8ByteProducesBreak:
+    """v0.1.8 NF-R2-1: a stray 0x80 byte (invalid UTF-8 start byte)
+    inside an audit log line must surface as ``MALFORMED_LINE`` rather
+    than a raw ``UnicodeDecodeError`` from the verifier."""
+
+    def test_invalid_utf8_byte_produces_break(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        chain.append(_entry("b"))
+        chain.append(_entry("c"))
+
+        # Splice a raw 0x80 byte into line 2 by finding the first
+        # newline and inserting right after it.
+        raw = backend.path.read_bytes()
+        nl = raw.index(b"\n")
+        backend.path.write_bytes(raw[: nl + 1] + b"\x80" + raw[nl + 1 :])
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        kinds = {b.kind for b in report.breaks}
+        assert BreakKind.MALFORMED_LINE in kinds, (
+            f"invalid UTF-8 byte must surface as MALFORMED_LINE; breaks={report.breaks}"
         )
+
+
+class TestNFR21MissingFieldProducesBreak:
+    """v0.1.8 NF-R2-1: a row missing a required schema field (e.g.
+    ``owner_type``) must surface as ``MALFORMED_LINE`` rather than a
+    raw ``KeyError``. The JSON is valid; the schema is not."""
+
+    def test_missing_owner_type_produces_break(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        chain.append(_entry("b"))
+
+        lines = _read_lines(backend.path)
+        data = json.loads(lines[1])
+        del data["owner_type"]
+        lines[1] = json.dumps(data, separators=(",", ":"), sort_keys=True)
+        _write_lines(backend.path, lines)
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        kinds = {b.kind for b in report.breaks}
+        assert BreakKind.MALFORMED_LINE in kinds, (
+            f"missing schema field must surface as MALFORMED_LINE; breaks={report.breaks}"
+        )
+
+
+class TestNFR21InvalidEnumValueProducesBreak:
+    """v0.1.8 NF-R2-1: a typo'd enum value (``decision: 'alloS'``)
+    must surface as ``MALFORMED_LINE`` rather than a raw ``ValueError``
+    from :class:`Decision` enum coercion."""
+
+    def test_invalid_enum_value_produces_break(
+        self, chain: HmacChain, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        chain.append(_entry("a"))
+        chain.append(_entry("b"))
+
+        lines = _read_lines(backend.path)
+        data = json.loads(lines[1])
+        data["decision"] = "alloS"
+        lines[1] = json.dumps(data, separators=(",", ":"), sort_keys=True)
+        _write_lines(backend.path, lines)
+
+        report = ChainVerifier(backend, keyring).verify()
+        assert not report.ok
+        kinds = {b.kind for b in report.breaks}
+        assert BreakKind.MALFORMED_LINE in kinds
+
+
+# ---------------------------------------------------------------------------
+# NEW-2: every CLI subcommand that walks the audit log must surface a
+# schema-incomplete row as a one-line operator-readable error rather
+# than a raw Python traceback. The fix is inside ``iter_entries``; the
+# CLI catches were already in place.
+# ---------------------------------------------------------------------------
+
+
+def _build_schema_incomplete_log(tmp_path: Path) -> Path:
+    """Return a log path containing two valid rows + one row missing
+    a required schema field (``owner_type``)."""
+    backend = JsonlBackend(tmp_path / "audit.jsonl", fsync_after_append=False)
+    ring = KeyRing(active=Key(key_id="k1", secret=b"x" * 32))
+    chain = HmacChain(backend=backend, keyring=ring)
+    a = chain.append(_entry("a"))
+    chain.append(_entry("b"))
+    chain.append(_entry("c"))
+    # Capture the first entry's id for show/replay tests.
+    _build_schema_incomplete_log.first_entry_id = a.entry_id  # type: ignore[attr-defined]
+    lines = _read_lines(backend.path)
+    data = json.loads(lines[1])
+    del data["owner_type"]
+    lines[1] = json.dumps(data, separators=(",", ":"), sort_keys=True)
+    _write_lines(backend.path, lines)
+    return backend.path
+
+
+def _assert_clean_cli_error(result, hint_fragment: str = "malformed") -> None:
+    """Assert a CLI invocation surfaced the schema-incomplete row as a
+    structured ClickException (or the verifier's structured break),
+    not a Python traceback."""
+    # Click renders a traceback via ``Result.exception`` when an
+    # unexpected exception escapes. A ClickException maps to a
+    # non-zero exit code with a one-line message and ``exception is
+    # None`` on the Result.
+    assert result.exit_code != 0, f"expected non-zero exit; output={result.output}"
+    if result.exception is not None:
+        # ``click.ClickException`` (and ``SystemExit``) are expected
+        # control-flow exits; an unhandled ``KeyError`` / etc would
+        # be a regression.
+        import click as _click
+
+        assert isinstance(result.exception, _click.ClickException | SystemExit), (
+            f"unexpected exception escaped CLI: "
+            f"{type(result.exception).__name__}: {result.exception}\n"
+            f"output={result.output}"
+        )
+    assert "Traceback" not in result.output, f"CLI leaked a Python traceback:\n{result.output}"
+
+
+class TestNew2CliSubcommandsSurfaceSchemaIncomplete:
+    """v0.1.8 NEW-2: each of the CLI subcommands that walks the audit
+    log via ``iter_entries`` must produce a one-line operator-readable
+    error when it encounters a schema-incomplete row. Before the fix
+    only ``json.JSONDecodeError`` was wrapped; ``KeyError`` on
+    missing fields leaked through as a raw Python traceback."""
+
+    HMAC_SECRET = "x" * 64  # 32 bytes in hex
+    KEY_ID = "k1"
+
+    def test_audit_verify_handles_schema_incomplete(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from signet.cli import main
+
+        log_path = _build_schema_incomplete_log(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "verify",
+                str(log_path),
+                "--hmac-secret",
+                self.HMAC_SECRET,
+                "--key-id",
+                self.KEY_ID,
+            ],
+        )
+        # ``audit verify`` routes malformed rows through the verifier
+        # which converts them to a MALFORMED_LINE break and exits 2.
+        # Either path (ClickException exit_code != 0 or verifier
+        # BROKEN exit 2) is acceptable -- the contract is "no
+        # traceback".
+        _assert_clean_cli_error(result)
+
+    def test_audit_count_handles_schema_incomplete(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from signet.cli import main
+
+        log_path = _build_schema_incomplete_log(tmp_path)
+        runner = CliRunner()
+        # ``audit count`` takes LOG_PATH as a positional argument.
+        result = runner.invoke(main, ["audit", "count", str(log_path)])
+        _assert_clean_cli_error(result)
+        assert "malformed" in result.output.lower()
+
+    def test_audit_tail_handles_schema_incomplete(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from signet.cli import main
+
+        log_path = _build_schema_incomplete_log(tmp_path)
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", "tail", str(log_path)])
+        _assert_clean_cli_error(result)
+        assert "malformed" in result.output.lower()
+
+    def test_audit_show_handles_schema_incomplete(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from signet.cli import main
+
+        log_path = _build_schema_incomplete_log(tmp_path)
+        # Look up an entry that comes AFTER the broken row, so the
+        # iterator must walk past the malformed line and surface the
+        # error rather than returning early on a match.
+        target_id = "00000000-0000-0000-0000-000000000000"
+        runner = CliRunner()
+        result = runner.invoke(main, ["audit", "show", target_id, "--audit-log", str(log_path)])
+        _assert_clean_cli_error(result)
+        assert "malformed" in result.output.lower()
+
+    def test_audit_report_handles_schema_incomplete(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from signet.cli import main
+
+        log_path = _build_schema_incomplete_log(tmp_path)
+        runner = CliRunner()
+        # ``--no-anonymize`` avoids the salt requirement so the test
+        # exercises the iter_entries path, not the input-validation
+        # short-circuit.
+        result = runner.invoke(
+            main,
+            [
+                "audit",
+                "report",
+                "--audit-log",
+                str(log_path),
+                "--since",
+                "30d",
+                "--no-anonymize",
+            ],
+        )
+        _assert_clean_cli_error(result)
+        assert "malformed" in result.output.lower()
+
+    def test_replay_handles_schema_incomplete(self, tmp_path: Path) -> None:
+        from click.testing import CliRunner
+
+        from signet.cli import main
+
+        log_path = _build_schema_incomplete_log(tmp_path)
+        target_id = "00000000-0000-0000-0000-000000000000"
+        runner = CliRunner()
+        result = runner.invoke(main, ["replay", target_id, "--audit-log", str(log_path)])
+        _assert_clean_cli_error(result)
+        assert "malformed" in result.output.lower()

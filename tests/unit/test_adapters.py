@@ -173,9 +173,7 @@ class TestOwnerPrefixWarning:
         client = _DummyClient()
         with warnings.catch_warnings():
             warnings.simplefilter("error")  # raise on any warning
-            wrap_openai(
-                client, signet_url="http://x", owner="human:alice@example.com"
-            )
+            wrap_openai(client, signet_url="http://x", owner="human:alice@example.com")
 
     def test_agent_prefix_no_warning_openai(self) -> None:
         import warnings
@@ -217,9 +215,7 @@ class TestOwnerPrefixWarning:
         client = _DummyClient()
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            wrap_anthropic(
-                client, signet_url="http://x", owner="human:bob@example.com"
-            )
+            wrap_anthropic(client, signet_url="http://x", owner="human:bob@example.com")
 
     def test_warning_message_suggests_fix(self) -> None:
         client = _DummyClient()

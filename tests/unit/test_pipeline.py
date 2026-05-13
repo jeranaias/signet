@@ -63,9 +63,7 @@ class _AllowInspection(Check):
     name = "fake_inspect"
     stage = Stage.INSPECTION
 
-    async def inspect_response_chunk(
-        self, _ctx: ResponseContext, _chunk: str
-    ) -> CheckResult:
+    async def inspect_response_chunk(self, _ctx: ResponseContext, _chunk: str) -> CheckResult:
         return CheckResult.allow()
 
 
@@ -193,8 +191,15 @@ class TestPipelineHistogramObservation:
         _, value, labels = observer.observations[0]
         assert labels["decision"] == "block"
         assert labels["check"] == "fake_slow"
-        # The elapsed time is at least the timeout itself.
-        assert value >= 0.005
+        # The timeout fired: elapsed time is positive and well under the
+        # 1.0s sleep the check would have spent if uncancelled. The
+        # previous lower bound of 0.005s was too tight for Windows CI
+        # (asyncio task cancellation latency on the GitHub Actions
+        # Windows runner can be <1ms because the timer granularity and
+        # event-loop dispatch are coarser than the budget itself). The
+        # meaningful invariant is "cancel happened before the sleep
+        # would have completed", not a specific minimum latency.
+        assert 0 < value < 0.5
 
 
 class TestSignetAppExposesHistogram:

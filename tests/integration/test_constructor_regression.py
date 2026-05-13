@@ -61,8 +61,7 @@ def test_unit_constructor_aliases_class_coverage() -> None:
         "TestRequestContextConstructor",
     }
     found = {
-        name for name, obj in inspect.getmembers(mod, inspect.isclass)
-        if name.startswith("Test")
+        name for name, obj in inspect.getmembers(mod, inspect.isclass) if name.startswith("Test")
     }
     missing = expected - found
     assert not missing, (

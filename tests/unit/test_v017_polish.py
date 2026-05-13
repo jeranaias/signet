@@ -69,9 +69,7 @@ def _request(
     )
 
 
-def _response(
-    req: RequestContext, *, accumulated: str = "", chunks: int = 1
-) -> ResponseContext:
+def _response(req: RequestContext, *, accumulated: str = "", chunks: int = 1) -> ResponseContext:
     return ResponseContext(request=req, accumulated_text=accumulated, chunk_count=chunks)
 
 
@@ -129,12 +127,12 @@ class TestC1OwnerSanitization:
         "tainted_value",
         [
             "human:alice@example.com\r\nX-Other: bar",  # CRLF injection
-            "human:alice@example.com\nX-Other: bar",    # bare LF
-            "human:alice@example.com\rX-Other: bar",    # bare CR
-            "human:al\x00ice",                          # NUL byte
-            "human:al\x07ice",                          # BEL (control char)
-            "human:al\x1bice",                          # ESC (control char)
-            "human:al\x7fice",                          # DEL
+            "human:alice@example.com\nX-Other: bar",  # bare LF
+            "human:alice@example.com\rX-Other: bar",  # bare CR
+            "human:al\x00ice",  # NUL byte
+            "human:al\x07ice",  # BEL (control char)
+            "human:al\x1bice",  # ESC (control char)
+            "human:al\x7fice",  # DEL
         ],
     )
     async def test_crlf_nul_control_chars_rejected(self, tainted_value: str) -> None:
@@ -202,9 +200,7 @@ class TestC1OwnerSanitization:
 class _FlakyState:
     """Mock state backend that raises on get / set per configuration."""
 
-    def __init__(
-        self, *, raise_on_get: bool = False, raise_on_set: bool = False
-    ) -> None:
+    def __init__(self, *, raise_on_get: bool = False, raise_on_set: bool = False) -> None:
         self.raise_on_get = raise_on_get
         self.raise_on_set = raise_on_set
 
@@ -442,8 +438,7 @@ class TestC4RegexReDoS:
 
         # The hard contract: wall-clock bounded. v0.1.6 took ~25s.
         assert elapsed < 1.5, (
-            f"ReDoS regression: scan took {elapsed:.2f}s "
-            f"(expected < 1.5s with timeout=0.2s)"
+            f"ReDoS regression: scan took {elapsed:.2f}s (expected < 1.5s with timeout=0.2s)"
         )
         # A non-allow result is the desirable outcome (BLOCK on match
         # or BLOCK on timeout). The third-party ``regex`` matcher may
@@ -535,8 +530,7 @@ class TestC6PromptInjection:
         ctx = _request(body={"messages": [{"role": "user", "content": probe.payload}]})
         result = await check.pre_request(ctx)
         assert result.is_block, (
-            f"probe corpus regression: {probe.name!r} not blocked\n"
-            f"payload={probe.payload!r}"
+            f"probe corpus regression: {probe.name!r} not blocked\npayload={probe.payload!r}"
         )
 
     async def test_short_base32_injection_caught(self) -> None:
@@ -752,9 +746,9 @@ class TestC2WhitespaceClassificationLogging:
         # data are compatible after whitespace fallback.
         assert result.is_allow
         # The breadcrumb landed.
-        assert any(
-            "whitespace-only" in rec.getMessage() for rec in caplog.records
-        ), f"no whitespace breadcrumb in: {[r.getMessage() for r in caplog.records]}"
+        assert any("whitespace-only" in rec.getMessage() for rec in caplog.records), (
+            f"no whitespace breadcrumb in: {[r.getMessage() for r in caplog.records]}"
+        )
 
     async def test_absent_classification_does_not_log(
         self, caplog: pytest.LogCaptureFixture

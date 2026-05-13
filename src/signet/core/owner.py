@@ -55,12 +55,8 @@ def _coerce_owner_type(value: OwnerType | str) -> OwnerType:
             return OwnerType(value.lower())
         except ValueError as e:
             valid = sorted(t.value for t in OwnerType)
-            raise ValueError(
-                f"unknown OwnerType {value!r}; expected one of {valid}"
-            ) from e
-    raise ValueError(
-        f"OwnerType must be an OwnerType or str, got {type(value).__name__}"
-    )
+            raise ValueError(f"unknown OwnerType {value!r}; expected one of {valid}") from e
+    raise ValueError(f"OwnerType must be an OwnerType or str, got {type(value).__name__}")
 
 
 @dataclass(frozen=True, slots=True)

@@ -92,9 +92,7 @@ def test_bench_rejects_invalid_requests_arg() -> None:
 def test_bench_rejects_invalid_concurrency_arg() -> None:
     pipeline = default_mock_pipeline()
     with pytest.raises(ValueError, match="concurrency must be > 0"):
-        asyncio.run(
-            run_bench(pipeline, requests=10, concurrency=0, mock_upstream=True)
-        )
+        asyncio.run(run_bench(pipeline, requests=10, concurrency=0, mock_upstream=True))
 
 
 # ---------------------------------------------------------------------------
@@ -167,9 +165,7 @@ def test_parse_gate_spec_empty_returns_empty_list() -> None:
 def test_apply_gate_passes_under_threshold() -> None:
     """A rule of p95=100ms passes when the actual p95 is ~5ms."""
     pipeline = default_mock_pipeline()
-    report = asyncio.run(
-        run_bench(pipeline, requests=50, mock_upstream=True, baseline=False)
-    )
+    report = asyncio.run(run_bench(pipeline, requests=50, mock_upstream=True, baseline=False))
     rule = GateRule(percentile=95, threshold_seconds=0.100)  # 100ms
     outcome = apply_gate(report, [rule])
     assert outcome.passed is True
@@ -179,9 +175,7 @@ def test_apply_gate_passes_under_threshold() -> None:
 def test_apply_gate_fails_over_threshold() -> None:
     """A rule of p95=0.001us forces a failure (any real timing exceeds it)."""
     pipeline = default_mock_pipeline()
-    report = asyncio.run(
-        run_bench(pipeline, requests=20, mock_upstream=True, baseline=False)
-    )
+    report = asyncio.run(run_bench(pipeline, requests=20, mock_upstream=True, baseline=False))
     rule = GateRule(percentile=95, threshold_seconds=1e-12)
     outcome = apply_gate(report, [rule])
     assert outcome.passed is False
@@ -217,9 +211,7 @@ def test_format_gate_outcome_renders_pass_and_fail() -> None:
 def test_bench_json_format_parseable() -> None:
     """--format json output is well-formed JSON with the documented schema."""
     pipeline = default_mock_pipeline()
-    report = asyncio.run(
-        run_bench(pipeline, requests=50, mock_upstream=True, baseline=False)
-    )
+    report = asyncio.run(run_bench(pipeline, requests=50, mock_upstream=True, baseline=False))
     payload = json.loads(report.render_json())
     # Documented keys.
     for key in (
@@ -246,9 +238,7 @@ def test_bench_json_format_parseable() -> None:
 def test_bench_markdown_renders_section_headings() -> None:
     """--format markdown output contains the section headings docs refer to."""
     pipeline = default_mock_pipeline()
-    report = asyncio.run(
-        run_bench(pipeline, requests=50, mock_upstream=True, baseline=False)
-    )
+    report = asyncio.run(run_bench(pipeline, requests=50, mock_upstream=True, baseline=False))
     md = report.render_markdown()
     # Top banner.
     assert "signet bench - overhead report" in md
@@ -266,9 +256,7 @@ def test_bench_markdown_renders_section_headings() -> None:
 def test_bench_csv_renders_summary_row() -> None:
     """--format csv emits one row per check + one summary total row."""
     pipeline = default_mock_pipeline()
-    report = asyncio.run(
-        run_bench(pipeline, requests=50, mock_upstream=True, baseline=False)
-    )
+    report = asyncio.run(run_bench(pipeline, requests=50, mock_upstream=True, baseline=False))
     csv_text = report.render_csv()
     lines = [line for line in csv_text.splitlines() if line]
     # Header + 4 stages + 2 checks + 1 total = 8.
@@ -362,6 +350,31 @@ def test_cli_bench_rejects_malformed_gate_spec() -> None:
     assert "invalid --gate rule" in result.output
 
 
+def test_bench_requests_zero_clean_error() -> None:
+    """v0.1.8 NEW-1: --requests 0 produces clean click error, no traceback."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["bench", "--mock-upstream", "--requests", "0"])
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+    assert "requests" in result.output.lower() or "Invalid value" in result.output
+
+
+def test_bench_concurrency_negative_clean_error() -> None:
+    """v0.1.8 NEW-1: --concurrency -5 produces clean click error, no traceback."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["bench", "--mock-upstream", "--concurrency", "-5"])
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+
+
+def test_bench_non_integer_clean_error() -> None:
+    """v0.1.8 NEW-1: non-integer --requests produces clean click error."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["bench", "--mock-upstream", "--requests", "abc"])
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+
+
 def test_cli_bench_with_config_file(tmp_path: Path) -> None:
     """`--config pipeline.py` loads the operator's pipeline and benches it.
 
@@ -370,7 +383,7 @@ def test_cli_bench_with_config_file(tmp_path: Path) -> None:
     """
     pipeline_py = tmp_path / "pipeline.py"
     pipeline_py.write_text(
-        '''\
+        """\
 from signet.core.pipeline import Pipeline
 from signet.core.check import Check, CheckResult
 from signet.core.stage import Stage
@@ -386,7 +399,7 @@ class _Allow(Check):
 
 
 pipeline = Pipeline(checks=[_Allow()])
-''',
+""",
         encoding="utf-8",
     )
     runner = CliRunner()

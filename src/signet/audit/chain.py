@@ -32,9 +32,15 @@ import json
 import logging
 import threading
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
-from signet.audit.anchor import ANCHOR_FIELD, AnchorBackend, NoopAnchor
+from signet.audit.anchor import (
+    ANCHOR_FIELD,
+    AnchorBackend,
+    AnchorProtocolError,
+    AnchorReceipt,
+    NoopAnchor,
+)
 from signet.audit.backend import AuditBackend
 from signet.audit.keyring import KeyRing
 from signet.core.audit import AuditEntry
@@ -119,12 +125,20 @@ class HmacChain:
         the limitation on the custom backend.
         """
         with self._lock:
-            if not self._cache_prev and hasattr(
-                self._backend, "append_locked_with_link"
-            ):
+            if not self._cache_prev and hasattr(self._backend, "append_locked_with_link"):
                 # V2 (v0.1.7 follow-up): atomic multi-process path.
-                linked = self._backend.append_locked_with_link(
-                    lambda prev: self._build_linked_entry(entry, prev)
+                # The ``hasattr`` gate above narrows to the
+                # ``FileLockingJsonlBackend`` shape at runtime, but
+                # mypy sees ``self._backend`` as the abstract
+                # ``AuditBackend`` and treats the dynamic method call
+                # as returning ``Any``. ``cast`` makes the return
+                # type explicit; the runtime check is the actual
+                # safety net.
+                linked = cast(
+                    AuditEntry,
+                    self._backend.append_locked_with_link(
+                        lambda prev: self._build_linked_entry(entry, prev)
+                    ),
                 )
                 self._cached_prev = linked.hmac
                 return linked
@@ -175,12 +189,36 @@ class HmacChain:
                 self._anchor.name,
                 type(exc).__name__,
             )
-            from signet.audit.anchor import AnchorReceipt
-
             anchor_receipt = AnchorReceipt(
                 backend=self._anchor.name,
                 success=False,
                 error=f"{type(exc).__name__}: {exc}",
+            )
+
+        # F-R5-A: defend against custom anchor backends that return
+        # something that isn't an AnchorReceipt. Without this, the
+        # downstream ``.success`` / ``.to_dict()`` accesses would surface
+        # as raw AttributeError and corrupt the calling check's error
+        # reporting (the operator sees a Python traceback, not a clean
+        # protocol error).
+        if not isinstance(anchor_receipt, AnchorReceipt):
+            err = AnchorProtocolError(
+                backend=self._anchor.name,
+                field="<return value>",
+                detail=(f"expected AnchorReceipt, got {type(anchor_receipt).__name__}"),
+            )
+            if self._require_anchor_success:
+                raise err
+            logger.warning(
+                "anchor backend %s returned %s instead of AnchorReceipt; "
+                "recording failure on entry",
+                self._anchor.name,
+                type(anchor_receipt).__name__,
+            )
+            anchor_receipt = AnchorReceipt(
+                backend=self._anchor.name,
+                success=False,
+                error=str(err),
             )
 
         if not anchor_receipt.success and self._require_anchor_success:
@@ -206,20 +244,67 @@ class HmacChain:
         return entry_with_anchor.with_chain_links(prev_hmac=prev_hmac, hmac=new_hmac)
 
     def _read_prev_hmac(self) -> str:
-        """Return the HMAC of the latest entry in the chain, or ``""`` if
+        """Return the HMAC the next append must link to, or ``""`` if
         the chain is empty.
 
         With ``cache_prev=True`` (default, single-process), cached after
         first read. With ``cache_prev=False`` (multi-process), always
         re-reads from the backend to pick up writes from sibling workers.
+
+        Round 11 HIGH-1: marker-aware tail read. If the on-disk tail is
+        a compaction marker (full-sweep result: the live log contains
+        ONLY the marker), the correct predecessor for the next live
+        append is the LAST ARCHIVED entry's hmac, NOT the marker's hmac.
+        The marker's signed payload commits to that bridge value via its
+        own ``prev_hmac`` field (set to ``eligible[-1].hmac`` by the
+        compactor), so ``last.prev_hmac`` is exactly the bridge value
+        the verifier's archive-bridge rule expects.
+
+        This works regardless of ``cache_prev`` and survives process
+        restart, because the bridge value is read directly from the
+        marker on disk. The same-instance cache-seed in
+        :func:`compact_audit_log` remains as a fast-path optimization
+        (it avoids the linear scan), but the slow path is now correct
+        on its own. An attacker cannot redirect the bridge without
+        breaking the marker's own self-HMAC: the marker's payload
+        (including its ``prev_hmac``) is bound by the chain HMAC under
+        the keyring secret, so tampering shows up as ``SELF_MISMATCH``
+        at verify time.
         """
         if self._cache_prev and self._cached_prev is not None:
             return self._cached_prev
         last = self._backend.last_entry()
-        prev = last.hmac if last is not None else ""
+        if last is None:
+            prev = ""
+        elif _tail_is_marker(last):
+            # Full-sweep tail: bridge value = marker.prev_hmac.
+            prev = last.prev_hmac
+        else:
+            prev = last.hmac
         if self._cache_prev:
             self._cached_prev = prev
         return prev
+
+
+def _tail_is_marker(entry: AuditEntry) -> bool:
+    """Round 11 HIGH-1: marker-aware tail detection for chain extension.
+
+    Returns True when ``entry`` has compaction-marker shape. Used by
+    :meth:`HmacChain._read_prev_hmac` (and by
+    :meth:`FileLockingJsonlBackend._read_tail_hmac`) to decide whether
+    the next live append should link to ``entry.hmac`` (ordinary tail)
+    or to ``entry.prev_hmac`` (bridge value the marker commits to).
+
+    Implemented as a lazy import of :func:`signet.audit.compactor._has_marker_shape`
+    to avoid the chain → compactor → chain circular import at module
+    load time. The check itself is a cheap structural test, and a stale
+    cached miss would surface as ``LINK_MISMATCH`` immediately at the
+    next verifier walk, so optimizing the import-cost away with a local
+    duplicate isn't worth the desynchronization risk.
+    """
+    from signet.audit.compactor import _has_marker_shape
+
+    return _has_marker_shape(entry)
 
 
 def _serialize_for_signing(entry: AuditEntry) -> bytes:

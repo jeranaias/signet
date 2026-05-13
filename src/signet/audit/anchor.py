@@ -40,10 +40,30 @@ sensible failure mode:
 * ``require_success=True``: failures raise. Use when unanchored
   entries are unacceptable.
 
-Verification: :class:`signet.audit.verifier.ChainVerifier` checks
-anchor receipts when configured with the matching anchor backend's
-verify path. An entry whose anchor receipt does not verify externally
-counts as a chain break.
+Verification: anchor receipts are recorded inside the entry's metadata
+under :data:`ANCHOR_FIELD` BEFORE the chain HMAC is computed, so the
+chain HMAC binds the receipt to the entry. The HMAC chain therefore
+detects any post-write tampering with the receipt as a
+``SELF_MISMATCH`` break at verify time. The receipt is independently
+re-verifiable against the TSA's public certificate by any third party
+who keeps a copy of the certificate -- the ``cms_bytes`` payload is
+self-contained -- but :class:`signet.audit.verifier.ChainVerifier`
+does NOT itself replay that external verification step against the
+TSA cert during a chain walk. Trust in the receipt's authenticity
+comes from (a) the TSA's signed CMS payload, verifiable out-of-band,
+and (b) the chain HMAC binding the receipt to the entry.
+
+This is intentional: the verifier runs in environments without
+network access to the TSA and without a configured TSA-cert trust
+store, so an in-band re-verification would either silently no-op or
+require operator-side trust-store configuration the rest of the audit
+chain does not need. Operators who want stronger guarantees should
+periodically run an external script that walks the live + archived
+logs, extracts each receipt's ``cms_bytes``, and feeds it through
+``openssl ts -verify`` (or a Python CMS library) against a pinned TSA
+certificate. A future :class:`signet.audit.verifier.ChainVerifier`
+extension may add an optional anchor-verify hook; the current API
+surface is stable so adding it would not break existing callers.
 """
 
 from __future__ import annotations
@@ -59,6 +79,63 @@ logger = logging.getLogger("signet.audit.anchor")
 
 #: Metadata key on AuditEntry where the anchor receipt is embedded.
 ANCHOR_FIELD = "_anchor"
+
+
+class AnchorProtocolError(Exception):
+    """Raised when an anchor backend's response violates the expected shape.
+
+    Surfaces a single domain-specific exception in place of the raw
+    ``AttributeError`` / ``TypeError`` that would otherwise leak from
+    field extraction (missing attribute, wrong type, non-bytes where
+    bytes expected). The message identifies the offending field and the
+    type that was actually seen so an operator can pin the bad backend.
+
+    The raw response payload is intentionally NOT included -- it may be
+    large or binary. Callers that need it should keep their own
+    reference before invoking the anchor.
+    """
+
+    def __init__(self, backend: str, field: str, detail: str) -> None:
+        super().__init__(
+            f"anchor backend {backend!r} returned malformed response: field {field!r}: {detail}"
+        )
+        self.backend = backend
+        self.field = field
+        self.detail = detail
+
+
+def _require_attr(response: object, attr: str, backend: str) -> Any:
+    """Return ``getattr(response, attr)`` or raise :class:`AnchorProtocolError`.
+
+    Translates an :class:`AttributeError` from a malformed backend response
+    into the single domain-specific exception so callers see a clean
+    protocol error instead of a Python traceback.
+    """
+    try:
+        return getattr(response, attr)
+    except AttributeError as exc:
+        raise AnchorProtocolError(
+            backend=backend,
+            field=attr,
+            detail=f"missing attribute on {type(response).__name__}",
+        ) from exc
+
+
+def _require_bytes(value: object, field: str, backend: str) -> bytes:
+    """Return ``value`` as ``bytes`` or raise :class:`AnchorProtocolError`.
+
+    Some HTTP libraries / mocks return ``str`` (or ``None``) where the
+    RFC 3161 TSA contract expects ``bytes``. Without this guard the
+    downstream ``base64.b64encode`` would surface as a ``TypeError`` deep
+    in the call stack.
+    """
+    if not isinstance(value, bytes | bytearray | memoryview):
+        raise AnchorProtocolError(
+            backend=backend,
+            field=field,
+            detail=(f"expected bytes, got {type(value).__name__}"),
+        )
+    return bytes(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,7 +268,6 @@ class Rfc3161Anchor:
                 headers={"Content-Type": "application/timestamp-query"},
                 timeout=self.timeout_s,
             )
-            resp.raise_for_status()
         except httpx.HTTPError as exc:
             return AnchorReceipt(
                 backend=self.name,
@@ -201,11 +277,39 @@ class Rfc3161Anchor:
                 ts_ns=_now_ns(),
             )
 
+        # Extract fields defensively. A backend returning an object that
+        # doesn't quack like an httpx.Response would otherwise raise raw
+        # AttributeError / TypeError mid-call; translate it to a single
+        # AnchorProtocolError that callers can reason about. F-R5-A.
+        raise_for_status = _require_attr(resp, "raise_for_status", self.name)
+        if not callable(raise_for_status):
+            raise AnchorProtocolError(
+                backend=self.name,
+                field="raise_for_status",
+                detail=(f"expected callable, got {type(raise_for_status).__name__}"),
+            )
+        try:
+            raise_for_status()
+        except httpx.HTTPError as exc:
+            return AnchorReceipt(
+                backend=self.name,
+                success=False,
+                error=f"TSA request failed: {type(exc).__name__}: {exc}",
+                anchor_url=self.tsa_url,
+                ts_ns=_now_ns(),
+            )
+
+        content = _require_bytes(
+            _require_attr(resp, "content", self.name),
+            field="content",
+            backend=self.name,
+        )
+
         return AnchorReceipt(
             backend=self.name,
             success=True,
             anchor_url=self.tsa_url,
-            receipt=base64.b64encode(resp.content).decode(),
+            receipt=base64.b64encode(content).decode(),
             ts_ns=_now_ns(),
         )
 
@@ -260,6 +364,7 @@ def _now_ns() -> int:
 __all__ = [
     "ANCHOR_FIELD",
     "AnchorBackend",
+    "AnchorProtocolError",
     "AnchorReceipt",
     "NoopAnchor",
     "Rfc3161Anchor",

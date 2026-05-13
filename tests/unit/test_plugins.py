@@ -141,9 +141,7 @@ class TestDiscovery:
         cls = resolve("stub_resolve_check")
         assert cls is _StubCheck
 
-    def test_duplicate_entry_point_names_flagged(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_duplicate_entry_point_names_flagged(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Two packages registering the same (group, name) must both
         be marked ``duplicate_name`` with ``duplicate_with`` pointing
         at the OTHER package, and ``obj`` cleared so the silently
@@ -222,9 +220,7 @@ class TestDiscovery:
         check_map = discover(refresh=True)
         assert "conflicting_name" not in check_map
 
-    def test_resolve_refuses_duplicate_name(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_resolve_refuses_duplicate_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """resolve() on a duplicated entry-point name must raise
         ``RuntimeError`` naming the conflicting packages.
         """
@@ -268,9 +264,7 @@ class TestDiscovery:
         with pytest.raises(RuntimeError, match="duplicate registrations"):
             resolve("conflicting_name")
 
-    def test_single_plugin_no_duplicates(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_single_plugin_no_duplicates(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """One plugin under a name must remain ``loaded`` — the
         duplicate-detection pass is a no-op for the common case.
         """
@@ -391,9 +385,7 @@ class TestDiscovery:
             assert entry.status == "loaded"
             assert entry.duplicate_with == ()
 
-    def test_incompatible_abi_marked_as_unloaded(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_incompatible_abi_marked_as_unloaded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from signet.core.check import CHECK_ABI_VERSION, Check
         from signet.core.stage import Stage
 

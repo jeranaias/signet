@@ -145,14 +145,11 @@ class TestAdmission:
         # Session-start / session-end were NOT written because admission
         # closed the session before they fire.
         assert not any(
-            e.check_name in {"pipeline.realtime.session_start",
-                              "pipeline.realtime.session_end"}
+            e.check_name in {"pipeline.realtime.session_start", "pipeline.realtime.session_end"}
             for e in entries
         )
 
-    def test_admission_refusal_decision_survives_strict_redaction(
-        self, tmp_path
-    ) -> None:
+    def test_admission_refusal_decision_survives_strict_redaction(self, tmp_path) -> None:
         """v0.1.7 R1: ``decision`` is structural, not policy-revealing,
         so it MUST survive strict-error-redaction coarsening."""
         log = tmp_path / "audit.jsonl"
@@ -193,8 +190,7 @@ class TestAdmission:
             assert event["type"] == "signet.shadow"
             assert event["stage"] == "admission"
             assert event["decision"] == "block"
-            assert event["would_have_closed_code"] == \
-                realtime_mod.WS_CLOSE_POLICY_VIOLATION
+            assert event["would_have_closed_code"] == realtime_mod.WS_CLOSE_POLICY_VIOLATION
             ws.receive_json()  # raises disconnect
         assert excinfo.value.code == realtime_mod.WS_CLOSE_NORMAL
 
@@ -231,17 +227,11 @@ class TestCommitmentBlock:
     def test_block_emits_refusal(self, tmp_path) -> None:
         log = tmp_path / "audit.jsonl"
         # Empty registry + allow_unregistered=False → tool blocks.
-        inspector = ToolCallInspectorCheck(
-            registry={}, allow_unregistered=False
-        )
-        pipeline = Pipeline(
-            checks=[OwnerResolutionCheck(require_owner=True), inspector]
-        )
+        inspector = ToolCallInspectorCheck(registry={}, allow_unregistered=False)
+        pipeline = Pipeline(checks=[OwnerResolutionCheck(require_owner=True), inspector])
         _, client = _make_app(pipeline=pipeline, audit_log_path=log)
 
-        with client.websocket_connect(
-            "/v1/realtime", headers=_commit_owner_headers()
-        ) as ws:
+        with client.websocket_connect("/v1/realtime", headers=_commit_owner_headers()) as ws:
             ws.send_json(_function_call_event("send_email"))
             event = ws.receive_json()
 
@@ -258,15 +248,11 @@ class TestCommitmentBlock:
         names = [e.check_name for e in entries]
         assert "pipeline.realtime.session_start" in names
         assert "pipeline.realtime.session_end" in names
-        commit_rows = [
-            e for e in entries if e.check_name == "tool_call_inspector"
-        ]
+        commit_rows = [e for e in entries if e.check_name == "tool_call_inspector"]
         assert len(commit_rows) == 1
         assert commit_rows[0].decision.value == "block"
 
-        end_row = next(
-            e for e in entries if e.check_name == "pipeline.realtime.session_end"
-        )
+        end_row = next(e for e in entries if e.check_name == "pipeline.realtime.session_end")
         assert end_row.metadata["function_calls_count"] == 1
         assert end_row.metadata["function_calls_blocked"] == 1
         assert end_row.metadata["function_calls_escalated"] == 0
@@ -282,22 +268,12 @@ class TestCommitmentEscalate:
 
     def test_escalate_emits_approval_chain(self, tmp_path) -> None:
         log = tmp_path / "audit.jsonl"
-        registry = {
-            "transfer_funds": ToolSpec(
-                risk_tier=RiskTier.HIGH, irreversible=True
-            )
-        }
-        inspector = ToolCallInspectorCheck(
-            registry=registry, escalate_at_tier=RiskTier.HIGH
-        )
-        pipeline = Pipeline(
-            checks=[OwnerResolutionCheck(require_owner=True), inspector]
-        )
+        registry = {"transfer_funds": ToolSpec(risk_tier=RiskTier.HIGH, irreversible=True)}
+        inspector = ToolCallInspectorCheck(registry=registry, escalate_at_tier=RiskTier.HIGH)
+        pipeline = Pipeline(checks=[OwnerResolutionCheck(require_owner=True), inspector])
         _, client = _make_app(pipeline=pipeline, audit_log_path=log)
 
-        with client.websocket_connect(
-            "/v1/realtime", headers=_commit_owner_headers()
-        ) as ws:
+        with client.websocket_connect("/v1/realtime", headers=_commit_owner_headers()) as ws:
             ws.send_json(_function_call_event("transfer_funds"))
             event = ws.receive_json()
 
@@ -311,9 +287,7 @@ class TestCommitmentEscalate:
         assert approval.get("current_approver") == "human:alice@example.com"
 
         end_row = next(
-            e
-            for e in _read_entries(log)
-            if e.check_name == "pipeline.realtime.session_end"
+            e for e in _read_entries(log) if e.check_name == "pipeline.realtime.session_end"
         )
         assert end_row.metadata["function_calls_escalated"] == 1
         assert end_row.metadata["function_calls_blocked"] == 0
@@ -329,20 +303,12 @@ class TestCommitmentBlockShadow:
 
     def test_shadow_forwards_blocked_call(self, tmp_path) -> None:
         log = tmp_path / "audit.jsonl"
-        inspector = ToolCallInspectorCheck(
-            registry={}, allow_unregistered=False
-        )
-        pipeline = Pipeline(
-            checks=[OwnerResolutionCheck(require_owner=True), inspector]
-        )
-        _, client = _make_app(
-            pipeline=pipeline, audit_log_path=log, shadow=True
-        )
+        inspector = ToolCallInspectorCheck(registry={}, allow_unregistered=False)
+        pipeline = Pipeline(checks=[OwnerResolutionCheck(require_owner=True), inspector])
+        _, client = _make_app(pipeline=pipeline, audit_log_path=log, shadow=True)
 
         original = _function_call_event("send_email")
-        with client.websocket_connect(
-            "/v1/realtime", headers=_commit_owner_headers()
-        ) as ws:
+        with client.websocket_connect("/v1/realtime", headers=_commit_owner_headers()) as ws:
             ws.send_json(original)
             echoed = ws.receive_json()
 
@@ -352,11 +318,7 @@ class TestCommitmentBlockShadow:
         assert echoed["name"] == "send_email"
 
         # Audit row still records the would-have-been-block, tagged shadow.
-        commit_rows = [
-            e
-            for e in _read_entries(log)
-            if e.check_name == "tool_call_inspector"
-        ]
+        commit_rows = [e for e in _read_entries(log) if e.check_name == "tool_call_inspector"]
         assert len(commit_rows) == 1
         assert commit_rows[0].decision.value == "block"
         assert commit_rows[0].metadata.get("shadow") is True
@@ -379,30 +341,21 @@ class TestAudioPassthrough:
             "type": realtime_mod.EVENT_AUDIO_INPUT,
             "audio": "base64-bytes-here",
         }
-        with client.websocket_connect(
-            "/v1/realtime", headers=_commit_owner_headers()
-        ) as ws:
+        with client.websocket_connect("/v1/realtime", headers=_commit_owner_headers()) as ws:
             ws.send_json(audio_event)
             echoed = ws.receive_json()
 
         assert echoed["type"] == realtime_mod.EVENT_AUDIO_INPUT
         assert echoed["audio"] == "base64-bytes-here"
 
-        audio_rows = [
-            e
-            for e in _read_entries(log)
-            if e.check_name == "pipeline.realtime.audio"
-        ]
+        audio_rows = [e for e in _read_entries(log) if e.check_name == "pipeline.realtime.audio"]
         assert len(audio_rows) == 1
         assert audio_rows[0].metadata["audio_inspection_skipped"] is True
-        assert audio_rows[0].metadata["event_type"] == \
-            realtime_mod.EVENT_AUDIO_INPUT
+        assert audio_rows[0].metadata["event_type"] == realtime_mod.EVENT_AUDIO_INPUT
 
         # Session-end metrics reflect the audio frame.
         end_row = next(
-            e
-            for e in _read_entries(log)
-            if e.check_name == "pipeline.realtime.session_end"
+            e for e in _read_entries(log) if e.check_name == "pipeline.realtime.session_end"
         )
         assert end_row.metadata["audio_chunks_passed_through"] == 1
 
@@ -424,23 +377,15 @@ class TestSessionLifecycle:
         # this exercises the client-event-counter without firing any
         # stage logic.
         passthrough_event = {"type": "session.update", "session": {}}
-        with client.websocket_connect(
-            "/v1/realtime", headers=_commit_owner_headers()
-        ) as ws:
+        with client.websocket_connect("/v1/realtime", headers=_commit_owner_headers()) as ws:
             ws.send_json(passthrough_event)
             ws.receive_json()
             ws.send_json(passthrough_event)
             ws.receive_json()
 
         entries = _read_entries(log)
-        starts = [
-            e
-            for e in entries
-            if e.check_name == "pipeline.realtime.session_start"
-        ]
-        ends = [
-            e for e in entries if e.check_name == "pipeline.realtime.session_end"
-        ]
+        starts = [e for e in entries if e.check_name == "pipeline.realtime.session_start"]
+        ends = [e for e in entries if e.check_name == "pipeline.realtime.session_end"]
         assert len(starts) == 1
         assert len(ends) == 1
 
@@ -461,6 +406,7 @@ class TestSessionLifecycle:
             "upstream_event_count",
             "audio_chunks_passed_through",
             "text_chunks_inspected",
+            "binary_frames_received",
             "ended_normally",
             "close_code",
         ):
@@ -495,9 +441,7 @@ class TestPeriodicFlush:
         pipeline = Pipeline(checks=[OwnerResolutionCheck(require_owner=True)])
         _, client = _make_app(pipeline=pipeline, audit_log_path=log)
 
-        with client.websocket_connect(
-            "/v1/realtime", headers=_commit_owner_headers()
-        ) as ws:
+        with client.websocket_connect("/v1/realtime", headers=_commit_owner_headers()) as ws:
             # Hold the connection open long enough for the flush task
             # to fire. We pump a few echo events to ensure the loop
             # is awake.
@@ -512,11 +456,7 @@ class TestPeriodicFlush:
 
             _time.sleep(0.2)
 
-        flush_rows = [
-            e
-            for e in _read_entries(log)
-            if e.check_name == "pipeline.realtime.flush"
-        ]
+        flush_rows = [e for e in _read_entries(log) if e.check_name == "pipeline.realtime.flush"]
         assert len(flush_rows) >= 1
         meta = flush_rows[0].metadata
         assert meta.get("interim") is True
@@ -582,3 +522,41 @@ class TestRealtimeDisabledStub:
             ws.send_json({"type": "session.update", "session": {}})
             event = ws.receive_json()
             assert event["type"] == "session.update"
+
+
+# ---------------------------------------------------------------------------
+# 8. v0.1.8.1 N1 -- binary WS frames audit + counter
+# ---------------------------------------------------------------------------
+
+
+class TestBinaryFrameAudit:
+    """v0.1.8.1 N1: a binary WebSocket frame writes an audit row +
+    counter rather than silently dropping. Operators alerted on a
+    misbehaving client now have a row to pivot from."""
+
+    def test_n1_binary_ws_frame_writes_audit_row(self, tmp_path) -> None:
+        log = tmp_path / "audit.jsonl"
+        pipeline = Pipeline(checks=[OwnerResolutionCheck(require_owner=True)])
+        _, client = _make_app(pipeline=pipeline, audit_log_path=log)
+
+        binary_payload = b"\x00\x01\x02\x03\x04\x05" * 20  # 120 bytes
+        with client.websocket_connect("/v1/realtime", headers=_commit_owner_headers()) as ws:
+            ws.send_bytes(binary_payload)
+            # Loopback echoes the bytes back; consume so the test
+            # isn't racy on close.
+            echoed = ws.receive_bytes()
+            assert echoed == binary_payload
+
+        entries = _read_entries(log)
+        binary_rows = [e for e in entries if e.check_name == "pipeline.realtime.binary"]
+        assert len(binary_rows) == 1, (
+            f"expected exactly one binary audit row, got {len(binary_rows)}"
+        )
+        meta = binary_rows[0].metadata
+        assert meta["binary_frame_received"] is True
+        assert meta["frame_size_bytes"] == len(binary_payload)
+        assert "session_id" in meta
+
+        # Session-end row carries the cumulative counter.
+        end_row = next(e for e in entries if e.check_name == "pipeline.realtime.session_end")
+        assert end_row.metadata["binary_frames_received"] == 1

@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -63,6 +64,211 @@ if TYPE_CHECKING:
     from signet.core.pipeline import Pipeline
 
 logger = logging.getLogger("signet.cli")
+
+
+# Round 7 MED/LOW: terminal-escape-injection defense. Several CLI surfaces
+# echo bytes that ultimately come from a network peer (the upstream proxy
+# being probed by ``signet doctor --self``, the contents of an audit row's
+# ``metadata`` block surfaced by ``signet replay``, or a ``.env`` file in
+# the operator's CWD picked up by ``_doctor_autodetect``). A malicious or
+# compromised producer of those bytes can embed ANSI / OSC escape
+# sequences (title-rewrite, screen-clear, OSC-52 clipboard write, OSC-8
+# hyperlink phish, etc.) that a real terminal will interpret. We
+# centralize the defense in one helper so every echo path uses the same
+# replacement table.
+_CONTROL_BYTE_REPLACEMENTS: dict[int, str] = {c: f"\\x{c:02x}" for c in range(0x20)} | {
+    0x7F: "\\x7f"
+}
+# Tab is preserved -- it's the only sub-0x20 byte that is both common in
+# legitimate values and harmless to a terminal renderer.
+_CONTROL_BYTE_REPLACEMENTS.pop(0x09, None)
+# Round 14 INFO: extend coverage beyond ASCII control bytes. The R13
+# audit found four Unicode classes that pass through the ASCII-only
+# translation table but render in modern terminals (xterm, Windows
+# Terminal, VS Code integrated terminal):
+#   - C1 controls (U+0080-U+009F): some terminals interpret these as
+#     8-bit CSI / OSC equivalents over UTF-8 (CSI = U+009B as the 1-byte
+#     equivalent of ``ESC [``), making ANSI sequences reachable without
+#     an actual ESC byte.
+#   - Bidirectional overrides (U+202A LRE, U+202B RLE, U+202C PDF,
+#     U+202D LRO, U+202E RLO) and isolates (U+2066-U+2069): the "Trojan
+#     Source" attack class (CVE-2021-42574, Boucher & Anderson 2021).
+#     An attacker-supplied check_name like ``"safe<RLO>check"`` renders
+#     as ``"safekcehc"`` and an audit reader sees a different identifier
+#     than what is stored.
+#   - Line / paragraph separators (U+2028, U+2029): rendered as line
+#     breaks by terminals, which can split or hide adjacent content in
+#     audit verify / tail / replay output.
+#   - BOM / ZWNBSP (U+FEFF): a long-standing display-confusion vector.
+# We render each as a textual ``\\uNNNN`` escape, consistent with how
+# the ASCII control bytes already render as ``\\xNN``.
+_UNICODE_CONTROL_CODEPOINTS: tuple[int, ...] = (
+    *range(0x80, 0xA0),  # C1 controls
+    *range(0x202A, 0x202F),  # bidi overrides (LRE, RLE, PDF, LRO, RLO)
+    *range(0x2066, 0x206A),  # bidi isolates (LRI, RLI, FSI, PDI)
+    0x2028,  # LINE SEPARATOR
+    0x2029,  # PARAGRAPH SEPARATOR
+    0xFEFF,  # ZWNBSP / BOM
+)
+for _cp in _UNICODE_CONTROL_CODEPOINTS:
+    _CONTROL_BYTE_REPLACEMENTS[_cp] = f"\\u{_cp:04x}"
+del _cp
+
+
+def _sanitize_for_terminal(value: object) -> str:
+    """Render *value* as a terminal-safe string.
+
+    Replaces ASCII control bytes (< 0x20 except ``\\t``, plus 0x7f) with
+    their ``\\xNN`` textual escape so a malicious upstream cannot inject
+    ANSI / OSC sequences into the operator's terminal.
+
+    Round 14 INFO: also escapes Unicode classes that pass through
+    ASCII-only sanitization but render in modern terminals -- C1 controls
+    (U+0080-U+009F), bidirectional overrides (U+202A-U+202E) and isolates
+    (U+2066-U+2069), line / paragraph separators (U+2028 / U+2029), and
+    BOM / ZWNBSP (U+FEFF). These close the Trojan Source (CVE-2021-42574)
+    deception vector and the 8-bit-CSI / line-splice surfaces. They
+    render as ``\\uNNNN`` text so an operator can still see the shape of
+    the attacker-supplied bytes in the audit / replay output.
+
+    Accepts any object; non-strings are coerced via ``str()`` first so
+    callers can pass arbitrary metadata values straight through.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    # Round 29 MED (F-R29-1): use the unbound ``str.translate`` so a
+    # hostile ``str``-subclass with an overridden ``translate`` cannot
+    # crash or escape the sanitizer. Same pattern as R26-R28 helpers
+    # (``str.__str__(value)``) -- the unbound method invokes the plain
+    # ``str`` implementation regardless of subclass overrides.
+    return str.translate(value, _CONTROL_BYTE_REPLACEMENTS)
+
+
+# Round 14 INFO: reject Windows reserved device names at the CLI
+# boundary. ``Path("CON").exists()`` returns True on Windows because the
+# reserved names live in the Win32 namespace as character devices, which
+# means Click's ``Path(exists=True, dir_okay=False)`` validator happily
+# accepts ``CON``, ``NUL``, ``COM1``, etc. Real-world effects:
+#   * ``signet audit count CON`` opens the console for read and the
+#     iterator blocks indefinitely waiting for keyboard input.
+#   * ``signet audit count NUL`` reports 0 entries silently.
+#   * ``serve --audit-log COM1`` either fails opaquely or routes the
+#     audit chain to a serial port.
+# This is operator-driven, not a security boundary, but it's a UX foot-
+# gun for any script that templates ``$LOG_PATH`` and substitutes a
+# reserved name accidentally. We reject by matching the basename (sans
+# extension, case-insensitive) against the reserved set.
+_WINDOWS_RESERVED_DEVICE_NAMES: frozenset[str] = frozenset(
+    {"CON", "NUL", "PRN", "AUX"}
+    | {f"COM{n}" for n in range(1, 10)}
+    | {f"LPT{n}" for n in range(1, 10)}
+)
+
+
+def _is_windows_reserved_device_name(path: Path) -> bool:
+    """Return True if *path*'s basename matches a Windows reserved
+    device name (``CON``, ``NUL``, ``PRN``, ``AUX``, ``COM1``-``COM9``,
+    ``LPT1``-``LPT9``).
+
+    The check is platform-agnostic: we match on the path text alone so
+    a POSIX deployment templating ``$LOG_PATH`` to ``CON`` also gets the
+    same clear error. The candidate name is the basename with any
+    extension stripped, upper-cased -- this matches the Win32 namespace
+    behavior where ``CON.txt`` and ``CON`` alias the same device.
+
+    Round 15 MED (F-R15-1): Win32 also normalizes basenames by stripping
+    trailing spaces/tabs/dots BEFORE the namespace lookup, so
+    ``"CON "`` (trailing space), ``"CON."``, ``"CON  "``, ``"CON .txt"``,
+    etc. all route to the CON device. The R14 split-on-dot only
+    stripped a single trailing dot via the ``split(".", 1)[0]`` shape
+    (``"CON."`` -> ``"CON"`` happens to work); a trailing space or tab
+    bypassed entirely. We now rstrip the basename of trailing
+    ``" \\t."`` before the suffix split so every Win32-normalized form
+    reaches the same reserved-name comparison.
+
+    Round 23 LOW (F-R23-10): NTFS Alternate Data Stream syntax
+    (``CON:streamname``) also routes to the CON device on Windows --
+    the colon introduces the data-stream name, the head of the basename
+    is still the device name. The R15 split on ``.`` did not split on
+    ``:``, so a basename like ``"CON:foo"`` survived the reserved-name
+    check intact. ``:`` is not a legitimate filename character on Windows
+    (it's reserved for drive letters and ADS), so we reject any path
+    whose basename contains ``:`` outright -- both ``CON:foo`` and the
+    benign-looking ``stream:name`` route into the rejection path, which
+    is the correct operator-facing behavior because either is going to
+    surprise a caller that templated ``$LOG_PATH`` into the basename.
+    POSIX deployments treat ``:`` as a legal filename character, but
+    the check is platform-agnostic by design (see the function docstring):
+    a CON-like basename should reject everywhere for predictable
+    cross-platform script behavior.
+    """
+    basename = os.path.basename(str(path))
+    if not basename:
+        return False
+    # Round 23 F-R23-10: a ``:`` in the basename is always either an NTFS
+    # Alternate Data Stream reference (``CON:foo`` -> CON device) or a
+    # drive-letter prefix that ``os.path.basename`` failed to strip.
+    # Either way the basename is not a legitimate Windows filename --
+    # reject the whole path so the reserved-name check is not bypassable
+    # via the ADS shape.
+    if ":" in basename:
+        return True
+    # Win32 strips trailing spaces / tabs / dots from the basename
+    # before the namespace lookup. Mirror that normalization so e.g.
+    # ``"CON "`` and ``"CON.txt"`` both reduce to ``"CON"`` for the
+    # reserved-set check. We strip BOTH the full basename (covers
+    # ``"CON "`` / ``"CON."``) AND the stem after the suffix split
+    # (covers ``"CON .txt"`` / ``"NUL\t.log"``, where the trailing
+    # whitespace sits between the stem and the extension and would
+    # survive the first rstrip).
+    basename = basename.rstrip(" \t.")
+    if not basename:
+        return False
+    stem = basename.split(".", 1)[0].rstrip(" \t.")
+    if not stem:
+        return False
+    return stem.upper() in _WINDOWS_RESERVED_DEVICE_NAMES
+
+
+def _reject_windows_reserved_device_name(path: Path, *, kind: str = "audit log path") -> None:
+    """Raise ``click.ClickException`` if *path* is a Windows reserved
+    device name. Used by every CLI subcommand that writes to an
+    operator-supplied output path.
+
+    Round 17 MED (F-R17-1): the original wording named only "audit log
+    path"; the helper is now also called for ``keys generate-ed25519
+    --out`` and ``--public-out`` (where ``--out CON`` silently routed
+    the private-key bytes to the console device). ``kind`` lets callers
+    name the specific surface so the operator-facing message points at
+    the right CLI option. The substring ``Windows reserved device name``
+    is preserved verbatim for downstream regex / output assertions.
+    """
+    if _is_windows_reserved_device_name(path):
+        raise click.ClickException(
+            f"{kind} must be a regular file, not a Windows reserved "
+            f"device name: {_sanitize_for_terminal(str(path))!r}"
+        )
+
+
+def _open_jsonl_backend(log_path: Path) -> Any:
+    """Construct a :class:`JsonlBackend` and surface the Round 9 symlink
+    guard as a clear :class:`click.ClickException` instead of a Python
+    traceback. Used by every CLI subcommand that opens an audit log.
+
+    Round 14 INFO: also rejects Windows reserved device names (CON, NUL,
+    PRN, AUX, COM1-COM9, LPT1-LPT9) at the CLI boundary so
+    ``signet audit count CON`` produces a clear ``ClickException``
+    instead of hanging on a blocking console read.
+    """
+    from signet.audit.backend import AuditLogSymlinkError, JsonlBackend
+
+    _reject_windows_reserved_device_name(log_path)
+    try:
+        return JsonlBackend(log_path)
+    except AuditLogSymlinkError as exc:
+        raise click.ClickException(_sanitize_for_terminal(exc)) from exc
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -93,7 +299,10 @@ def main() -> None:
 @click.option(
     "--port",
     default=8443,
-    type=int,
+    # Round-4 NEW-9: clamp to the TCP port range so values like
+    # ``--port 99999`` raise a click range error (exit 2) instead of an
+    # OverflowError bubbling out of uvicorn's socket() call.
+    type=click.IntRange(0, 65535),
     envvar="SIGNET_PORT",
     show_default=True,
     help="Bind port.",
@@ -215,6 +424,14 @@ def serve(
             # logs. Production should use the strict default.
             strict_error_redaction = False
 
+    # Round 14 INFO: reject Windows reserved device names at the CLI
+    # boundary so ``signet serve --audit-log CON`` produces a clear error
+    # instead of routing the audit chain at the console / null device.
+    # Done after the ``--dev`` defaulting so a stray ``CON`` from the
+    # environment still trips the guard.
+    if audit_log_path is not None:
+        _reject_windows_reserved_device_name(audit_log_path)
+
     # Load pipeline from config file or use empty one.
     if config_path:
         click.secho(
@@ -249,11 +466,26 @@ def serve(
     if shadow is not None:
         cfg.shadow = shadow
 
-    signet_app = SignetApp(config=cfg, pipeline=pipeline)
+    # Round 9 LOW: surface the audit-log symlink guard as a clear
+    # ClickException instead of letting the AuditLogSymlinkError bubble
+    # out as a Python traceback.
+    from signet.audit.backend import AuditLogSymlinkError
+
+    try:
+        signet_app = SignetApp(config=cfg, pipeline=pipeline)
+    except AuditLogSymlinkError as exc:
+        raise click.ClickException(_sanitize_for_terminal(exc)) from exc
     app = signet_app.app
     # ASCII arrow (-> not unicode) so the banner renders on Windows
     # cp1252 stdout without UnicodeEncodeError.
-    click.echo(f"signet {__version__} -> {upstream_url}  (listening on {host}:{port})")
+    # Round 9 MED: ``upstream_url`` is env-derived (or CLI-supplied) and
+    # the banner stays in scrollback. Even if config validation now
+    # restricts schemes, control bytes can still appear in the URL
+    # query/path portion -- sanitize before echo.
+    click.echo(
+        f"signet {__version__} -> {_sanitize_for_terminal(upstream_url)}  "
+        f"(listening on {host}:{port})"
+    )
 
     # If we generated an ephemeral key, print it as hex so the user can
     # save it for post-mortem `signet audit verify`. Otherwise the audit
@@ -275,10 +507,17 @@ def serve(
     # Print loaded checks so operators can verify the configuration
     # without re-reading the file. Quiet on the empty-pipeline path
     # since the warning above is already loud about it.
+    #
+    # Round 11 LOW: ``c.name`` is a class attribute on each Check; a
+    # hostile plugin (entry-point group ``signet.checks``) that the
+    # operator wires into pipeline.py can declare a ``name`` carrying
+    # OSC / control bytes. Sanitize for parity with Round 10's plugins
+    # list / plugins doctor surfaces. ``c.stage.value`` is a ``Stage``
+    # enum member and safe.
     if pipeline.checks:
         click.echo(f"pipeline ({len(pipeline.checks)} checks):")
         for c in pipeline.checks:
-            click.echo(f"  [{c.stage.value}] {c.name}")
+            click.echo(f"  [{c.stage.value}] {_sanitize_for_terminal(c.name)}")
 
     uvicorn.run(app, host=host, port=port, log_level="info")
 
@@ -333,6 +572,46 @@ def keys_generate_ed25519(
 
     Requires ``pip install signet-sign[ed25519]``.
     """
+    # Round 9 LOW: reject ``--key-id`` that contains ASCII control bytes
+    # at parse time. A key-id with control bytes is a misconfiguration
+    # regardless of intent: it cannot be safely pasted into source code
+    # (the "copy this into your code" output below is exactly that
+    # surface), and it would invisibly mismatch a verifier reading the
+    # printable form. Defense in depth -- the three echo sites also
+    # sanitize, so a key-id that somehow slips through still renders
+    # safely.
+    #
+    # Round 15 LOW (F-R15-3): the R9 check refused only ASCII control
+    # bytes (< 0x20 or 0x7F). R14 extended ``_sanitize_for_terminal``
+    # to cover C1 controls, bidi overrides/isolates, LSEP/PSEP, and
+    # BOM, but the parse-time guard did not match that wider set. A
+    # ``--key-id "‮hacked"`` would pass the parse check and only get
+    # neutralized at echo time. The fix tightens the parse-time guard
+    # to a strict allowlist: key IDs in practice are short ASCII
+    # identifiers (``prod-2024-01``, ``kms-rotated-foo``), so the
+    # ``[A-Za-z0-9_.:\-]+`` charset is more than enough. Rejecting
+    # Unicode at the parser is cleaner than depending on the echo-site
+    # sanitizer, and removes any ambiguity about what a "key id" can
+    # contain in operator pipelines.
+    # Round 17 MED (F-R17-1): reject Windows reserved device names on
+    # both ``--out`` and ``--public-out`` at parse time. Same guard
+    # class as the R14/R15 audit-log surface
+    # (``_reject_windows_reserved_device_name``) -- a bare ``CON`` /
+    # ``NUL`` / ``COM1`` basename routes the ``write_bytes`` call to
+    # the Win32 console / null device and silently consumes the PEM-
+    # encoded private key. The CLI would otherwise report success while
+    # only the ``.pub`` file was actually persisted (the ``.pub``
+    # suffix breaks the device-name match). Operators who share the
+    # orphaned public key with verifiers cannot produce matching
+    # signatures.
+    _reject_windows_reserved_device_name(out_path, kind="--out")
+    if public_out_path is not None:
+        _reject_windows_reserved_device_name(public_out_path, kind="--public-out")
+    if key_id is not None:
+        # Round 9 / R15 / R23: charset validation extracted into
+        # ``_validate_key_id_charset`` (single source of truth shared
+        # across every ``--key-id`` flag site).
+        _validate_key_id_charset(key_id, source="--key-id")
     try:
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -395,7 +674,9 @@ def keys_generate_ed25519(
             encoding="utf-8",
         )
         click.secho(f"  wrote key metadata: {meta_path}", fg="green")
-        click.echo(f"\nkey_id (record this; verifiers need it): {key_id}")
+        # Round 9 LOW: key_id is rejected at parse-time if it contains
+        # control bytes, but sanitize at every echo for defense in depth.
+        click.echo(f"\nkey_id (record this; verifiers need it): {_sanitize_for_terminal(key_id)}")
     click.echo("\nNext: configure signet with this key for asymmetric receipts.")
     # C4 (v0.1.7): emit Python's safe ``repr()`` of the path so Windows
     # backslashes (``D:\tmp\priv.pem``) are properly escaped. Previously
@@ -406,7 +687,10 @@ def keys_generate_ed25519(
     # ``'/tmp/priv.pem'`` on POSIX), which always parses cleanly.
     out_repr = repr(str(out_path))
     public_repr = repr(str(public_out_path))
-    key_id_value = key_id or "REPLACE_ME"
+    # Round 9 LOW: sanitize the key-id value rendered in the "paste this
+    # into source code" template. Parse-time validation already refuses
+    # control bytes; this is defense in depth.
+    key_id_value = _sanitize_for_terminal(key_id) if key_id else "REPLACE_ME"
     click.echo(
         "  In your pipeline / app code:\n"
         "    from signet.server.receipt import Ed25519ReceiptSigner\n"
@@ -492,7 +776,10 @@ def doctor(
         failed = True
 
     if upstream_url:
-        click.echo(f"\nprobing upstream: {upstream_url}")
+        # Round 7 LOW: ``upstream_url`` can come from a hostile ``.env``
+        # picked up by ``_doctor_autodetect``, and httpx's exceptions
+        # echo the URL bytes back to us verbatim. Sanitize both surfaces.
+        click.echo(f"\nprobing upstream: {_sanitize_for_terminal(upstream_url)}")
         try:
             resp = httpx.get(
                 upstream_url.rstrip("/") + "/models", timeout=5.0, follow_redirects=True
@@ -502,11 +789,20 @@ def doctor(
             else:
                 click.secho(f"  upstream returned HTTP {resp.status_code}", fg="yellow")
         except httpx.HTTPError as exc:
-            click.secho(f"  upstream unreachable: {type(exc).__name__}: {exc}", fg="red")
+            click.secho(
+                f"  upstream unreachable: {type(exc).__name__}: {_sanitize_for_terminal(exc)}",
+                fg="red",
+            )
+            failed = True
+        except httpx.InvalidURL as exc:  # pragma: no cover -- defense in depth
+            click.secho(
+                f"  upstream URL rejected: {_sanitize_for_terminal(exc)}",
+                fg="red",
+            )
             failed = True
 
     if signet_url:
-        click.echo(f"\nprobing signet:   {signet_url}")
+        click.echo(f"\nprobing signet:   {_sanitize_for_terminal(signet_url)}")
         base = signet_url.rstrip("/")
         try:
             health = httpx.get(f"{base}/health", timeout=5.0)
@@ -516,7 +812,10 @@ def doctor(
                 click.secho(f"  /health         unexpected ({health.status_code})", fg="red")
                 failed = True
         except httpx.HTTPError as exc:
-            click.secho(f"  /health         unreachable: {exc}", fg="red")
+            click.secho(
+                f"  /health         unreachable: {_sanitize_for_terminal(exc)}",
+                fg="red",
+            )
             failed = True
             # Fall through to the rest of the doctor flow -- each
             # subsequent probe will surface its own failure and the
@@ -528,9 +827,18 @@ def doctor(
 
         try:
             ver = httpx.get(f"{base}/version", timeout=5.0).json()
-            click.secho(f"  /version        signet {ver.get('version', '?')}", fg="green")
+            # Round 7 MED: sanitize the upstream-supplied version string
+            # before echo so a malicious peer cannot inject terminal
+            # escape sequences via the JSON response body.
+            ver_str = (
+                _sanitize_for_terminal(ver.get("version", "?")) if isinstance(ver, dict) else "?"
+            )
+            click.secho(f"  /version        signet {ver_str}", fg="green")
         except httpx.HTTPError as exc:
-            click.secho(f"  /version        unreachable: {exc}", fg="red")
+            click.secho(
+                f"  /version        unreachable: {_sanitize_for_terminal(exc)}",
+                fg="red",
+            )
             failed = True
 
         # No-owner probe: should be refused if OwnerResolutionCheck is
@@ -558,8 +866,26 @@ def doctor(
                     fg="yellow",
                 )
         except httpx.HTTPError as exc:
-            click.secho(f"  no-owner probe  errored: {exc}", fg="red")
+            # Round 9 MED: httpx error text echoes the URL bytes; the
+            # URL can come from a hostile env-derived
+            # ``SIGNET_UPSTREAM_URL``. Sanitize to match the pattern
+            # Round 8 applied to the other three httpx.HTTPError sites
+            # in this function.
+            click.secho(
+                f"  no-owner probe  errored: {_sanitize_for_terminal(exc)}",
+                fg="red",
+            )
             failed = True
+
+        # F-R5-B: probe-corpus drift detection. A stale signet install on
+        # the operator's machine ships fewer (or different) probes than
+        # the current canonical set, so ``--probe-injection`` would
+        # under-test the running proxy. Emit a yellow WARN -- not a
+        # failure -- so CI doesn't turn red on every minor-version skew,
+        # but the operator knows to upgrade.
+        drift = _check_probe_corpus_drift()
+        if drift is not None:
+            click.secho(f"  probe corpus    WARN: {drift}", fg="yellow")
 
     if not upstream_url and not signet_url:
         click.echo("\n(pass --upstream <url> and/or --self <url> to probe endpoints)")
@@ -577,6 +903,142 @@ def doctor(
             failed = True
 
     sys.exit(1 if failed else 0)
+
+
+#: F-R5-B: canonical probe IDs the current signet release ships. Keep in
+#: sync with :data:`signet.cli_helpers.probe_injection_corpus.PROMPT_INJECTION_PROBE_CORPUS`.
+#: This list is the ground truth the doctor checks the installed corpus
+#: against -- if a downgraded install has fewer entries (e.g., 21 instead
+#: of 23), the doctor warns rather than silently under-testing.
+#:
+#: R9 expansion: the original 23-entry baseline (R7 + Round-8 follow-ons)
+#: grew to 44 with the nested-base64 / depth-3 polyglot / base32hex /
+#: base36 / base58 / base62 / MIME-base64-with-newlines /
+#: hex-with-separators / Greek-cluster / cipher-overlay (reverse / atbash /
+#: Caesar-N) / gzip-url-percent / markdown-split / backslash-split /
+#: Punycode / quoted-printable additions.
+_CANONICAL_PROBE_IDS: tuple[str, ...] = (
+    "plain_ignore_previous",
+    "cyrillic_confusable",
+    "stretched_whitespace",
+    "zero_width_inserts",
+    "base64_encoded",
+    "rot13_encoded",
+    "base32_encoded",
+    "hex_encoded",
+    "dan_persona_attack",
+    "rot13_english_prefix_bypass",
+    "truncation_tail_bypass",
+    "base64_unpadded_bypass",
+    "base32_lowercase_bypass",
+    "base85_bypass",
+    "ascii85_bypass",
+    "url_percent_bypass",
+    "html_decimal_entity_bypass",
+    "html_hex_entity_bypass",
+    "unicode_escape_bypass",
+    "b64_rot13_polyglot_bypass",
+    "rot13_b64_polyglot_bypass",
+    "gzip_hex_bypass",
+    "zlib_b64_bypass",
+    # R9 additions (data-only sync; the corpus IDs are the source of truth).
+    "nested_b64_depth2_bypass",
+    "nested_b64_depth3_bypass",
+    "b64_rot13_b64_polyglot_bypass",
+    "b85_b64_rot13_polyglot_bypass",
+    "rot13_b85_b64_polyglot_bypass",
+    "base32hex_bypass",
+    "base36_bypass",
+    "base58_bypass",
+    "base62_bypass",
+    "mime_base64_newlines_bypass",
+    "hex_spaced_bypass",
+    "hex_0x_commas_bypass",
+    "greek_cluster_homoglyph_bypass",
+    "reverse_string_bypass",
+    "atbash_bypass",
+    "caesar_5_bypass",
+    "gzip_url_percent_bypass",
+    "markdown_emphasis_bypass",
+    "backslash_split_bypass",
+    "punycode_bypass",
+    "quoted_printable_bypass",
+    # R11 additions (F-R11-1 byte-budget exhaustion, F-R11-2 ES6 curly-
+    # brace escapes, F-R11-3 depth-4+, F-R11-4 non-Latin homoglyphs).
+    # Data-only sync — the canonical source of truth is the corpus
+    # module; the doctor uses this list only for the install-drift check.
+    "byte_budget_exhaustion_bypass",
+    "es6_curly_brace_escape_bypass",
+    "es6_x_curly_brace_escape_bypass",
+    "b64_depth_4_bypass",
+    "b64_depth_7_bypass",
+    "non_latin_homoglyph_bypass",
+    # R13 additions (F-R13-1 per-depth budget tier-0/1, F-R13-2 depth
+    # 9+, F-R13-3 missing Latin confusables, F-R13-4 UUencode channel,
+    # F-R13-5 reverse-then-b64 cipher overlay). Same data-only sync
+    # contract as the R9/R11 blocks above.
+    "byte_budget_exhaustion_100k_bypass",
+    "b64_depth_12_bypass",
+    "latin_iota_homoglyph_bypass",
+    "latin_polyglot_homoglyph_bypass",
+    "uuencode_bypass",
+    "reverse_then_b64_bypass",
+    "atbash_then_b64_bypass",
+    # R16 additions (F-R14-5 missing confusables documented in R13,
+    # F-R14-6 jailbreak-keyword). Same data-only sync contract as
+    # the earlier blocks above — the corpus module is the source of
+    # truth; this list exists only for the install-drift check.
+    "devanagari_zero_homoglyph_bypass",
+    "greek_lambda_homoglyph_bypass",
+    "jailbreak_standalone_bypass",
+    # R18 additions (P0 boundary-bypass closure, MED jailbreak space-
+    # split, MED decimal-codepoint channel, HIGH lowercase Greek
+    # confusables). Same data-only sync contract as earlier rounds.
+    "boundary_bypass_ignore_glued",
+    "boundary_bypass_disregard_glued",
+    "boundary_bypass_forget_glued",
+    "boundary_bypass_jailbreak_glued",
+    "boundary_bypass_developer_mode_glued",
+    "boundary_bypass_no_restrictions_glued",
+    "jailbreak_space_split_bypass",
+    "jailbreak_hyphen_split_bypass",
+    "decimal_codepoint_space_bypass",
+    "decimal_codepoint_comma_bypass",
+    "lowercase_greek_sigma_homoglyph_bypass",
+    "lowercase_greek_omega_homoglyph_bypass",
+)
+
+
+def _check_probe_corpus_drift() -> str | None:
+    """Return a human-readable drift message, or ``None`` if the corpus is
+    aligned with :data:`_CANONICAL_PROBE_IDS`.
+
+    Compares the installed corpus length and entry ``name`` set against
+    the canonical set. The doctor surfaces the result as a yellow WARN
+    line; this is a stale-install signal, not a broken-install failure,
+    so the doctor does NOT exit non-zero on drift.
+    """
+    from signet.cli_helpers.probe_injection_corpus import (
+        PROMPT_INJECTION_PROBE_CORPUS,
+    )
+
+    canonical = set(_CANONICAL_PROBE_IDS)
+    installed_ids = {probe.name for probe in PROMPT_INJECTION_PROBE_CORPUS}
+    installed_count = len(PROMPT_INJECTION_PROBE_CORPUS)
+    canonical_count = len(_CANONICAL_PROBE_IDS)
+
+    if installed_count == canonical_count and installed_ids == canonical:
+        return None
+
+    missing = sorted(canonical - installed_ids)
+    extra = sorted(installed_ids - canonical)
+    parts = [f"probe corpus has {installed_count} entries, expected {canonical_count}"]
+    if missing:
+        parts.append(f"missing: {', '.join(missing)}")
+    if extra:
+        parts.append(f"unexpected: {', '.join(extra)}")
+    parts.append("your signet install may be stale.")
+    return "; ".join(parts)
 
 
 def _run_probe_injection_corpus(signet_url: str) -> bool:
@@ -637,7 +1099,8 @@ def _run_probe_injection_corpus(signet_url: str) -> bool:
             )
         except httpx.HTTPError as exc:
             click.secho(
-                f"  [{probe.name:<24}] errored: {type(exc).__name__}: {exc}",
+                f"  [{probe.name:<24}] errored: {type(exc).__name__}: "
+                f"{_sanitize_for_terminal(exc)}",
                 fg="red",
             )
             leaked = True
@@ -645,7 +1108,12 @@ def _run_probe_injection_corpus(signet_url: str) -> bool:
 
         # Decide pass/fail. The "shadow-mode block" path is the only
         # case where 200 is acceptable.
-        shadow_decision = resp.headers.get("X-Signet-Shadow-Decision", "")
+        #
+        # Round 7 MED: ``shadow_decision`` and ``firing_check`` are both
+        # supplied by the proxy being probed; if that proxy is a hostile
+        # impostor it may try to embed ANSI / OSC escape sequences in
+        # those values. Sanitize before interpolation.
+        shadow_decision = _sanitize_for_terminal(resp.headers.get("X-Signet-Shadow-Decision", ""))
         firing_check = _probe_firing_check(resp)
         if resp.status_code == 403 or resp.status_code == 202:
             click.secho(
@@ -655,8 +1123,7 @@ def _run_probe_injection_corpus(signet_url: str) -> bool:
             )
         elif resp.status_code == 200 and shadow_decision == "block":
             click.secho(
-                f"  [{probe.name:<24}] shadow-blocked "
-                f"(check={firing_check or 'redacted'})",
+                f"  [{probe.name:<24}] shadow-blocked (check={firing_check or 'redacted'})",
                 fg="green",
             )
         else:
@@ -700,10 +1167,15 @@ def _probe_firing_check(resp: Any) -> str | None:
     (shadow mode), then at the response JSON body's ``check`` field
     (only populated when ``--no-strict-error-redaction`` is on the
     target). Returns ``None`` when neither channel surfaces it.
+
+    Round 7 MED: the returned value is interpolated into terminal
+    output by the doctor's ``--probe-injection`` flow, so we sanitize
+    ASCII control bytes here -- a hostile proxy could otherwise embed
+    escape sequences in either channel.
     """
     name = resp.headers.get("X-Signet-Shadow-Decision-Check")
     if name:
-        return str(name)
+        return _sanitize_for_terminal(name)
     try:
         body = resp.json()
     except (ValueError, AttributeError):
@@ -711,7 +1183,7 @@ def _probe_firing_check(resp: Any) -> str | None:
     if isinstance(body, dict):
         check = body.get("check") or body.get("firing_check")
         if isinstance(check, str):
-            return check
+            return _sanitize_for_terminal(check)
     return None
 
 
@@ -770,7 +1242,12 @@ def audit_verify(
     summarize_cascades: bool,
 ) -> None:
     """Walk LOG_PATH and report any tampering."""
-    from signet.audit.backend import JsonlBackend, MalformedAuditEntry
+    # Round 23 LOW (F-R23-9): charset validation, mirroring
+    # ``keys generate-ed25519``. ``--key-id`` (or ``SIGNET_HMAC_KEY_ID``)
+    # is plumbed straight into operator-facing banners and the integrity
+    # message body, so the same strict ASCII allowlist applies.
+    _validate_key_id_charset(key_id, source="--key-id/SIGNET_HMAC_KEY_ID")
+    from signet.audit.backend import MalformedAuditEntry
     from signet.audit.keyring import Key, KeyRing
     from signet.audit.verifier import ChainVerifier, verify_with_archives
 
@@ -780,12 +1257,10 @@ def audit_verify(
             secret=_parse_hex_secret(hmac_secret, "--hmac-secret/SIGNET_HMAC_SECRET"),
         )
     )
-    backend = JsonlBackend(log_path)
+    backend = _open_jsonl_backend(log_path)
     try:
         if archive_dir is None:
-            report = ChainVerifier(
-                backend, keyring, compact_breaks=summarize_cascades
-            ).verify()
+            report = ChainVerifier(backend, keyring, compact_breaks=summarize_cascades).verify()
         else:
             report = verify_with_archives(
                 backend,
@@ -830,9 +1305,17 @@ def audit_verify(
         if report.total_entries == 0:
             click.secho("OK: 0 entries (chain is empty)", fg="green")
         else:
+            # Round 11 MED: ``last_known_good_hmac`` is sourced from
+            # ``entry.hmac`` which ``AuditEntry.from_dict`` only
+            # type-checks as ``str`` -- a tampered chain can carry
+            # control bytes here. Sanitize before echo so the success
+            # banner cannot leak escape sequences into the operator's
+            # terminal. ``b.kind.value`` (enum) and integers below are
+            # not attacker-controlled.
             click.secho(
                 f"OK: {report.total_entries} entries, chain intact "
-                f"(last hmac={report.last_known_good_hmac[:16]}...)",
+                f"(last hmac="
+                f"{_sanitize_for_terminal(report.last_known_good_hmac[:16])}...)",
                 fg="green",
             )
         return
@@ -842,8 +1325,21 @@ def audit_verify(
         fg="red",
         bold=True,
     )
+    # Round 11 MED: ``b.entry_id`` comes from ``AuditEntry.entry_id``
+    # which is only validated as a string -- a tampered audit row can
+    # plant control bytes (backspace, OSC title-set, BEL) that the
+    # terminal will interpret. ``b.detail`` likewise embeds
+    # attacker-controlled ``prev_hmac`` / ``hmac`` prefixes for the
+    # LINK_MISMATCH / SELF_MISMATCH / UNKNOWN_KEY / MISSING_KEY_ID
+    # kinds. Wrap both with ``_sanitize_for_terminal`` to match the
+    # Round 10 audit-tail / audit-report fixes. ``b.index`` is int and
+    # ``b.kind.value`` is an enum member, neither needs sanitization.
     for b in report.breaks[:50]:
-        click.echo(f"  line {b.index} [{b.kind.value}] entry={b.entry_id}: {b.detail}")
+        click.echo(
+            f"  line {b.index} [{b.kind.value}] "
+            f"entry={_sanitize_for_terminal(b.entry_id)}: "
+            f"{_sanitize_for_terminal(b.detail)}"
+        )
         hint = _verify_break_hint(b.kind.value)
         if hint:
             click.echo(f"      hint: {hint}")
@@ -903,9 +1399,9 @@ def audit_count(log_path: Path, group_by: str | None, as_json: bool) -> None:
     """
     from collections import Counter
 
-    from signet.audit.backend import JsonlBackend, MalformedAuditEntry
+    from signet.audit.backend import MalformedAuditEntry
 
-    backend = JsonlBackend(log_path)
+    backend = _open_jsonl_backend(log_path)
     if group_by is None:
         try:
             total = sum(1 for _ in backend.iter_entries())
@@ -920,16 +1416,24 @@ def audit_count(log_path: Path, group_by: str | None, as_json: bool) -> None:
     counts: Counter[str] = Counter()
     try:
         for entry in backend.iter_entries():
+            # Round 9 MED: group keys derived from attacker-controlled
+            # fields (check_name, owner string, stage from metadata) need
+            # sanitization before they enter the Counter, so both the
+            # tabular and the JSON branches render terminal-safe keys.
+            # The --json branch is also safe via json.dumps, but
+            # sanitizing once at insertion keeps the two outputs aligned.
+            # Enum-derived keys (decision.value, owner_type.value) are
+            # constrained by construction and don't need sanitizing.
             if group_by == "check":
-                counts[entry.check_name] += 1
+                counts[_sanitize_for_terminal(entry.check_name)] += 1
             elif group_by == "decision":
                 counts[entry.decision.value] += 1
             elif group_by == "owner":
-                counts[str(entry.owner)] += 1
+                counts[_sanitize_for_terminal(entry.owner)] += 1
             elif group_by == "owner_type":
                 counts[entry.owner.owner_type.value] += 1
             elif group_by == "stage":
-                stage = str(entry.metadata.get("_stage", "unknown"))
+                stage = _sanitize_for_terminal(entry.metadata.get("_stage", "unknown"))
                 counts[stage] += 1
     except MalformedAuditEntry as exc:
         raise _malformed_audit_to_click_exception(exc) from exc
@@ -961,7 +1465,7 @@ def audit_count(log_path: Path, group_by: str | None, as_json: bool) -> None:
 )
 def audit_tail(log_path: Path, n_lines: int, filter_expr: str | None, as_json: bool) -> None:
     """Show the last N entries from LOG_PATH (optionally filtered)."""
-    from signet.audit.backend import JsonlBackend, MalformedAuditEntry
+    from signet.audit.backend import MalformedAuditEntry
 
     # C7 (v0.1.7): validate filter field names up-front. Previously an
     # unknown field (``foo=bar``) silently filtered out every entry --
@@ -986,7 +1490,7 @@ def audit_tail(log_path: Path, n_lines: int, filter_expr: str | None, as_json: b
 
     from signet.core.audit import AuditEntry
 
-    backend = JsonlBackend(log_path)
+    backend = _open_jsonl_backend(log_path)
     matched: list[AuditEntry] = []
     try:
         for entry in backend.iter_entries():
@@ -1017,11 +1521,17 @@ def audit_tail(log_path: Path, n_lines: int, filter_expr: str | None, as_json: b
         if as_json:
             click.echo(json.dumps(entry.to_dict(), separators=(",", ":"), sort_keys=True))
         else:
-            ts_iso = _ns_to_iso(entry.ts_ns)
+            # Round 9 MED: every interpolated field is attacker-controlled
+            # (check_name / owner / reason can be smuggled in via metadata
+            # or upstream-derived values), so each one is sanitized before
+            # rendering to a terminal. The --json branch is already safe
+            # because json.dumps escapes control bytes.
+            ts_iso = _sanitize_for_terminal(_ns_to_iso(entry.ts_ns))
             click.echo(
-                f"{ts_iso}  {entry.decision.value:8s} "
-                f"{entry.check_name:20s} owner={entry.owner} "
-                f"reason={entry.reason}"
+                f"{ts_iso}  {_sanitize_for_terminal(entry.decision.value):8s} "
+                f"{_sanitize_for_terminal(entry.check_name):20s} "
+                f"owner={_sanitize_for_terminal(entry.owner)} "
+                f"reason={_sanitize_for_terminal(entry.reason)}"
             )
 
 
@@ -1048,9 +1558,15 @@ def _malformed_audit_to_click_exception(exc: Any) -> click.ClickException:
     backup as the canonical fix.
     """
     raw = exc.raw_line if isinstance(exc.raw_line, str) else str(exc.raw_line)
+    # Round 9 MED: the raw audit line is by definition not trusted JSON
+    # (we're inside the malformed-line branch), and the parse_error from
+    # stdlib json can include a slice of the malformed line. Both can
+    # carry ANSI / OSC bytes that would otherwise re-render directly on
+    # the operator's terminal when this ClickException is printed.
     return click.ClickException(
-        f"audit log line {exc.line_number} is malformed: {exc.parse_error}\n"
-        f"  raw line: {raw[:200]}\n"
+        f"audit log line {exc.line_number} is malformed: "
+        f"{_sanitize_for_terminal(exc.parse_error)}\n"
+        f"  raw line: {_sanitize_for_terminal(raw[:200])}\n"
         f"  fix: edit the file to remove or fix the bad line, "
         f"or restore from backup."
     )
@@ -1091,15 +1607,13 @@ def audit_show(entry_id: str, audit_log_path: Path) -> None:
 @click.option(
     "--before",
     required=True,
-    help="ISO 8601 UTC timestamp; entries with ts strictly < this are "
-    "compacted into the archive.",
+    help="ISO 8601 UTC timestamp; entries with ts strictly < this are compacted into the archive.",
 )
 @click.option(
     "--output",
     required=True,
     type=click.Path(dir_okay=False, path_type=Path),
-    help="Path to write the archive file. Parent directory is created "
-    "if missing.",
+    help="Path to write the archive file. Parent directory is created if missing.",
 )
 @click.option(
     "--hmac-secret",
@@ -1113,8 +1627,7 @@ def audit_show(entry_id: str, audit_log_path: Path) -> None:
     envvar="SIGNET_HMAC_KEY_ID",
     default="k1",
     show_default=True,
-    help="ID of the active key. The compaction marker is signed with "
-    "this key.",
+    help="ID of the active key. The compaction marker is signed with this key.",
 )
 @click.option(
     "--quiesce-confirm",
@@ -1145,6 +1658,11 @@ def audit_compact(
     The live chain MUST be quiesced first (no concurrent writers).
     Concurrent writes during compaction will corrupt the chain.
     """
+    # Round 23 LOW (F-R23-9): charset validation, mirroring
+    # ``keys generate-ed25519``. The compaction marker carries
+    # ``key_id`` so a hostile env var here would forge a poisoned
+    # marker even though the echo sites sanitize.
+    _validate_key_id_charset(key_id, source="--key-id/SIGNET_HMAC_KEY_ID")
     if not quiesce_confirm:
         raise click.ClickException(
             "audit compact REQUIRES --quiesce-confirm because the live "
@@ -1154,9 +1672,20 @@ def audit_compact(
             "proceeding."
         )
 
+    # Round 17 MED (F-R17-1) sweep: the ``--audit-log`` path passes
+    # through ``_open_jsonl_backend`` which already rejects Windows
+    # reserved device names. The ``--output`` archive path is normally
+    # safe because ``compact_audit_log`` does ``Path(output).resolve()``
+    # before writing -- the fully-qualified form is treated as a
+    # regular file by Win32. We still refuse the reserved-name shape
+    # here so the resulting archive is not a UX foot-gun (a file named
+    # ``CON`` is awkward to open or delete from Windows Explorer) and
+    # so the device-name guard fires consistently across every CLI
+    # surface that writes to an operator-supplied output path.
+    _reject_windows_reserved_device_name(output, kind="--output")
+
     from datetime import UTC, datetime
 
-    from signet.audit.backend import JsonlBackend
     from signet.audit.chain import HmacChain
     from signet.audit.compactor import compact_audit_log
     from signet.audit.keyring import Key, KeyRing
@@ -1167,8 +1696,7 @@ def audit_compact(
         before_dt = datetime.fromisoformat(before.replace("Z", "+00:00"))
     except ValueError as exc:
         raise click.ClickException(
-            f"--before {before!r} is not valid ISO 8601 ({exc}). "
-            "Try e.g. '2026-05-01T00:00:00Z'."
+            f"--before {before!r} is not valid ISO 8601 ({exc}). Try e.g. '2026-05-01T00:00:00Z'."
         ) from exc
     if before_dt.tzinfo is None:
         before_dt = before_dt.replace(tzinfo=UTC)
@@ -1179,7 +1707,9 @@ def audit_compact(
             secret=_parse_hex_secret(hmac_secret, "--hmac-secret/SIGNET_HMAC_SECRET"),
         )
     )
-    backend = JsonlBackend(audit_log_path)
+    from signet.audit.backend import MalformedAuditEntry
+
+    backend = _open_jsonl_backend(audit_log_path)
     chain = HmacChain(backend, keyring)
 
     # ``compact_audit_log`` raises ``FileExistsError`` when output
@@ -1191,6 +1721,11 @@ def audit_compact(
     # ``--force`` overrides the file-overwrite refusal but does NOT
     # silence the stacked-compaction ValueError (the marker check is a
     # data-integrity guard, not a UX nicety).
+    # Round-4 NEW-3: compact also walks the live JSONL via
+    # ``backend.iter_entries()``, so a mid-write truncated row would
+    # raise ``MalformedAuditEntry``. Mirror the v0.1.7 C6 contract used
+    # by every other audit subcommand: one-line operator-readable error,
+    # no traceback.
     try:
         result = compact_audit_log(
             chain=chain,
@@ -1201,9 +1736,10 @@ def audit_compact(
         )
     except FileExistsError as exc:
         raise click.ClickException(
-            f"refusing to overwrite existing archive at {output}; "
-            f"pass --force to override ({exc})"
+            f"refusing to overwrite existing archive at {output}; pass --force to override ({exc})"
         ) from exc
+    except MalformedAuditEntry as exc:
+        raise _malformed_audit_to_click_exception(exc) from exc
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -1312,6 +1848,11 @@ def audit_report(
     (anonymized by default), deltas vs the prior equivalent period,
     and the chain-integrity attestation when --hmac-secret is supplied.
     """
+    # Round 23 LOW (F-R23-9): charset validation, mirroring
+    # ``keys generate-ed25519``. The report header / integrity section
+    # renders ``key_id`` and would otherwise leak attacker-controlled
+    # bytes through banners if the env var is hostile.
+    _validate_key_id_charset(key_id, source="--key-id/SIGNET_HMAC_KEY_ID")
     from datetime import UTC, datetime
 
     if anonymize and not anonymize_salt:
@@ -1326,9 +1867,9 @@ def audit_report(
     prior_start = now - 2 * duration
     prior_end = window_start
 
-    from signet.audit.backend import JsonlBackend, MalformedAuditEntry
+    from signet.audit.backend import MalformedAuditEntry
 
-    backend = JsonlBackend(audit_log_path)
+    backend = _open_jsonl_backend(audit_log_path)
     cur_window: list[Any] = []
     prior_window: list[Any] = []
     try:
@@ -1399,6 +1940,29 @@ def audit_report(
     click.echo(_render_audit_report_markdown(payload))
 
 
+_MAX_DURATION_DAYS = 36500  # ~100 years; see ``_clamp_duration``.
+
+
+def _clamp_duration(td: Any, spec: str) -> Any:
+    """Reject duration windows larger than ~100 years.
+
+    Round-4 NEW-10: the report path computes ``now - duration`` and
+    ``now - 2 * duration``, which the standard library's ``datetime``
+    rejects with :class:`OverflowError` once the result drifts past
+    ``datetime.min``. Operators that fat-finger a giant ``--since``
+    (e.g. ``999999999d``) used to see a raw traceback. Clamping at the
+    parse step gives them a one-line actionable error and also pins a
+    sane upper bound that doubles cleanly without overflow on prior-
+    window computation.
+    """
+    if td.days > _MAX_DURATION_DAYS:
+        raise click.ClickException(
+            f"--since {spec!r} duration too large; maximum is 100 years "
+            f"({_MAX_DURATION_DAYS} days)."
+        )
+    return td
+
+
 def _parse_duration(spec: str) -> Any:
     """Parse a duration spec to a :class:`datetime.timedelta`.
 
@@ -1432,9 +1996,7 @@ def _parse_duration(spec: str) -> Any:
     # Suffix forms first -- the original v0.1.6 surface plus minutes
     # and weeks. Reject negatives and overflow before they reach
     # timedelta() (which would raise OverflowError on huge values).
-    suffix_match = re.fullmatch(
-        r"(\d+)\s*([mhdw])", raw, flags=re.IGNORECASE
-    )
+    suffix_match = re.fullmatch(r"(\d+)\s*([mhdw])", raw, flags=re.IGNORECASE)
     if suffix_match:
         n = int(suffix_match.group(1))
         unit = suffix_match.group(2).lower()
@@ -1445,11 +2007,10 @@ def _parse_duration(spec: str) -> Any:
             "w": 604800,
         }[unit]
         try:
-            return timedelta(seconds=n * factor_seconds)
+            td = timedelta(seconds=n * factor_seconds)
         except OverflowError as exc:
-            raise click.ClickException(
-                f"--since {spec!r} overflows timedelta: {exc}"
-            ) from exc
+            raise click.ClickException(f"--since {spec!r} overflows timedelta: {exc}") from exc
+        return _clamp_duration(td, spec)
 
     # ISO 8601 duration -- accept ``PnW`` or ``PnDTnHnMnS`` shapes.
     # Years/months are intentionally rejected because their length is
@@ -1464,22 +2025,20 @@ def _parse_duration(spec: str) -> Any:
         flags=re.IGNORECASE,
     )
     if iso_match and any(g is not None for g in iso_match.groups()):
-        weeks_grp, days_grp, hours_grp, minutes_grp, seconds_grp = (
-            iso_match.groups()
-        )
+        weeks_grp, days_grp, hours_grp, minutes_grp, seconds_grp = iso_match.groups()
         try:
             if weeks_grp is not None:
-                return timedelta(weeks=int(weeks_grp))
-            return timedelta(
-                days=int(days_grp) if days_grp else 0,
-                hours=int(hours_grp) if hours_grp else 0,
-                minutes=int(minutes_grp) if minutes_grp else 0,
-                seconds=float(seconds_grp) if seconds_grp else 0,
-            )
+                td = timedelta(weeks=int(weeks_grp))
+            else:
+                td = timedelta(
+                    days=int(days_grp) if days_grp else 0,
+                    hours=int(hours_grp) if hours_grp else 0,
+                    minutes=int(minutes_grp) if minutes_grp else 0,
+                    seconds=float(seconds_grp) if seconds_grp else 0,
+                )
         except OverflowError as exc:
-            raise click.ClickException(
-                f"--since {spec!r} overflows timedelta: {exc}"
-            ) from exc
+            raise click.ClickException(f"--since {spec!r} overflows timedelta: {exc}") from exc
+        return _clamp_duration(td, spec)
 
     raise click.ClickException(
         f"--since {spec!r} is not a valid duration; expected forms: "
@@ -1562,9 +2121,7 @@ def _maybe_anonymize_owner(owner_str: str, *, anonymize: bool, salt: str) -> str
     return f"owner_{h[:16]}"
 
 
-def _compute_deltas(
-    cur: dict[str, Any], prior: dict[str, Any]
-) -> dict[str, Any]:
+def _compute_deltas(cur: dict[str, Any], prior: dict[str, Any]) -> dict[str, Any]:
     """Compute "current vs prior" deltas the report renders.
 
     Two notable signals:
@@ -1637,9 +2194,7 @@ def _render_audit_report_markdown(payload: dict[str, Any]) -> str:
         f"**Range:** {_strip_utc_suffix(rng['start'])} -> "
         f"{_strip_utc_suffix(rng['end'])} UTC ({rng['duration']})"
     )
-    lines.append(
-        f"**Service:** signet {payload['signet_version']}{service_suffix}"
-    )
+    lines.append(f"**Service:** signet {payload['signet_version']}{service_suffix}")
     lines.append(f"**Total decisions:** {payload['total_decisions']:,}")
     lines.append("")
 
@@ -1663,10 +2218,13 @@ def _render_audit_report_markdown(payload: dict[str, Any]) -> str:
                 breakdown = ", ".join(f"{v} {k}" for k, v in sorted(by.items()))
                 detail = f"{row['firings']} firings ({breakdown})"
             else:
-                detail = (
-                    f"{row['firings']} firings, {row['distinct_owners']} distinct owners"
-                )
-            lines.append(f"{i}. `{row['name']}` -- {detail}")
+                detail = f"{row['firings']} firings, {row['distinct_owners']} distinct owners"
+            # Round 9 MED: row['name'] is check_name, attacker-controlled.
+            # Markdown itself doesn't interpret ANSI bytes, but operators
+            # routinely view the report through ``less`` / ``cat`` / pipe
+            # into chat -- all of which DO render the bytes. Sanitize
+            # before interpolation so the markdown output is terminal-safe.
+            lines.append(f"{i}. `{_sanitize_for_terminal(row['name'])}` -- {detail}")
     lines.append("")
 
     # A5 (v0.1.7): only mark the section header as "(anonymized)" when
@@ -1679,8 +2237,12 @@ def _render_audit_report_markdown(payload: dict[str, Any]) -> str:
         else:
             lines.append("## Top blocked owners")
         for i, row in enumerate(payload["top_blocked_owners"], start=1):
+            # Round 9 MED: owner string attacker-controlled when
+            # --no-anonymize is set. Sanitize for the same reason as the
+            # check name above.
             lines.append(
-                f"{i}. `{row['owner']}` -- {_pluralize_blocks(row['blocks'])}"
+                f"{i}. `{_sanitize_for_terminal(row['owner'])}` -- "
+                f"{_pluralize_blocks(row['blocks'])}"
             )
         lines.append("")
     else:
@@ -1693,23 +2255,22 @@ def _render_audit_report_markdown(payload: dict[str, Any]) -> str:
         pct = d["pct_delta"]
         if pct is None or pct == 0.0:
             continue
+        # Round 9 MED: d['name'] is check_name, attacker-controlled.
+        name_safe = _sanitize_for_terminal(d["name"])
         if pct == float("inf"):
             lines.append(
-                f"- `{d['name']}` firings NEW in this window "
-                f"({d['current']} firings; prior=0)"
+                f"- `{name_safe}` firings NEW in this window ({d['current']} firings; prior=0)"
             )
         else:
             arrow = "up" if pct > 0 else "down"
             lines.append(
-                f"- `{d['name']}` firings {arrow} {abs(pct):.0f}% "
-                f"({d['prior']} -> {d['current']})"
+                f"- `{name_safe}` firings {arrow} {abs(pct):.0f}% ({d['prior']} -> {d['current']})"
             )
         rendered_any = True
     new_owners = deltas.get("new_blocked_owners", [])
     if new_owners:
         lines.append(
-            f"- New blocked owners: {len(new_owners)} first-time appearances "
-            "in the top-10"
+            f"- New blocked owners: {len(new_owners)} first-time appearances in the top-10"
         )
         rendered_any = True
     if not rendered_any:
@@ -1877,30 +2438,34 @@ def plugins_list(group: str, as_json: bool) -> None:
             click.echo("  (none)")
             continue
         seen_any = True
-        # Compute aligned columns. ``name`` and ``package`` have the
-        # widest variance.
-        name_w = max(len(p.name) for p in rows)
-        pkg_w = max(len(_render_pkg(p)) for p in rows)
-        for p in rows:
-            pkg = _render_pkg(p)
+        # Round 9 MED: plugin metadata (entry-point name, distribution,
+        # version, load error text) is attacker-influenceable -- a
+        # typosquatted plugin can carry ANSI bytes in any of those
+        # fields. Sanitize every attribute before interpolation so the
+        # CLI render path is terminal-safe. The width computation must
+        # use the sanitized strings too or the column padding will be
+        # off-by-N (where N is the expansion of the textual ``\xNN``
+        # form).
+        sanitized_names = [_sanitize_for_terminal(p.name) for p in rows]
+        sanitized_pkgs = [_render_pkg(p) for p in rows]
+        name_w = max(len(n) for n in sanitized_names)
+        pkg_w = max(len(pkg) for pkg in sanitized_pkgs)
+        for p, name_safe, pkg in zip(rows, sanitized_names, sanitized_pkgs, strict=True):
             abi_seg = ""
             if grp == "signet.checks":
                 abi = p.abi_declared if p.abi_declared is not None else "?"
-                abi_seg = f"ABI {abi:<3}"
+                abi_seg = f"ABI {_sanitize_for_terminal(abi):<3}"
             status_seg = _render_plugin_status(p)
-            line = f"  {p.name:<{name_w}}  {pkg:<{pkg_w}}  {abi_seg:<8}{status_seg}".rstrip()
+            line = f"  {name_safe:<{name_w}}  {pkg:<{pkg_w}}  {abi_seg:<8}{status_seg}".rstrip()
             color = (
-                "green"
-                if p.status == "loaded"
-                else "red"
-                if p.status == "load_error"
-                else "yellow"
+                "green" if p.status == "loaded" else "red" if p.status == "load_error" else "yellow"
             )
             click.secho(line, fg=color)
 
     if not seen_any and group == "all":
-        click.echo("\n(no plugins discovered; install signet plugin packages "
-                   "to populate this list)")
+        click.echo(
+            "\n(no plugins discovered; install signet plugin packages to populate this list)"
+        )
 
 
 @plugins.command("doctor")
@@ -1940,11 +2505,7 @@ def plugins_doctor(as_json: bool) -> None:
     seen: dict[tuple[str, str], list[Any]] = {}
     for p in plugins_found:
         seen.setdefault((p.group, p.name), []).append(p)
-    duplicates = {
-        (group, name): rows
-        for (group, name), rows in seen.items()
-        if len(rows) > 1
-    }
+    duplicates = {(group, name): rows for (group, name), rows in seen.items() if len(rows) > 1}
 
     # Plugins that failed to come up at all.
     failed = [p for p in plugins_found if p.status != "loaded"]
@@ -1978,13 +2539,14 @@ def plugins_doctor(as_json: bool) -> None:
 
     issues = 0
     if duplicates:
-        click.secho(
-            f"DUPLICATE PLUGIN NAMES ({len(duplicates)})", fg="red", bold=True
-        )
+        click.secho(f"DUPLICATE PLUGIN NAMES ({len(duplicates)})", fg="red", bold=True)
         for (group, name), rows in sorted(duplicates.items()):
+            # Round 9 MED: plugin name + packages are attacker-influenceable.
             packages = ", ".join(_render_pkg(r) for r in rows)
             click.secho(
-                f"  [{group}] {name} registered by: {packages}", fg="red"
+                f"  [{_sanitize_for_terminal(group)}] "
+                f"{_sanitize_for_terminal(name)} registered by: {packages}",
+                fg="red",
             )
         issues += len(duplicates)
         click.echo("")
@@ -1996,9 +2558,14 @@ def plugins_doctor(as_json: bool) -> None:
             bold=True,
         )
         for p in failed:
+            # Round 9 MED: every interpolated attribute (group, name,
+            # package, status, error) can carry ANSI bytes from a
+            # hostile plugin's metadata or ImportError text.
             click.secho(
-                f"  [{p.group}] {p.name} ({_render_pkg(p)}): "
-                f"{p.status} -- {p.error or 'unknown'}",
+                f"  [{_sanitize_for_terminal(p.group)}] "
+                f"{_sanitize_for_terminal(p.name)} ({_render_pkg(p)}): "
+                f"{_sanitize_for_terminal(p.status)} -- "
+                f"{_sanitize_for_terminal(p.error or 'unknown')}",
                 fg="red",
             )
         issues += len(failed)
@@ -2025,26 +2592,36 @@ def _render_pkg(p: Any) -> str:
     Empty package strings happen for dynamically-registered entry
     points (test fixtures, in-process registration). Render those as
     ``-`` so the column never collapses.
+
+    Round 9 MED: package + version are derived from installed
+    distribution metadata, which a hostile/typosquatted plugin can
+    inject ANSI bytes into. Sanitize before returning so callers can
+    interpolate the result into terminal output without re-checking.
     """
-    pkg = p.package or "-"
-    ver = p.package_version or ""
+    pkg = _sanitize_for_terminal(p.package or "-")
+    ver = _sanitize_for_terminal(p.package_version or "")
     return f"{pkg} {ver}".strip() if pkg != "-" else "-"
 
 
 def _render_plugin_status(p: Any) -> str:
-    """Format the status column for one plugin."""
+    """Format the status column for one plugin.
+
+    Round 9 MED: error text + ABI declarations originate in plugin
+    code / metadata and may carry ANSI control bytes. Sanitize before
+    returning the column.
+    """
     if p.status == "loaded":
         return "loaded"
     if p.status == "incompatible_abi":
         # Use the structured error if present; otherwise synthesize.
         err = p.error or (
-            f"declares CHECK_ABI_VERSION={p.abi_declared}; "
-            f"signet requires {p.abi_required}"
+            f"declares CHECK_ABI_VERSION={_sanitize_for_terminal(p.abi_declared)}; "
+            f"signet requires {_sanitize_for_terminal(p.abi_required)}"
         )
-        return f"incompatible_abi: {err}"
+        return f"incompatible_abi: {_sanitize_for_terminal(err)}"
     if p.status == "load_error":
-        return f"load_error: {p.error or 'unknown'}"
-    return p.status  # forward-compat for new statuses
+        return f"load_error: {_sanitize_for_terminal(p.error or 'unknown')}"
+    return _sanitize_for_terminal(p.status)  # forward-compat for new statuses
 
 
 @main.command()
@@ -2073,8 +2650,7 @@ def _render_plugin_status(p: Any) -> str:
     default="k1",
     show_default=True,
     envvar="SIGNET_HMAC_KEY_ID",
-    help="ID of the active key to verify against when --hmac-secret "
-    "is provided.",
+    help="ID of the active key to verify against when --hmac-secret is provided.",
 )
 def replay(
     entry_id: str,
@@ -2093,6 +2669,12 @@ def replay(
     Equivalent to ``signet audit show <id>`` (which remains as the
     canonical alias). Exit 0 if found, 1 if not.
     """
+    # Round 23 LOW (F-R23-9): charset validation, mirroring
+    # ``keys generate-ed25519``. The replay output interpolates
+    # ``entry_key_id`` from the keyring fallback into the hmac
+    # verification annotation; validating up-front keeps the asymmetry
+    # closed between every ``--key-id`` flag in the CLI.
+    _validate_key_id_charset(key_id, source="--key-id/SIGNET_HMAC_KEY_ID")
     _replay_pretty_print(
         entry_id=entry_id,
         audit_log_path=audit_log_path,
@@ -2102,13 +2684,13 @@ def replay(
 
 
 def _show_entry(entry_id: str, audit_log_path: Path) -> None:
-    from signet.audit.backend import JsonlBackend, MalformedAuditEntry
+    from signet.audit.backend import MalformedAuditEntry
 
     # UUIDs are case-insensitive per RFC 4122; operators paste from
     # logs with whatever case the source rendered them in. Normalize
     # both sides to lowercase for the compare.
     target = entry_id.strip().lower()
-    backend = JsonlBackend(audit_log_path)
+    backend = _open_jsonl_backend(audit_log_path)
     try:
         for entry in backend.iter_entries():
             if entry.entry_id.lower() == target:
@@ -2138,11 +2720,11 @@ def _replay_pretty_print(
     import hashlib
     import hmac as _hmac
 
-    from signet.audit.backend import JsonlBackend, MalformedAuditEntry
+    from signet.audit.backend import MalformedAuditEntry
     from signet.audit.chain import KEY_ID_FIELD, _serialize_for_signing
 
     target = entry_id.strip().lower()
-    backend = JsonlBackend(audit_log_path)
+    backend = _open_jsonl_backend(audit_log_path)
     found = None
     try:
         for entry in backend.iter_entries():
@@ -2162,7 +2744,21 @@ def _replay_pretty_print(
     hmac_suffix = ""
     if hmac_secret:
         secret = _parse_hex_secret(hmac_secret, "--hmac-secret/SIGNET_HMAC_SECRET")
-        entry_key_id = str(found.metadata.get(KEY_ID_FIELD, key_id))
+        # Round 25 MED (F-R25-2): ``found.metadata[KEY_ID_FIELD]`` is
+        # attacker-controlled (the operator is reaching for ``signet
+        # replay`` precisely to inspect a suspect entry). Every other
+        # interpolated value in this function is wrapped in
+        # ``_sanitize_for_terminal`` (per R7 / R14 / R23-5 closures);
+        # ``entry_key_id`` was the one slot the sanitizer was not
+        # applied to. A tampered ``_signing_key_id`` containing ANSI
+        # bytes (e.g. ``"\x1b[2J\x1bcEVIL"``) would otherwise leak
+        # through to the operator's terminal as the literal escape
+        # sequence, matching the class of finding the broader R7 / R14
+        # sweeps retired elsewhere. The CLI-supplied ``key_id`` fallback
+        # is already validated by ``_validate_key_id_charset`` (R23-9),
+        # but routing both branches through the sanitizer keeps the
+        # invariant uniform.
+        entry_key_id = _sanitize_for_terminal(str(found.metadata.get(KEY_ID_FIELD, key_id)))
         try:
             payload = _serialize_for_signing(found)
             recomputed = _hmac.new(secret, payload, hashlib.sha256).hexdigest()
@@ -2178,16 +2774,23 @@ def _replay_pretty_print(
 
     # Render aligned label: value rows. Width chosen to line up the
     # documented fields.
+    #
+    # Round 7 MED: ``reason``, ``check_name``, and ``owner`` are all
+    # populated by checks / server code that may carry attacker-
+    # influenced fragments (e.g. an exception message that echoes a
+    # request body slice). Run every interpolated value through the
+    # terminal-escape sanitizer so ``signet replay`` cannot be turned
+    # into a title-rewrite / clipboard-hijack primitive.
     rows: list[tuple[str, str]] = [
-        ("entry_id", found.entry_id),
-        ("ts", ts_iso),
-        ("owner", str(found.owner)),
+        ("entry_id", _sanitize_for_terminal(found.entry_id)),
+        ("ts", _sanitize_for_terminal(ts_iso)),
+        ("owner", _sanitize_for_terminal(found.owner)),
         # ``_stage`` is the convention used elsewhere (audit count, tail) for
         # surfacing the pipeline stage out of metadata. Fall back to "-".
-        ("stage", str(found.metadata.get("_stage", "-"))),
-        ("check", found.check_name),
-        ("decision", found.decision.value),
-        ("reason", found.reason),
+        ("stage", _sanitize_for_terminal(found.metadata.get("_stage", "-"))),
+        ("check", _sanitize_for_terminal(found.check_name)),
+        ("decision", _sanitize_for_terminal(found.decision.value)),
+        ("reason", _sanitize_for_terminal(found.reason)),
     ]
     label_width = max(len(label) for label, _ in rows) + 1  # ":"
     for label, value in rows:
@@ -2212,9 +2815,29 @@ def _replay_pretty_print(
         # Inner alignment for the metadata sub-rows.
         meta_label_w = max((len(k) for k in visible_meta), default=0) + 1
         for k, v in visible_meta.items():
-            click.echo(f"  {(k + ':').ljust(meta_label_w)}  {v}")
+            # Round 7 MED: metadata values come from arbitrary check /
+            # server code paths and can carry attacker-influenced bytes
+            # (upstream Content-Type, exception messages, tool names).
+            # ``json.dumps`` is the cleanest stringifier here -- it
+            # matches the on-disk representation that ``audit show``
+            # already echoes safely. With ``ensure_ascii=False`` it
+            # escapes C0 controls (0x00-0x1F) as ``\\uNNNN`` per JSON
+            # spec, but it does NOT escape Unicode bidi controls,
+            # paragraph / line separators, BOM, or C1 controls.
+            # Round 14 INFO: those gaps are closed by the extended
+            # ``_sanitize_for_terminal`` table (Trojan Source +
+            # 8-bit-CSI), so the two-step pipeline (json.dumps with
+            # ensure_ascii=False, then sanitize) now preserves legitimate
+            # non-ASCII display while neutralizing the deception vectors
+            # that reach the operator's terminal via ``signet replay``.
+            rendered = json.dumps(v, ensure_ascii=False, default=str)
+            rendered = _sanitize_for_terminal(rendered)
+            click.echo(f"  {(_sanitize_for_terminal(k) + ':').ljust(meta_label_w)}  {rendered}")
         if chain_meta_keys:
-            click.echo(f"  (chain-internal: {', '.join(sorted(chain_meta_keys))})")
+            click.echo(
+                "  (chain-internal: "
+                f"{', '.join(_sanitize_for_terminal(k) for k in sorted(chain_meta_keys))})"
+            )
 
     click.echo(f"{('hmac:').ljust(label_width)}    {hmac_short}{hmac_suffix}")
     sys.exit(0)
@@ -2262,6 +2885,15 @@ def init(target_dir: Path) -> None:
        ``--config pipeline.py`` for local iteration).
     3. In another terminal, ``python client_example.py``.
     """
+    # Round 19 LOW (F-R19-3): refuse Windows reserved device names at
+    # the CLI boundary so ``signet init CON`` (and friends) produce a
+    # clean ``ClickException`` instead of a raw ``NotADirectoryError:
+    # [WinError 267]`` traceback from ``Path.mkdir``. Mirrors the R17
+    # closures at the audit-log, keys-gen, and audit-compact output
+    # surfaces -- the helper's check is on basename shape and is
+    # correct for both file and directory targets.
+    _reject_windows_reserved_device_name(target_dir, kind="TARGET_DIR")
+
     target_dir.mkdir(parents=True, exist_ok=True)
 
     pipeline_path = target_dir / "pipeline.py"
@@ -2276,22 +2908,53 @@ def init(target_dir: Path) -> None:
         (gitignore_path, _GITIGNORE_TEMPLATE),
     ]
 
+    def _path_already_present(p: Path) -> bool:
+        # Round 7 LOW: ``Path.exists`` returns False on a dangling
+        # symlink, which means a local attacker who pre-plants a
+        # symlink at e.g. ``pipeline.py -> /etc/somewhere`` would slip
+        # past the overwrite guard below. ``is_symlink`` (or
+        # ``os.path.lexists`` -- same thing) closes the gap.
+        return p.exists() or p.is_symlink()
+
     # If every scaffolded file already exists, the operator is calling
     # init on an already-initialized directory -- refuse so we don't
     # silently no-op. Mirrors the v0.1.6 contract that an existing
     # ``pipeline.py`` is load-bearing.
-    if all(path.exists() for path, _ in files):
-        click.secho(
-            f"refusing to overwrite existing {pipeline_path}", fg="yellow"
-        )
+    if all(_path_already_present(path) for path, _ in files):
+        click.secho(f"refusing to overwrite existing {pipeline_path}", fg="yellow")
         sys.exit(1)
 
     wrote_any = False
     for path, content in files:
-        if path.exists():
-            click.secho(f"  skipped (already exists): {path}", fg="yellow")
+        if _path_already_present(path):
+            # Be explicit when a symlink is what's blocking us so the
+            # operator knows their tree is in an unexpected shape.
+            if path.is_symlink():
+                click.secho(
+                    f"  skipped (refusing to write through symlink): {path}",
+                    fg="yellow",
+                )
+            else:
+                click.secho(f"  skipped (already exists): {path}", fg="yellow")
             continue
-        path.write_text(content, encoding="utf-8")
+        # Use ``O_CREAT | O_EXCL`` so we refuse to follow any final-
+        # component symlink that was created between the
+        # ``_path_already_present`` check above and this open() call.
+        # ``O_EXCL`` makes the open atomic with respect to that race.
+        try:
+            fd = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o644,
+            )
+        except FileExistsError:
+            click.secho(
+                f"  skipped (refusing to write through symlink): {path}",
+                fg="yellow",
+            )
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
         click.secho(f"  wrote {path}", fg="green")
         wrote_any = True
 
@@ -2319,16 +2982,27 @@ def init(target_dir: Path) -> None:
     "--requests",
     "request_count",
     default=1000,
-    type=int,
+    # Round 14 INFO: cap the upper bound. ``run_bench`` materializes one
+    # asyncio task per request up front (``bench.py:780, 837``) -- the
+    # ``Semaphore(concurrency)`` correctly bounds in-flight HTTP /
+    # pipeline work but does NOT bound the number of pending task
+    # objects. For ``--requests 1_000_000`` memory grows linearly into
+    # the gigabyte range while adding no meaningful percentile signal
+    # over the 1000-sample baseline. Refuse with a clear click range
+    # error rather than letting the bench OOM the operator's machine.
+    type=click.IntRange(min=1, max=1_000_000),
     show_default=True,
-    help="Total number of synthetic requests to drive through the pipeline.",
+    help="Total number of synthetic requests to drive through the pipeline. "
+    "Must be in [1, 1_000_000]. The bench materializes one task per "
+    "request up front, so an upper bound caps memory growth -- meaningful "
+    "tail-percentile signal levels off well below the cap.",
 )
 @click.option(
     "--concurrency",
     default=10,
-    type=int,
+    type=click.IntRange(min=1),
     show_default=True,
-    help="Maximum in-flight requests at once.",
+    help="Maximum in-flight requests at once. Must be >= 1.",
 )
 @click.option(
     "--config",
@@ -2418,16 +3092,23 @@ def bench(
 
     pipeline = load_pipeline_or_default(config_path)
 
-    report = asyncio.run(
-        run_bench(
-            pipeline,
-            upstream_url=upstream_url,
-            requests=request_count,
-            concurrency=concurrency,
-            baseline=not no_baseline,
-            mock_upstream=mock_upstream,
+    # click.IntRange already validates --requests/--concurrency at parse
+    # time, but run_bench also enforces its own contract for programmatic
+    # callers. Wrap the ValueError it raises so a future internal misuse
+    # surfaces as a one-line click error instead of a raw traceback.
+    try:
+        report = asyncio.run(
+            run_bench(
+                pipeline,
+                upstream_url=upstream_url,
+                requests=request_count,
+                concurrency=concurrency,
+                baseline=not no_baseline,
+                mock_upstream=mock_upstream,
+            )
         )
-    )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     if output_format == "markdown":
         click.echo(report.render_markdown(), nl=False)
@@ -2688,8 +3369,13 @@ def _doctor_autodetect(
             value = _read_env_var(candidate, "SIGNET_UPSTREAM_URL")
             if value:
                 upstream_url = value
+                # Round 7 LOW: a hostile .env in the operator's CWD can
+                # carry ANSI / OSC escape sequences; sanitize before
+                # echoing to stderr so doctor's preflight banner can't
+                # rewrite the operator's terminal title.
                 click.echo(
-                    f"(doctor: auto-detected --upstream={value} from {candidate})",
+                    f"(doctor: auto-detected --upstream="
+                    f"{_sanitize_for_terminal(value)} from {candidate})",
                     err=True,
                 )
                 break
@@ -2736,6 +3422,64 @@ def _read_env_var(path: Path, key: str) -> str | None:
             v = v.split(" #", 1)[0].rstrip()
         return v or None
     return None
+
+
+# Round 23 LOW (F-R23-9): the R15 F-R15-3 closure tightened the parse-
+# time guard on ``signet keys generate-ed25519 --key-id`` to a strict
+# ``[A-Za-z0-9_.:\-]+`` allowlist, but the other four ``--key-id`` flag
+# sites (``audit verify``, ``audit report``, ``audit compact``, and the
+# top-level ``replay`` command) inherit the same ``SIGNET_HMAC_KEY_ID``
+# env var WITHOUT the validation. A hostile operator environment
+# (compromised CI runner, a malicious .envrc, a copy-pasted env block
+# from a phishing message) could set ``SIGNET_HMAC_KEY_ID=$'\x1b[2J'``
+# (terminal clear) or a Unicode bidi-override and have it leak into
+# the colored error / info banners on the read path. The echo sites
+# all sanitize via ``_sanitize_for_terminal`` so the runtime impact
+# is bounded -- but promoting the parse-time guard to every ``--key-id``
+# option closes the asymmetry between the write surface (key
+# generation) and the read surfaces (verify / report / compact /
+# replay) uniformly.
+def _validate_key_id_charset(key_id: str, *, source: str = "--key-id") -> str:
+    """Validate a ``--key-id`` value against the strict charset allowlist.
+
+    The allowlist mirrors the R15 ``keys generate-ed25519`` parse-time
+    guard: ``[A-Za-z0-9_.:\\-]+``. Key IDs in practice are short ASCII
+    identifiers (``prod-2024-01``, ``kms-rotated-foo``), so the charset
+    is more than sufficient; rejecting Unicode at the parser is cleaner
+    than depending on the echo-site sanitizer to neutralize bidi /
+    control bytes after they have already flowed into log lines.
+
+    Returns the (unchanged) ``key_id`` on success. Raises
+    ``click.ClickException`` on empty / non-conforming input.
+
+    Args:
+        key_id: The candidate key identifier.
+        source: Human-readable name of the flag (e.g. ``"--key-id"``
+            or ``"SIGNET_HMAC_KEY_ID"``) for the error message.
+    """
+    import re as _re
+
+    if not key_id:
+        raise click.ClickException(f"{source} must not be empty")
+    if not _re.fullmatch(r"[A-Za-z0-9_.:\-]+", key_id):
+        # Report the first offending codepoint so the operator can
+        # locate the problem (e.g. an invisible trailing space from a
+        # copy-paste). Render the value through ``_sanitize_for_terminal``
+        # so the error message itself cannot inject ANSI / bidi into
+        # the terminal.
+        offending: str | None = None
+        for ch in key_id:
+            if not _re.fullmatch(r"[A-Za-z0-9_.:\-]", ch):
+                offending = ch
+                break
+        offending_repr = f"U+{ord(offending):04X}" if offending is not None else "?"
+        raise click.ClickException(
+            f"{source} must match [A-Za-z0-9_.:-]+ (got "
+            f"{_sanitize_for_terminal(key_id)!r}; first invalid "
+            f"codepoint {offending_repr}); key IDs are short ASCII "
+            "identifiers like 'prod-2024-01'"
+        )
+    return key_id
 
 
 def _parse_hex_secret(value: str, source: str) -> bytes:
@@ -2789,12 +3533,17 @@ def _load_pipeline_from_path(path: Path) -> Pipeline:
     try:
         spec.loader.exec_module(module)
     except SyntaxError as exc:
+        # Round 9 LOW: user-supplied config files are documented arbitrary
+        # code execution, but the error formatter should still scrub
+        # control bytes -- a *buggy* (not malicious) config that surfaces
+        # an HTTP response in its error message can carry ANSI without
+        # either party intending it.
         raise click.ClickException(
-            f"syntax error in {path}: {exc.msg} at line {exc.lineno}"
+            f"syntax error in {path}: {_sanitize_for_terminal(exc.msg)} at line {exc.lineno}"
         ) from exc
     except ImportError as exc:
         raise click.ClickException(
-            f"failed to import {path}: {exc}"
+            f"failed to import {path}: {_sanitize_for_terminal(exc)}"
         ) from exc
     except click.ClickException:
         # Don't double-wrap -- _load_pipeline_from_path may be called
@@ -2802,7 +3551,7 @@ def _load_pipeline_from_path(path: Path) -> Pipeline:
         raise
     except Exception as exc:
         raise click.ClickException(
-            f"failed to load {path}: {type(exc).__name__}: {exc}"
+            f"failed to load {path}: {type(exc).__name__}: {_sanitize_for_terminal(exc)}"
         ) from exc
     from signet.core.pipeline import Pipeline as _Pipeline
 

@@ -22,6 +22,7 @@ oracle) cannot halt the proxy.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable, Iterable
 from typing import Protocol
@@ -29,6 +30,8 @@ from typing import Protocol
 from signet.core.check import Check, CheckResult
 from signet.core.context import RequestContext, ResponseContext, ToolCallContext
 from signet.core.stage import Stage
+
+logger = logging.getLogger("signet.core.pipeline")
 
 
 class _HistogramObserver(Protocol):
@@ -145,10 +148,80 @@ class Pipeline:
         check runs and every result is returned. RECORD checks are
         audit-only -- they cannot modify the already-delivered response --
         so the pipeline collects all of them for the audit chain.
+
+        R7 HIGH (RECORD-stage-exception-breaks-audit-contract): each
+        per-check call is wrapped in a try/except so one raising check
+        cannot kill the batch. A raising check is converted to a
+        synthetic ``CheckResult.block(...)`` audit row (decision
+        ``block``, reason names the exception) and the next check runs
+        unconditionally. This honors the docstring contract that every
+        RECORD check runs and every result is returned, and prevents a
+        hostile or flaky plugin from selectively suppressing the audit
+        rows of co-located checks. The upstream HTTP path (``app.py``
+        ``_handle_chat``) still cannot observe an exception from this
+        method, so a flaky RECORD plugin no longer causes a 502 after
+        the model has already produced a successful response.
+
+        R9 LOW (audit-row-naming): the synthetic result carries
+        ``_record_error=True`` AND a ``_audit_row_name`` metadata key
+        set to ``"pipeline.record.error"``. Audit consumers that know
+        to look for the sentinel can emit a distinct row name for the
+        synthetic block, separating "the check decided to block" from
+        "the check crashed and we synthesized a block". Consumers that
+        do not look at the sentinel fall back to the original check
+        name via ``_check_name`` — no contract change.
+
+        R11 LOW (F-R11-6 base-exception-breaks-audit-batch): the
+        ``except Exception`` clause leaks ``BaseException`` subclasses
+        (``SystemExit``, ``KeyboardInterrupt``, custom
+        ``BaseException`` subclasses) out of the audit batch, which
+        violates the docstring contract that every RECORD check runs.
+        A hostile or buggy plugin that raises ``SystemExit`` would
+        suppress the audit rows of every co-located RECORD check.
+        Pipeline orchestration MUST not be killable by a plugin
+        signal: we catch ``BaseException`` here so the audit batch
+        always completes, write a synthetic block row, and continue.
+        NOTE: this also catches operator ``KeyboardInterrupt`` during
+        the per-check dispatch, but the surrounding asyncio loop will
+        re-deliver Ctrl+C on the next yield -- and a Ctrl+C delivered
+        precisely during a check's ``post_complete`` is far less
+        common than a misbehaving plugin. The trade-off favors audit
+        completeness over Ctrl+C responsiveness in this narrow window.
         """
         results: list[CheckResult] = []
         for check in self.checks_for_stage(Stage.RECORD):
-            result = await self._dispatch(check, "post_complete", check.post_complete(ctx))
+            try:
+                result = await self._dispatch(check, "post_complete", check.post_complete(ctx))
+            # F-R13-7: ``asyncio.CancelledError`` is the asyncio task-
+            # cancellation signal — re-raise it so graceful shutdown,
+            # request-deadline cancellation, and graceful-restart paths
+            # that cancel outstanding tasks can actually terminate a
+            # pipeline mid-RECORD-pass. PEP 654 / the asyncio docs are
+            # clear: ``CancelledError`` is not a normal exception and
+            # MUST propagate. Catching it here would let a slow RECORD
+            # check defeat shutdown coordination.
+            except asyncio.CancelledError:
+                raise
+            # F-R11-6: catch BaseException so a plugin raising SystemExit
+            # / KeyboardInterrupt / a custom BaseException cannot
+            # suppress the audit rows of co-located RECORD checks.
+            # Audit contract: this method MUST never raise.
+            except BaseException as exc:  # audit contract: never raise
+                logger.exception(
+                    "pipeline.record check %r raised; recording as synthetic block "
+                    "(audit row name: pipeline.record.error)",
+                    check.name,
+                )
+                synthetic = CheckResult.block(
+                    f"record-stage check {check.name!r} raised {type(exc).__name__}: {exc}",
+                    error_class=type(exc).__name__,
+                    error_message=str(exc),
+                    _record_error=True,
+                    _audit_row_name="pipeline.record.error",
+                    _failing_check_name=check.name,
+                )
+                results.append(_annotate(synthetic, check))
+                continue
             results.append(_annotate(result, check))
         return results
 

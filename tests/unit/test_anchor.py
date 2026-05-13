@@ -17,6 +17,7 @@ import pytest
 
 from signet.audit.anchor import (
     ANCHOR_FIELD,
+    AnchorProtocolError,
     AnchorReceipt,
     NoopAnchor,
     Rfc3161Anchor,
@@ -217,3 +218,132 @@ class TestRfc3161AnchorOffline:
         import base64
 
         assert base64.b64decode(receipt.receipt) == FakeResp.content
+
+
+class TestAnchorProtocolError:
+    """F-R5-A: malformed backend responses raise a single domain exception.
+
+    Before the fix, a backend that returned an object missing the
+    expected ``raise_for_status`` / ``content`` attributes (or with a
+    non-``bytes`` ``content``) would surface as a raw ``AttributeError``
+    / ``TypeError`` mid-call, leaking a Python traceback to operators.
+    The new :class:`AnchorProtocolError` is the single, informative
+    type callers see.
+    """
+
+    def test_rfc3161_response_missing_content_raises_protocol_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        anchor = Rfc3161Anchor(tsa_url="http://fake-tsa/tsr")
+
+        class BadResp:
+            # No ``content`` attribute at all.
+            def raise_for_status(self) -> None:
+                return None
+
+        monkeypatch.setattr(httpx, "post", lambda *a, **kw: BadResp())
+        with pytest.raises(AnchorProtocolError) as exc_info:
+            anchor.anchor_hmac("a" * 64)
+        err = exc_info.value
+        assert err.backend == "rfc3161"
+        assert err.field == "content"
+        assert "BadResp" in str(err)
+
+    def test_rfc3161_response_content_wrong_type_raises_protocol_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        anchor = Rfc3161Anchor(tsa_url="http://fake-tsa/tsr")
+
+        class StrContentResp:
+            content = "this should be bytes, not str"
+
+            def raise_for_status(self) -> None:
+                return None
+
+        monkeypatch.setattr(httpx, "post", lambda *a, **kw: StrContentResp())
+        with pytest.raises(AnchorProtocolError) as exc_info:
+            anchor.anchor_hmac("a" * 64)
+        err = exc_info.value
+        assert err.field == "content"
+        # Informative: identifies what type WAS seen.
+        assert "str" in err.detail
+        # Does not leak the raw payload (which might be large/binary).
+        assert "this should be bytes" not in str(err)
+
+    def test_rfc3161_response_missing_raise_for_status_raises_protocol_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        anchor = Rfc3161Anchor(tsa_url="http://fake-tsa/tsr")
+
+        class NoRaiseForStatusResp:
+            content = b"ok"
+            # No ``raise_for_status`` method.
+
+        monkeypatch.setattr(httpx, "post", lambda *a, **kw: NoRaiseForStatusResp())
+        with pytest.raises(AnchorProtocolError) as exc_info:
+            anchor.anchor_hmac("a" * 64)
+        assert exc_info.value.field == "raise_for_status"
+
+    def test_rfc3161_raise_for_status_not_callable_raises_protocol_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        anchor = Rfc3161Anchor(tsa_url="http://fake-tsa/tsr")
+
+        class BadCallableResp:
+            content = b"ok"
+            raise_for_status = "not a method"  # type: ignore[assignment]
+
+        monkeypatch.setattr(httpx, "post", lambda *a, **kw: BadCallableResp())
+        with pytest.raises(AnchorProtocolError) as exc_info:
+            anchor.anchor_hmac("a" * 64)
+        assert exc_info.value.field == "raise_for_status"
+        assert "callable" in exc_info.value.detail
+
+    def test_chain_handles_non_anchor_receipt_return_value(
+        self, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        """A custom backend that returns ``None`` (not an AnchorReceipt)
+        is translated into a failure-flagged entry, not a Python crash."""
+        from dataclasses import dataclass
+
+        @dataclass
+        class _BogusAnchor:
+            name: str = "bogus"
+
+            def anchor_hmac(self, hmac_hex: str):  # type: ignore[no-untyped-def]
+                # Wrong shape: not an AnchorReceipt.
+                return {"backend": "bogus", "success": True}
+
+        chain = HmacChain(backend, keyring, anchor=_BogusAnchor())
+        appended = chain.append(_entry("bogus-return"))
+        # Entry written, but flagged as anchor failure -- chain still
+        # verifies internally.
+        assert appended.metadata[ANCHOR_FIELD]["success"] is False
+        assert "AnchorReceipt" in appended.metadata[ANCHOR_FIELD]["error"]
+        assert "dict" in appended.metadata[ANCHOR_FIELD]["error"]
+        assert ChainVerifier(backend, keyring).verify().ok
+
+    def test_chain_require_anchor_success_raises_on_bogus_return(
+        self, backend: JsonlBackend, keyring: KeyRing
+    ) -> None:
+        """With ``require_anchor_success=True``, a non-AnchorReceipt
+        return value raises :class:`AnchorProtocolError` directly."""
+        from dataclasses import dataclass
+
+        @dataclass
+        class _BogusAnchor:
+            name: str = "bogus"
+
+            def anchor_hmac(self, hmac_hex: str):  # type: ignore[no-untyped-def]
+                return object()
+
+        chain = HmacChain(
+            backend,
+            keyring,
+            anchor=_BogusAnchor(),
+            require_anchor_success=True,
+        )
+        with pytest.raises(AnchorProtocolError) as exc_info:
+            chain.append(_entry("must-anchor"))
+        assert exc_info.value.backend == "bogus"
+        assert exc_info.value.field == "<return value>"

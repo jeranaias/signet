@@ -146,9 +146,7 @@ class _Histogram:
             base_labels = list(label_tuple)
             for i, upper in enumerate(self.buckets):
                 bucket_labels = [*base_labels, ("le", _format_bucket(upper))]
-                labels_str = (
-                    "{" + ",".join(f'{k}="{_escape(v)}"' for k, v in bucket_labels) + "}"
-                )
+                labels_str = "{" + ",".join(f'{k}="{_escape(v)}"' for k, v in bucket_labels) + "}"
                 out.append(f"{self.name}_bucket{labels_str} {slot[i]}")
             inf_labels = [*base_labels, ("le", "+Inf")]
             inf_labels_str = "{" + ",".join(f'{k}="{_escape(v)}"' for k, v in inf_labels) + "}"

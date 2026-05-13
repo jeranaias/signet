@@ -74,12 +74,12 @@ from signet.core.stage import Stage
 # concrete type so the fallback ``re`` path doesn't accidentally
 # swallow unrelated ``TimeoutError`` instances raised elsewhere.
 try:  # pragma: no cover - import-time branch
-    import regex as _regex_module
+    import regex as _regex_module  # type: ignore[import-untyped]
 
     _HAS_REGEX_TIMEOUT = True
     _RegexTimeoutError: type[BaseException] = TimeoutError
 except ImportError:  # pragma: no cover - import-time branch
-    _regex_module = re  # type: ignore[assignment]
+    _regex_module = re
     _HAS_REGEX_TIMEOUT = False
 
     class _NeverRaisedTimeout(Exception):
@@ -117,9 +117,7 @@ class Pattern:
         if self.action not in ("block", "redact"):
             raise ValueError(f"action must be 'block' or 'redact', got {self.action!r}")
         if self.timeout_seconds <= 0:
-            raise ValueError(
-                f"timeout_seconds must be > 0, got {self.timeout_seconds!r}"
-            )
+            raise ValueError(f"timeout_seconds must be > 0, got {self.timeout_seconds!r}")
 
 
 def _compile_patterns(patterns: Iterable[Pattern]) -> tuple[tuple[Pattern, Any], ...]:
@@ -135,7 +133,7 @@ def _compile_patterns(patterns: Iterable[Pattern]) -> tuple[tuple[Pattern, Any],
     for p in patterns:
         try:
             compiled = _regex_module.compile(p.pattern)
-        except (_regex_module.error, re.error) as exc:  # type: ignore[attr-defined]
+        except (_regex_module.error, re.error) as exc:
             raise ValueError(f"invalid regex for pattern {p.label!r}: {exc}") from exc
         out.append((p, compiled))
     return tuple(out)
@@ -207,9 +205,7 @@ def _scan(
     return tuple(results)
 
 
-def _extract_input_text(
-    body: dict[str, Any], roles: tuple[str, ...] | None = None
-) -> str:
+def _extract_input_text(body: dict[str, Any], roles: tuple[str, ...] | None = None) -> str:
     """Best-effort extraction of human-readable text from an OpenAI-shaped
     request body. Concatenates content of every message; ignores tool calls
     and other non-text fields.

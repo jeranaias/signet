@@ -60,6 +60,54 @@ from signet.core.stage import Stage
 # JSON, and CSV renderers stay aligned with the bench logic.
 STAGE_LABELS: tuple[str, ...] = ("ADMISSION", "INSPECTION", "COMMITMENT", "RECORD")
 
+
+# Round 9 LOW: mirror ``signet.cli._sanitize_for_terminal`` so the
+# markdown / notes renderers can scrub ASCII control bytes out of
+# operator-supplied strings (``--upstream`` URL, network error text)
+# without taking a CLI import. Tab is preserved -- it's legitimate in
+# many strings and harmless to a terminal renderer.
+#
+# Round 14 INFO: extended to also escape Unicode classes that pass
+# through ASCII-only sanitization but still render in modern terminals
+# -- C1 controls, bidi overrides / isolates (Trojan Source), line and
+# paragraph separators, and BOM. Mirrors the same table in
+# ``signet.cli`` and ``signet.plugins.discovery``. See the cli.py copy
+# for the full rationale.
+_CONTROL_BYTE_REPLACEMENTS: dict[int, str] = {b: f"\\x{b:02x}" for b in range(0x20)}
+_CONTROL_BYTE_REPLACEMENTS[0x7F] = "\\x7f"
+_CONTROL_BYTE_REPLACEMENTS.pop(0x09, None)
+_UNICODE_CONTROL_CODEPOINTS: tuple[int, ...] = (
+    *range(0x80, 0xA0),  # C1 controls
+    *range(0x202A, 0x202F),  # bidi overrides
+    *range(0x2066, 0x206A),  # bidi isolates
+    0x2028,  # LINE SEPARATOR
+    0x2029,  # PARAGRAPH SEPARATOR
+    0xFEFF,  # ZWNBSP / BOM
+)
+for _cp in _UNICODE_CONTROL_CODEPOINTS:
+    _CONTROL_BYTE_REPLACEMENTS[_cp] = f"\\u{_cp:04x}"
+del _cp
+
+
+def _sanitize_for_terminal(value: object) -> str:
+    """Render *value* as a terminal-safe string.
+
+    Round 14 INFO: covers ASCII control bytes (< 0x20 except ``\\t``,
+    plus 0x7F) AND Unicode bidi overrides / isolates, C1 controls, line
+    and paragraph separators, and BOM. Escapes are ``\\xNN`` for ASCII
+    and ``\\uNNNN`` for Unicode. See ``signet.cli._sanitize_for_terminal``
+    for the full rationale.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    # Round 29 MED (F-R29-1): unbound ``str.translate`` bypasses any
+    # hostile ``str``-subclass ``translate`` override. Matches the
+    # ``str.__str__(value)`` pattern used by R26-R28 plugin helpers.
+    return str.translate(value, _CONTROL_BYTE_REPLACEMENTS)
+
+
 # Canonical synthetic request body used by the bench harness when
 # the caller doesn't supply one. Shaped like an OpenAI chat-completion
 # request because that's the wire format signet is gating; using a
@@ -187,7 +235,10 @@ class BenchReport:
         out.write("signet bench - overhead report\n")
         out.write("==============================\n")
         out.write("Setup:\n")
-        out.write(f"  upstream:     {self.upstream_url}")
+        # Round 9 LOW: ``--upstream`` is operator-supplied per invocation;
+        # an operator who copy-pastes a bench report into a doc / chat
+        # would otherwise carry hostile ANSI through. Sanitize.
+        out.write(f"  upstream:     {_sanitize_for_terminal(self.upstream_url)}")
         if self.baseline_samples:
             bp50 = self.percentile(self.baseline_samples, 50) * 1000
             bp99 = self.percentile(self.baseline_samples, 99) * 1000
@@ -209,9 +260,7 @@ class BenchReport:
 
         # Per-stage table.
         out.write("Per-request overhead (signet pipeline only, excluding upstream):\n")
-        out.write(
-            f"  {'Stage':<12} {'p50':>8} {'p95':>8} {'p99':>8} {'max':>9}\n"
-        )
+        out.write(f"  {'Stage':<12} {'p50':>8} {'p95':>8} {'p99':>8} {'max':>9}\n")
         for stage in STAGE_LABELS:
             vals = self.stage_durations(stage)
             if not any(vals):
@@ -219,11 +268,7 @@ class BenchReport:
                 # zero row so the operator can see the pipeline shape
                 # at a glance.
                 count = self.pipeline_stage_counts.get(stage, 0)
-                tail = (
-                    "  (no checks in this stage)"
-                    if count == 0
-                    else "  (no work this run)"
-                )
+                tail = "  (no checks in this stage)" if count == 0 else "  (no work this run)"
                 out.write(
                     f"  {stage:<12} {'0.0ms':>8} {'0.0ms':>8} {'0.0ms':>8} {'0.0ms':>9}{tail}\n"
                 )
@@ -232,9 +277,7 @@ class BenchReport:
             p95 = self.percentile(vals, 95) * 1000
             p99 = self.percentile(vals, 99) * 1000
             mx = max(vals) * 1000
-            out.write(
-                f"  {stage:<12} {p50:>7.2f}ms {p95:>7.2f}ms {p99:>7.2f}ms {mx:>8.2f}ms\n"
-            )
+            out.write(f"  {stage:<12} {p50:>7.2f}ms {p95:>7.2f}ms {p99:>7.2f}ms {mx:>8.2f}ms\n")
         totals = self.pipeline_totals()
         if totals:
             tp50 = self.percentile(totals, 50) * 1000
@@ -260,9 +303,7 @@ class BenchReport:
                 p50 = self.percentile(vals, 50) * 1000
                 p95 = self.percentile(vals, 95) * 1000
                 p99 = self.percentile(vals, 99) * 1000
-                out.write(
-                    f"  {label:<12} {p50:>7.0f}ms {p95:>7.0f}ms {p99:>7.0f}ms\n"
-                )
+                out.write(f"  {label:<12} {p50:>7.0f}ms {p95:>7.0f}ms {p99:>7.0f}ms\n")
             # Overhead row.
             d50 = (
                 self.percentile(totals, 50)
@@ -292,19 +333,23 @@ class BenchReport:
             for name in names:
                 durs = self.check_durations(name)
                 stage = self.check_stage(name)
+                # Round 11 LOW: ``name`` is the ``Check.name`` class
+                # attribute; a hostile plugin Check wired into
+                # pipeline.py can carry OSC / control bytes here. JSON /
+                # CSV renderers escape via json.dumps / csv.writer, but
+                # markdown / pretty mode would interpolate raw. Sanitize
+                # for parity with the Round 10 plugins-list fixes.
+                safe_name = _sanitize_for_terminal(name)
                 if not durs:
                     out.write(
-                        f"  {name:<28} {'-':>8} {'-':>8} {'-':>8}  "
+                        f"  {safe_name:<28} {'-':>8} {'-':>8} {'-':>8}  "
                         f"({stage.lower()} - did not fire)\n"
                     )
                     continue
                 fires_per_s = len(durs) / duration
                 p50 = self.percentile(durs, 50) * 1000
                 p99 = self.percentile(durs, 99) * 1000
-                out.write(
-                    f"  {name:<28} {fires_per_s:>8.1f} "
-                    f"{p50:>7.2f}ms {p99:>7.2f}ms\n"
-                )
+                out.write(f"  {safe_name:<28} {fires_per_s:>8.1f} {p50:>7.2f}ms {p99:>7.2f}ms\n")
             out.write("\n")
 
         if self.notes:
@@ -332,8 +377,7 @@ class BenchReport:
             "pipeline_stage_counts": self.pipeline_stage_counts,
             "pipeline_total_ms": _percentile_block(totals),
             "stages": {
-                stage: _percentile_block(self.stage_durations(stage))
-                for stage in STAGE_LABELS
+                stage: _percentile_block(self.stage_durations(stage)) for stage in STAGE_LABELS
             },
             "checks": {
                 name: {
@@ -344,9 +388,7 @@ class BenchReport:
                 for name in self.check_names()
             },
             "baseline_ms": (
-                _percentile_block(self.baseline_samples)
-                if self.baseline_samples
-                else None
+                _percentile_block(self.baseline_samples) if self.baseline_samples else None
             ),
             "notes": list(self.notes),
         }
@@ -361,9 +403,7 @@ class BenchReport:
         """
         out = io.StringIO()
         writer = csv.writer(out, lineterminator="\n")
-        writer.writerow(
-            ["kind", "name", "stage", "fires", "p50_ms", "p95_ms", "p99_ms", "max_ms"]
-        )
+        writer.writerow(["kind", "name", "stage", "fires", "p50_ms", "p95_ms", "p99_ms", "max_ms"])
         for stage in STAGE_LABELS:
             vals = self.stage_durations(stage)
             writer.writerow(
@@ -380,11 +420,20 @@ class BenchReport:
             )
         for name in self.check_names():
             durs = self.check_durations(name)
+            # Round 14 INFO: ``name`` is the ``Check.name`` class
+            # attribute and ``check_stage`` resolves to the ``Stage``
+            # enum value (controlled). ``csv.writer`` quotes commas /
+            # newlines but passes raw ASCII control bytes through, so a
+            # hostile plugin can land OSC bytes in the CSV name column.
+            # An operator piping ``signet bench --format csv`` through
+            # ``cat`` / ``less -R`` would render those. Mirror the R12
+            # markdown-path fix at bench.py:323 for parity. (``stage`` is
+            # an enum value, so sanitization is defense-in-depth.)
             writer.writerow(
                 [
                     "check",
-                    name,
-                    self.check_stage(name),
+                    _sanitize_for_terminal(name),
+                    _sanitize_for_terminal(self.check_stage(name)),
                     len(durs),
                     _ms_or_blank(self.percentile(durs, 50)),
                     _ms_or_blank(self.percentile(durs, 95)),
@@ -478,14 +527,11 @@ def parse_gate_spec(spec: str) -> list[GateRule]:
         match = _GATE_RULE_RE.match(token)
         if not match:
             raise ValueError(
-                f"invalid --gate rule {token!r}; expected e.g. 'p95=10ms', "
-                "'p99=0.02s'"
+                f"invalid --gate rule {token!r}; expected e.g. 'p95=10ms', 'p99=0.02s'"
             )
         pct = int(match.group("pct"))
         if not 0 < pct < 100:
-            raise ValueError(
-                f"invalid percentile in --gate rule {token!r}: must be 1..99"
-            )
+            raise ValueError(f"invalid percentile in --gate rule {token!r}: must be 1..99")
         num = float(match.group("num"))
         unit = match.group("unit").lower()
         if unit == "ms":
@@ -537,9 +583,7 @@ def format_gate_outcome(outcome: GateOutcome) -> str:
     if outcome.passed:
         lines = ["gate: PASS"]
         for rule in outcome.rules:
-            lines.append(
-                f"  p{rule.percentile}: <= {rule.threshold_seconds * 1000:.2f}ms"
-            )
+            lines.append(f"  p{rule.percentile}: <= {rule.threshold_seconds * 1000:.2f}ms")
         return "\n".join(lines) + "\n"
     lines = ["gate: FAIL"]
     for rule, observed in outcome.failures:
@@ -736,6 +780,7 @@ async def _measure_upstream_baseline(
     sem = asyncio.Semaphore(concurrency)
 
     async with httpx.AsyncClient(timeout=timeout_s) as client:
+
         async def one() -> tuple[float | None, str | None]:
             async with sem:
                 start = time.perf_counter()
@@ -820,14 +865,16 @@ async def run_bench(
             upstream_url, baseline_n, concurrency
         )
         if err and not baseline_samples:
+            # Round 9 LOW: ``err`` is the network-layer exception text
+            # which echoes the hostile URL. Sanitize on append.
             notes.append(
-                f"upstream baseline skipped: {err}. Pipeline-only numbers "
-                "below remain valid."
+                f"upstream baseline skipped: {_sanitize_for_terminal(err)}. "
+                "Pipeline-only numbers below remain valid."
             )
         elif err:
             notes.append(
                 f"upstream baseline partial ({len(baseline_samples)}/{baseline_n} "
-                f"succeeded): {err}"
+                f"succeeded): {_sanitize_for_terminal(err)}"
             )
     elif mock_upstream:
         notes.append("--mock-upstream: upstream calls skipped entirely.")
@@ -882,9 +929,7 @@ class _MockInspectionCheck(Check):
     name = "mock_inspection"
     stage = Stage.INSPECTION
 
-    async def inspect_response_chunk(
-        self, ctx: ResponseContext, chunk: str
-    ) -> CheckResult:
+    async def inspect_response_chunk(self, ctx: ResponseContext, chunk: str) -> CheckResult:
         return CheckResult.allow()
 
 

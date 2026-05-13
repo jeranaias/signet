@@ -71,22 +71,16 @@ class _FakeStreamResponse:
         self._chunks = chunks
         self._raise_mid_stream = raise_mid_stream
         self._raise_after_chunks = raise_after_chunks
-        self.headers: dict[str, str] = headers if headers is not None else {
-            "content-type": "text/event-stream"
-        }
+        self.headers: dict[str, str] = (
+            headers if headers is not None else {"content-type": "text/event-stream"}
+        )
 
     async def aiter_bytes(self) -> AsyncIterator[bytes]:
         for i, chunk in enumerate(self._chunks):
-            if (
-                self._raise_mid_stream is not None
-                and i >= self._raise_after_chunks
-            ):
+            if self._raise_mid_stream is not None and i >= self._raise_after_chunks:
                 raise self._raise_mid_stream("upstream tore down the stream")
             yield chunk
-        if (
-            self._raise_mid_stream is not None
-            and self._raise_after_chunks >= len(self._chunks)
-        ):
+        if self._raise_mid_stream is not None and self._raise_after_chunks >= len(self._chunks):
             raise self._raise_mid_stream("upstream tore down the stream")
 
 
@@ -142,9 +136,7 @@ def _make_app(
     return app, TestClient(app.app)
 
 
-def _post_stream(
-    client: TestClient, body: dict[str, Any], headers: dict[str, str] | None = None
-):
+def _post_stream(client: TestClient, body: dict[str, Any], headers: dict[str, str] | None = None):
     return client.post(
         "/v1/chat/completions",
         json={"stream": True, **body},
@@ -195,13 +187,8 @@ class TestClassificationLeakAfterPad:
     """A long benign prefix must NOT prevent inspection from firing on a
     later chunk that carries a classification marker."""
 
-    def test_marker_after_50_pad_chunks_blocks(
-        self, monkeypatch, tmp_path
-    ) -> None:
-        chunks = [
-            _content_chunk("benign payload chunk " * 5)
-            for _ in range(50)
-        ]
+    def test_marker_after_50_pad_chunks_blocks(self, monkeypatch, tmp_path) -> None:
+        chunks = [_content_chunk("benign payload chunk " * 5) for _ in range(50)]
         chunks.append(_content_chunk("(S//NF) classified marker"))
         chunks.append(_content_chunk(" must not appear"))
         chunks.append(b"data: [DONE]\n\n")
@@ -221,10 +208,7 @@ class TestClassificationLeakAfterPad:
         payloads = _split_sse(r.text)
         # Classified marker / sentinel must not appear in any forwarded
         # content frame.
-        content_frames = [
-            p for p in payloads
-            if p != "[DONE]" and "signet_abort" not in p
-        ]
+        content_frames = [p for p in payloads if p != "[DONE]" and "signet_abort" not in p]
         assert not any("(S//NF)" in p for p in content_frames)
         assert not any("must not appear" in p for p in content_frames)
         # Abort frame fired.
@@ -241,9 +225,7 @@ class TestStrictPreservesUpstreamProtocolViolation:
     transport reasons survive so SDKs can branch on retry vs.
     policy-refused."""
 
-    def test_remote_protocol_error_survives_strict(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_remote_protocol_error_survives_strict(self, monkeypatch, tmp_path) -> None:
         _patch_upstream_stream(
             monkeypatch,
             chunks=[_content_chunk("hi")],
@@ -272,9 +254,7 @@ class TestNonHttpxExceptionEmitsAbort:
     """A bare ``RuntimeError`` from a misconfigured transport must
     produce a structured abort frame, not an opaque hang or 500."""
 
-    def test_runtime_error_yields_upstream_exception_token(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_runtime_error_yields_upstream_exception_token(self, monkeypatch, tmp_path) -> None:
         _patch_upstream_stream(
             monkeypatch,
             chunks=[_content_chunk("clean ")],
@@ -297,9 +277,7 @@ class TestNonHttpxExceptionEmitsAbort:
 
         # Audit row records the exception class for forensics.
         entries = list(JsonlBackend(log).iter_entries())
-        upstream_rows = [
-            e for e in entries if e.check_name == "pipeline.upstream"
-        ]
+        upstream_rows = [e for e in entries if e.check_name == "pipeline.upstream"]
         assert len(upstream_rows) == 1
         assert upstream_rows[0].metadata.get("_exception_class") == "RuntimeError"
 
@@ -332,10 +310,7 @@ class TestGarbageUpstreamBytesCaught:
         assert frame["reason"] == "upstream_content_type_invalid"
         assert payloads[-1] == "[DONE]"
         # No content frames forwarded -- the binary garbage stayed in.
-        content_frames = [
-            p for p in payloads
-            if p != "[DONE]" and "signet_abort" not in p
-        ]
+        content_frames = [p for p in payloads if p != "[DONE]" and "signet_abort" not in p]
         assert content_frames == []
 
 
@@ -354,18 +329,20 @@ class TestInspectAllSseLinesCatchesEventLine:
     out-of-band.
     """
 
-    def test_marker_in_event_line_caught_when_opt_in(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_marker_in_event_line_caught_when_opt_in(self, monkeypatch, tmp_path) -> None:
         # An SSE frame with both an event: line carrying the marker
         # AND a data: line so the parser doesn't reject the frame.
         smuggle = (
             b"event: (S//NF) leaked via event line\n"
-            b"data: " + json.dumps({
-                "id": "x",
-                "object": "chat.completion.chunk",
-                "choices": [{"delta": {"content": "benign"}}],
-            }).encode() + b"\n\n"
+            b"data: "
+            + json.dumps(
+                {
+                    "id": "x",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"delta": {"content": "benign"}}],
+                }
+            ).encode()
+            + b"\n\n"
         )
         chunks = [smuggle, b"data: [DONE]\n\n"]
         _patch_upstream_stream(monkeypatch, chunks=chunks)
@@ -384,19 +361,14 @@ class TestInspectAllSseLinesCatchesEventLine:
         assert r.status_code == 200
         payloads = _split_sse(r.text)
         # Marker text must NOT have been forwarded as data:.
-        content_frames = [
-            p for p in payloads
-            if p != "[DONE]" and "signet_abort" not in p
-        ]
+        content_frames = [p for p in payloads if p != "[DONE]" and "signet_abort" not in p]
         assert not any("(S//NF)" in p for p in content_frames)
         # Abort frame fired.
         frame = _find_abort_frame(payloads)
         assert frame is not None
         assert frame["stage"] == "inspection"
 
-    def test_marker_in_event_line_passes_when_not_opt_in(
-        self, monkeypatch, tmp_path
-    ) -> None:
+    def test_marker_in_event_line_passes_when_not_opt_in(self, monkeypatch, tmp_path) -> None:
         """Default (False) preserves historical OpenAI semantics: event:
         lines aren't inspected. The marker reaches the client because
         the proxy treated only the data: line as content. This is the
@@ -411,11 +383,15 @@ class TestInspectAllSseLinesCatchesEventLine:
         """
         smuggle = (
             b"event: (S//NF) leaked via event line\n"
-            b"data: " + json.dumps({
-                "id": "x",
-                "object": "chat.completion.chunk",
-                "choices": [{"delta": {"content": "benign"}}],
-            }).encode() + b"\n\n"
+            b"data: "
+            + json.dumps(
+                {
+                    "id": "x",
+                    "object": "chat.completion.chunk",
+                    "choices": [{"delta": {"content": "benign"}}],
+                }
+            ).encode()
+            + b"\n\n"
         )
         chunks = [smuggle, b"data: [DONE]\n\n"]
         _patch_upstream_stream(monkeypatch, chunks=chunks)

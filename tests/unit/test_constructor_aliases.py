@@ -9,6 +9,7 @@ KeyRing(keys=) shipped without input-form coverage. Test type tracker:
 * RequestContext: with and without method=, default value.
 * Owner.human/agent/policy/unresolved factories.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -19,24 +20,32 @@ from signet.core.owner import Owner, OwnerType
 
 
 class TestOwnerConstructorForms:
-    @pytest.mark.parametrize("type_input,expected", [
-        (OwnerType.HUMAN, OwnerType.HUMAN),
-        ("human", OwnerType.HUMAN),
-        ("HUMAN", OwnerType.HUMAN),
-        ("Human", OwnerType.HUMAN),
-        (OwnerType.AGENT, OwnerType.AGENT),
-        ("agent", OwnerType.AGENT),
-        (OwnerType.POLICY, OwnerType.POLICY),
-        ("policy", OwnerType.POLICY),
-    ])
+    @pytest.mark.parametrize(
+        "type_input,expected",
+        [
+            (OwnerType.HUMAN, OwnerType.HUMAN),
+            ("human", OwnerType.HUMAN),
+            ("HUMAN", OwnerType.HUMAN),
+            ("Human", OwnerType.HUMAN),
+            (OwnerType.AGENT, OwnerType.AGENT),
+            ("agent", OwnerType.AGENT),
+            (OwnerType.POLICY, OwnerType.POLICY),
+            ("policy", OwnerType.POLICY),
+        ],
+    )
     def test_create_short_kwargs_coerce_type(self, type_input, expected):
         o = Owner.create(type=type_input, id="x")
         assert o.owner_type is expected
         assert o.owner_id == "x"
 
-    @pytest.mark.parametrize("type_input", [
-        OwnerType.HUMAN, "human", "HUMAN",
-    ])
+    @pytest.mark.parametrize(
+        "type_input",
+        [
+            OwnerType.HUMAN,
+            "human",
+            "HUMAN",
+        ],
+    )
     def test_create_long_kwargs_coerce_type(self, type_input):
         o = Owner.create(owner_type=type_input, owner_id="x")
         assert o.owner_type is OwnerType.HUMAN
@@ -50,11 +59,14 @@ class TestOwnerConstructorForms:
         o = Owner.create(type="human", id="alice")
         assert str(o) == "human:alice"
 
-    @pytest.mark.parametrize("factory,type_,id_", [
-        (Owner.human, OwnerType.HUMAN, "alice"),
-        (Owner.agent, OwnerType.AGENT, "ai-1"),
-        (Owner.policy, OwnerType.POLICY, "internal-tailnet"),
-    ])
+    @pytest.mark.parametrize(
+        "factory,type_,id_",
+        [
+            (Owner.human, OwnerType.HUMAN, "alice"),
+            (Owner.agent, OwnerType.AGENT, "ai-1"),
+            (Owner.policy, OwnerType.POLICY, "internal-tailnet"),
+        ],
+    )
     def test_named_factories(self, factory, type_, id_):
         o = factory(id_)
         assert o.owner_type is type_

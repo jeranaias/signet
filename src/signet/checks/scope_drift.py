@@ -44,11 +44,63 @@ Adding more drift dimensions is a matter of subclassing and overriding
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 from signet.core.check import Check, CheckResult
 from signet.core.context import ResponseContext, get_header_ci
 from signet.core.stage import Stage
+
+# F-R13-6: zero-width / bidi-formatting characters that an attacker can
+# interleave between letters of a classification marker without
+# changing the rendered text (``S​ECRET``). Stripped from the
+# scan target so the marker regex still sees the literal token. Kept
+# local rather than imported from ``prompt_injection`` to keep
+# ``scope_drift`` standalone (importing across checks couples failure
+# domains). The set duplicates ``prompt_injection._ZERO_WIDTH_CHARS``;
+# if either is extended, mirror the change here.
+_ZERO_WIDTH_CHARS = (
+    "​"  # ZERO WIDTH SPACE
+    "‌"  # ZERO WIDTH NON-JOINER
+    "‍"  # ZERO WIDTH JOINER
+    "⁠"  # WORD JOINER
+    "﻿"  # ZERO WIDTH NO-BREAK SPACE / BOM
+    "᠎"  # MONGOLIAN VOWEL SEPARATOR
+    "‪"  # LRE
+    "‫"  # RLE
+    "‬"  # PDF
+    "‭"  # LRO
+    "‮"  # RLO
+    "⁦"  # LRI
+    "⁧"  # RLI
+    "⁨"  # FSI
+    "⁩"  # PDI
+    "­"  # SOFT HYPHEN
+)
+_ZERO_WIDTH_RE = re.compile(f"[{re.escape(_ZERO_WIDTH_CHARS)}]")
+
+
+def _normalize_marker_scan_target(text: str) -> str:
+    """Strip zero-width chars and NFKC-normalize text for marker matching.
+
+    F-R13-6: the OUTPUT-side classification-marker scan must agree with
+    the input-side header parser on Unicode normalization. A model that
+    emits a fullwidth (FF21-FF5A range) ``SECRET//NOFORN`` or a
+    circled-letter (U+24B6-U+24E9) form would otherwise slip past the
+    ASCII regex even when ``X-Classification: UNCLASS`` is set.
+    ZWSP-interleaved markers are also closed by stripping zero-width
+    characters before NFKC.
+
+    The original ``tail`` is preserved by the caller so the
+    ``match.group(0)`` in the audit row shows the emitted form (the
+    NFKC product) — operators can see the literal bytes the regex
+    fired on, which is what an audit row needs to be useful.
+    """
+    if not text:
+        return text
+    stripped = _ZERO_WIDTH_RE.sub("", text)
+    return unicodedata.normalize("NFKC", stripped)
+
 
 # Markers we look for in output that imply a classification level. Same
 # alias map shape as ClassificationGateCheck but kept local to avoid
@@ -223,8 +275,19 @@ class ScopeDriftCheck(Check):
             # proxy's SSE-line filtering because only the extracted
             # content (``_extract_sse_content`` output) lands in
             # ``accumulated_text``.
+            #
+            # F-R13-6: normalize the scan target (NFKC + zero-width
+            # strip) before matching so fullwidth / circled-letter /
+            # ZWSP-interleaved markers can no longer slip past the
+            # ASCII regex. The character-count overlap above is
+            # computed on the un-normalized buffer; NFKC may shorten
+            # some compatibility characters, but the overlap window
+            # is a lower bound, not an exact boundary — a slightly
+            # over-included window costs at most one extra regex
+            # search per chunk on the same already-bounded tail.
             if tail:
-                tail_match = self._classification_pattern.search(tail)
+                tail_norm = _normalize_marker_scan_target(tail)
+                tail_match = self._classification_pattern.search(tail_norm)
                 if tail_match:
                     result = self._classification_block(tail_match, request_level)
                     if result is not None:
@@ -240,7 +303,8 @@ class ScopeDriftCheck(Check):
             # path -- raw SSE prelude lines are only scanned once the
             # buffer-based defense has demonstrably stopped working.
             if ctx.accumulated_text_truncated and chunk:
-                chunk_match = self._classification_pattern.search(chunk)
+                chunk_norm = _normalize_marker_scan_target(chunk)
+                chunk_match = self._classification_pattern.search(chunk_norm)
                 if chunk_match:
                     result = self._classification_block(chunk_match, request_level)
                     if result is not None:
@@ -248,9 +312,7 @@ class ScopeDriftCheck(Check):
 
         return CheckResult.allow()
 
-    def _classification_block(
-        self, match: re.Match[str], request_level: int
-    ) -> CheckResult | None:
+    def _classification_block(self, match: re.Match[str], request_level: int) -> CheckResult | None:
         """Resolve ``match`` to a BLOCK CheckResult, or ``None`` when the
         marker level is compatible with the request's declared level.
 
@@ -283,11 +345,23 @@ class ScopeDriftCheck(Check):
 
     @staticmethod
     def _declared_classification(ctx: ResponseContext) -> int:
-        """Map the request's X-Classification header to a numeric level."""
+        """Map the request's X-Classification header to a numeric level.
+
+        F-R11-5 (NFKC inconsistency): ``ClassificationGateCheck._parse_level``
+        NFKC-normalizes the header value before alias lookup so fullwidth
+        Latin letters (e.g. ``U+FF33 U+FF25 U+FF23 U+FF32 U+FF25 U+FF34`` —
+        fullwidth ``SECRET``) collapse to canonical ASCII. Without
+        normalization here, the gate would parse the fullwidth form
+        as level 2 but scope_drift would parse it as level 0 (UNCLASS
+        fallback), making scope_drift incorrectly treat the request
+        as UNCLASS and trip on any SECRET-level marker in the
+        output. Apply the same NFKC normalization here so both
+        checks agree on the resolved level.
+        """
         v = get_header_ci(ctx.request.headers, "X-Classification")
         if not v:
             return 0  # UNCLASS default
-        norm = v.upper()
+        norm = unicodedata.normalize("NFKC", v).strip().upper()
         return {
             "UNCLASS": 0,
             "UNCLASSIFIED": 0,
