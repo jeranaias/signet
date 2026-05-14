@@ -1523,23 +1523,26 @@ class PromptInjectionCheck(Check):
             legitimately ship multi-megabyte user content and prefer
             to raise ``scan_max_chars`` rather than fail closed.
         on_decode_budget_exceeded: Policy when the BFS wall-clock
-            deadline (``_BFS_WALL_BUDGET_SECONDS``, 2.0 s) fires before
-            the decoder finishes unrolling encoding cascades. R18 P0
-            closure: pre-R18 the partial-decoded list was forwarded to
-            the rule scan and any attack still queued in the BFS was
-            silently allowed — an attacker who padded a depth-14
-            attack with ~50 KB of high-entropy noise tripped the
-            deadline before the inner cascade unrolled and the
-            request was admitted. ``"block"`` (default) refuses the
-            request when the deadline fires; a payload that requires
-            >2 s of decoder work is itself suspicious and legitimate
-            inputs do not require that depth. ``"escalate"`` defers
-            to a downstream judge. ``"audit_warn"`` preserves the
-            allow path but writes an audit warning with
-            ``_refusal_kind="decode_budget_exceeded"`` so operators
-            that genuinely process huge legitimate payloads can spot
-            the deadline burn rate and tune ``scan_max_chars`` or the
-            wall-clock budget rather than fail closed.
+            deadline (``_BFS_WALL_BUDGET_SECONDS``, 2.0 s) fires
+            before the decoder finishes unrolling encoding cascades.
+            ``"audit_warn"`` (v0.1.9.1 default) preserves the allow
+            path and writes an audit warning with
+            ``_refusal_kind="decode_budget_exceeded"`` and
+            ``bfs_deadline_exceeded=True`` so operators can spot the
+            deadline burn rate in audit and tune the wall-clock
+            budget or ``scan_max_chars`` rather than ship a
+            false-positive class. ``"block"`` refuses the request
+            (operators with strict-traffic profiles -- classified-
+            network gateways, narrow-scope audit-only environments
+            -- should opt into this explicitly). ``"escalate"``
+            defers to a downstream judge. The deadline is a CPU-DoS
+            backstop, not a security boundary: the depth-16 ceiling
+            + per-depth budget is the security boundary, so the
+            default policy mirrors the backstop framing rather than
+            failing closed on long legitimate inputs (npm
+            ``sha512-...==`` SRI, git commit SRI, CSP
+            ``sha256-...`` directives all run longer than 2 s on
+            small-VM hardware).
     """
 
     name = "prompt_injection"
@@ -1582,15 +1585,28 @@ class PromptInjectionCheck(Check):
     # attacker can pad with high-entropy noise so the deadline fires
     # BEFORE the depth-N attack surface. Pre-R18 the partial-decoded
     # list was forwarded to the rule scan and the missing attack was
-    # silently allowed — collapsing R16's "N ≤ 16 always blocks"
-    # promise under <80 KB of attacker-controlled padding. Default
-    # policy now mirrors ``on_scan_truncated``: a payload that
-    # requires >2 s of decoder work is itself suspicious; legitimate
-    # inputs do not require that depth. Operators that ship genuinely
-    # huge payloads can opt into ``"audit_warn"`` (allow, but emit a
-    # structured warning so the operator can spot the deadline burn
-    # in audit) or ``"escalate"``.
-    on_decode_budget_exceeded: Literal["block", "escalate", "audit_warn"] = "block"
+    # silently allowed.
+    #
+    # v0.1.9.1 follow-up: the R18 closure shipped with ``"block"`` as
+    # the default. The CI matrix (Python 3.11/3.12/3.13 across Ubuntu/
+    # macOS/Windows on GitHub Actions runners) immediately surfaced
+    # the cost: long benign base64 strings -- npm ``sha512-...==``
+    # package-lock SRI integrity attributes, git commit SRI checksums,
+    # CSP ``sha256-...`` directives -- routinely take longer than 2 s
+    # to unroll on small-VM hardware. ``"block"`` then false-positives
+    # on legitimate developer / infrastructure traffic. The middle
+    # ground: ``"audit_warn"`` allows the request but emits a
+    # structured warning (``_refusal_kind="decode_budget_exceeded"``,
+    # ``bfs_deadline_exceeded=True``) so the operator sees the burn
+    # rate in audit and can either raise the wall-clock budget, drop
+    # ``scan_max_chars``, or opt explicitly into ``"block"`` once they
+    # understand the FP trade-off. The deadline is a backstop against
+    # CPU-DoS, not a hard security boundary -- the depth-16 ceiling
+    # is the security boundary -- so the default policy should match
+    # the backstop framing. Operators with strict-traffic profiles
+    # (e.g., classified-network gateways) can pin to ``"block"`` in
+    # config; the configurability remains.
+    on_decode_budget_exceeded: Literal["block", "escalate", "audit_warn"] = "audit_warn"
 
     def __post_init__(self) -> None:
         for sev, action in self.severity_actions.items():

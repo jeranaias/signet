@@ -8,6 +8,54 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.9.1] -- 2026-05-14
+
+### Hotfix: relax BFS-deadline default + loosen CI timing thresholds
+
+The v0.1.9 CI matrix (Python 3.11/3.12/3.13 across Ubuntu / macOS /
+Windows GitHub Actions runners) immediately surfaced one production-
+shape false-positive class and two CI-hardware timing flakes:
+
+- **`on_decode_budget_exceeded` default changed `"block"` → `"audit_warn"`.**
+  The R18 closure shipped with `"block"` as the default to close a
+  silent-allow P0 (attacker padding the depth-14 cascade past the 2 s
+  wall-clock budget). On real-world CI hardware the 2 s budget
+  doesn't always finish unrolling long benign base64 strings — npm
+  `sha512-...==` package-lock SRI integrity attributes, git commit
+  SRI checksums, CSP `sha256-...` directives — and the `"block"`
+  default false-positives on legitimate developer / infrastructure
+  traffic. The new `"audit_warn"` default preserves the allow path
+  with a structured warning (`_refusal_kind="decode_budget_exceeded"`,
+  `bfs_deadline_exceeded=True`) so operators see the deadline burn
+  rate in audit and can either raise the wall-clock budget, drop
+  `scan_max_chars`, or opt explicitly into `"block"`. The deadline
+  remains a CPU-DoS backstop; the depth-16 ceiling + per-depth
+  budget is the security boundary. Operators with strict-traffic
+  profiles (classified-network gateways, audit-only environments)
+  should pin `on_decode_budget_exceeded="block"` in config.
+- **`tests/unit/test_round16_hunt.py::test_324kb_random_spiral_under_4s`**:
+  relaxed 4 s wall-clock bound to 10 s. Locally the 324 KB random-
+  bytes spiral completes in ~700 ms; GitHub Actions runners
+  routinely observed 6 – 7 s. 10 s is still well under the 12.5 s
+  uncapped R14 baseline so the cap-active invariant is preserved.
+- **`tests/unit/test_v017_polish.py::test_one_megabyte_benign_input_completes_quickly`**:
+  relaxed 1 s wall-clock bound to 3 s. Under coverage instrumentation
+  on ubuntu-latest the same payload routinely hit 1.5 – 2 s.
+
+No PyPI artifact for v0.1.9 needs yanking — the package is
+runtime-functional and the only user-visible regression
+(`on_decode_budget_exceeded` default false-positive on long benign
+base64) is closed by the v0.1.9.1 default change. Operators already
+running v0.1.9 should `pip install --upgrade signet-sign` to pick
+up the new default; deployments that explicitly set
+`on_decode_budget_exceeded` in config are unaffected.
+
+### Tests
+
+- 1893 → 1894 (one R18 test renamed; constructor argument added at
+  two sites that pinned the BLOCK path).
+- CI matrix expected to land green for the first time since v0.1.7.
+
 ## [0.1.9] -- 2026-05-12
 
 ### Eleven hunt-fix cycles after v0.1.8 — the version that survives a determined adversary

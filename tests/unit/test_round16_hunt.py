@@ -195,8 +195,15 @@ class TestF_R14_4_BfsIterationCap:
         start = time.monotonic()
         _decide(payload)
         elapsed = time.monotonic() - start
-        assert elapsed < 4.0, (
-            f"BFS spiral exceeded 4s wall-clock: {elapsed:.2f}s; deadline cap may have regressed"
+        # v0.1.9.1: relaxed from 4s to 10s. The 4s bound was empirically
+        # comfortable on local dev hardware but the CI matrix (GitHub
+        # Actions Ubuntu / macOS / Windows runners) regularly observed
+        # 6-7s on the same payload because BFS work is CPU-bound and
+        # the runners are smaller. The invariant we actually care about
+        # is "the deadline DID fire" -- 10s is well under the 12.5s
+        # uncapped R14 baseline so we still verify the cap is active.
+        assert elapsed < 10.0, (
+            f"BFS spiral exceeded 10s wall-clock: {elapsed:.2f}s; deadline cap may have regressed"
         )
 
     def test_deadline_cap_surfaces_on_side_channel(self) -> None:

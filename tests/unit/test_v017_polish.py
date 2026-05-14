@@ -595,9 +595,14 @@ class TestC6PromptInjection:
         result = await check.pre_request(ctx)
         elapsed = time.monotonic() - start
         # Loose bound — the v0.1.6 baseline was ~256ms for this input;
-        # we expect the truncation to keep us comfortably under 1s
-        # even on slow CI workers.
-        assert elapsed < 1.0, f"1MB scan took {elapsed:.2f}s (expected < 1s)"
+        # we expect the truncation to keep us comfortably under 3s
+        # even on slow CI workers. v0.1.9.1: relaxed from 1s to 3s
+        # because GitHub Actions runners (especially ubuntu-latest
+        # under coverage instrumentation) routinely hit 1.5-2s on the
+        # same payload. The invariant is "doesn't HOLD the loop"
+        # (i.e., completes in a single-digit second, not minutes),
+        # not a specific microbenchmark.
+        assert elapsed < 3.0, f"1MB scan took {elapsed:.2f}s (expected < 3s)"
         # Either ALLOW (if no patterns match the 'aaaa...' prefix) or
         # BLOCK (if normalization triggers); both must surface the
         # truncation flag in metadata.

@@ -201,13 +201,22 @@ class TestBfsDeadlineFailClosed:
             nested = base64.b64encode(nested)
         return noise + " " + nested.decode()
 
-    def test_deadline_default_policy_blocks(self) -> None:
+    def test_deadline_policy_block_opt_in_blocks(self) -> None:
         # 50 KB noise + depth-14 attack triggers the wall-clock budget
-        # under normal CI hardware. Default policy is BLOCK; the
-        # request MUST NOT silently allow even if the cascade did not
-        # surface the attack text inside the deadline.
+        # under normal CI hardware. Operators with strict-traffic
+        # profiles opt into BLOCK; the request MUST NOT silently allow
+        # even if the cascade did not surface the attack text inside
+        # the deadline.
+        #
+        # v0.1.9.1: the default was relaxed from ``"block"`` to
+        # ``"audit_warn"`` because the ``"block"`` default false-
+        # positived on long benign base64 strings (npm SRI, git SRI,
+        # CSP hashes) on small-VM CI hardware where the BFS could not
+        # finish unrolling inside the 2 s budget. Operators that need
+        # the fail-closed posture still opt into ``"block"`` here and
+        # this regression test pins that path.
         payload = self._pad_attack(50_000, 14)
-        decision = _decide(payload)
+        decision = _decide(payload, on_decode_budget_exceeded="block")
         assert decision == "block"
 
     def test_deadline_audit_warn_emits_warning(self) -> None:
@@ -233,8 +242,11 @@ class TestBfsDeadlineFailClosed:
             PromptInjectionCheck(on_decode_budget_exceeded="ignore")  # type: ignore[arg-type]
 
     def test_block_path_carries_refusal_kind_metadata(self) -> None:
+        # v0.1.9.1: explicitly opt into ``"block"`` policy. The default
+        # is now ``"audit_warn"`` (see ``test_deadline_policy_block_
+        # opt_in_blocks`` for the rationale).
         payload = self._pad_attack(60_000, 14)
-        check = PromptInjectionCheck()
+        check = PromptInjectionCheck(on_decode_budget_exceeded="block")
         result = asyncio.run(check.pre_request(_make_req(payload)))
         assert result.decision.value == "block"
         # The block reason carries either ``_refusal_kind`` (deadline
