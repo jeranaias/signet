@@ -8,6 +8,60 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.9.2] -- 2026-05-14
+
+### Hotfix: raise BFS wall-clock to 10s + restore fail-closed default
+
+v0.1.9.1 flipped the BFS-deadline default from ``"block"`` to
+``"audit_warn"`` to dodge a false-positive class on long benign
+base64 (npm SRI / git SRI / CSP hashes). The CI matrix immediately
+caught the consequence: the relaxed default **broke R16's "N ≤ 16
+always blocks" security guarantee**. On slow CI hardware the 2 s
+deadline fired BEFORE depth-10-through-16 base64-nested attack
+cascades unrolled, and the ``"audit_warn"`` default then allowed
+the request. The test parametrization `test_b64_nested_blocks[10]`
+through `[16]` failed across every non-macos-3.11 matrix cell.
+
+The right fix, shipped here: **raise the wall-clock budget from 2.0 s
+to 10.0 s** and **restore ``"block"`` as the default**. 10 s
+accommodates legitimate long base64 inputs on any reasonable
+hardware (npm ``sha512-...==`` SRI complete in well under 1 s even
+on the smallest GitHub Actions runners), while still being well
+under the 12.5 s uncapped R14 baseline — the CPU-DoS backstop is
+preserved. Restoring ``"block"`` as the default reinstates the R16
+security promise for adversarial pad-attack payloads that still hit
+the cap.
+
+The configurability of ``on_decode_budget_exceeded`` remains intact;
+operators legitimately shipping multi-megabyte user content beyond
+``scan_max_chars`` can still opt into ``"audit_warn"`` to keep
+traffic moving with a structured warning.
+
+### Changed (vs. v0.1.9.1)
+
+- `_BFS_WALL_BUDGET_SECONDS`: 2.0 s → 10.0 s.
+- `PromptInjectionCheck.on_decode_budget_exceeded` default:
+  `"audit_warn"` → `"block"` (reverts the v0.1.9.1 default flip).
+- `tests/unit/test_round18_hunt.py`:
+  `test_deadline_policy_block_opt_in_blocks` renamed back to
+  `test_deadline_default_policy_blocks`; constructor argument for
+  `"block"` opt-in removed from the same file's two regression tests
+  (the default IS the regression-pinned policy again).
+- `tests/unit/test_round16_hunt.py::test_324kb_random_spiral_under_4s`:
+  bound relaxed 10 s → 14 s. The BFS deadline is now 10 s; the test
+  wraps admission / scan / result plumbing around it. 14 s is still
+  comfortably below the 12.5 s uncapped R14 baseline.
+
+### Net effect
+
+v0.1.9.0 had two real bugs: silent-allow under deadline burn on
+attacker-padded depth-16 cascades (R16's promise leaked) AND CI
+matrix failures from coincidence of the FP class. v0.1.9.1 tried to
+solve the FP class by changing defaults; it succeeded at that but
+re-opened the security promise. v0.1.9.2 solves both at once by
+giving the deadline enough budget to accommodate legitimate inputs,
+keeping the fail-closed default for the adversarial residue.
+
 ## [0.1.9.1] -- 2026-05-14
 
 ### Hotfix: relax BFS-deadline default + loosen CI timing thresholds

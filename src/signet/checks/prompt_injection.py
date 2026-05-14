@@ -1523,26 +1523,22 @@ class PromptInjectionCheck(Check):
             legitimately ship multi-megabyte user content and prefer
             to raise ``scan_max_chars`` rather than fail closed.
         on_decode_budget_exceeded: Policy when the BFS wall-clock
-            deadline (``_BFS_WALL_BUDGET_SECONDS``, 2.0 s) fires
-            before the decoder finishes unrolling encoding cascades.
-            ``"audit_warn"`` (v0.1.9.1 default) preserves the allow
-            path and writes an audit warning with
-            ``_refusal_kind="decode_budget_exceeded"`` and
-            ``bfs_deadline_exceeded=True`` so operators can spot the
-            deadline burn rate in audit and tune the wall-clock
-            budget or ``scan_max_chars`` rather than ship a
-            false-positive class. ``"block"`` refuses the request
-            (operators with strict-traffic profiles -- classified-
-            network gateways, narrow-scope audit-only environments
-            -- should opt into this explicitly). ``"escalate"``
-            defers to a downstream judge. The deadline is a CPU-DoS
-            backstop, not a security boundary: the depth-16 ceiling
-            + per-depth budget is the security boundary, so the
-            default policy mirrors the backstop framing rather than
-            failing closed on long legitimate inputs (npm
-            ``sha512-...==`` SRI, git commit SRI, CSP
-            ``sha256-...`` directives all run longer than 2 s on
-            small-VM hardware).
+            deadline (``_BFS_WALL_BUDGET_SECONDS``, 10.0 s as of
+            v0.1.9.2) fires before the decoder finishes unrolling
+            encoding cascades. ``"block"`` (default) refuses the
+            request — preserves R16's "N ≤ 16 always blocks"
+            security promise. ``"escalate"`` defers to a downstream
+            judge. ``"audit_warn"`` preserves the allow path with a
+            structured warning (``_refusal_kind="decode_budget_
+            exceeded"``, ``bfs_deadline_exceeded=True``); operators
+            shipping genuinely huge legitimate payloads (multi-MB
+            user content beyond the ``scan_max_chars`` cap) can opt
+            in to keep traffic moving while monitoring the burn rate.
+            The deadline accommodates legitimate long base64 (npm
+            ``sha512-...==`` SRI, git commit SRI, CSP ``sha256-...``
+            directives all complete in <1 s even on the smallest
+            CI workers); the 10 s budget is the CPU-DoS backstop
+            against the 12.5 s uncapped R14 baseline.
     """
 
     name = "prompt_injection"
@@ -1580,33 +1576,30 @@ class PromptInjectionCheck(Check):
     # ``scan_max_chars`` or set this to ``"allow"`` / ``"escalate"``
     # to restore the prior behavior consciously.
     on_scan_truncated: Literal["block", "escalate", "allow"] = "block"
-    # R18 P0 (bfs-deadline-attack-loss): when the 2 s BFS wall-clock
-    # budget expires before the decoder has unrolled the cascade an
-    # attacker can pad with high-entropy noise so the deadline fires
-    # BEFORE the depth-N attack surface. Pre-R18 the partial-decoded
-    # list was forwarded to the rule scan and the missing attack was
-    # silently allowed.
+    # R18 P0 (bfs-deadline-attack-loss): when the BFS wall-clock budget
+    # expires before the decoder has unrolled the cascade an attacker
+    # can pad with high-entropy noise so the deadline fires BEFORE the
+    # depth-N attack surface. Pre-R18 the partial-decoded list was
+    # forwarded to the rule scan and the missing attack was silently
+    # allowed.
     #
-    # v0.1.9.1 follow-up: the R18 closure shipped with ``"block"`` as
-    # the default. The CI matrix (Python 3.11/3.12/3.13 across Ubuntu/
-    # macOS/Windows on GitHub Actions runners) immediately surfaced
-    # the cost: long benign base64 strings -- npm ``sha512-...==``
-    # package-lock SRI integrity attributes, git commit SRI checksums,
-    # CSP ``sha256-...`` directives -- routinely take longer than 2 s
-    # to unroll on small-VM hardware. ``"block"`` then false-positives
-    # on legitimate developer / infrastructure traffic. The middle
-    # ground: ``"audit_warn"`` allows the request but emits a
-    # structured warning (``_refusal_kind="decode_budget_exceeded"``,
-    # ``bfs_deadline_exceeded=True``) so the operator sees the burn
-    # rate in audit and can either raise the wall-clock budget, drop
-    # ``scan_max_chars``, or opt explicitly into ``"block"`` once they
-    # understand the FP trade-off. The deadline is a backstop against
-    # CPU-DoS, not a hard security boundary -- the depth-16 ceiling
-    # is the security boundary -- so the default policy should match
-    # the backstop framing. Operators with strict-traffic profiles
-    # (e.g., classified-network gateways) can pin to ``"block"`` in
-    # config; the configurability remains.
-    on_decode_budget_exceeded: Literal["block", "escalate", "audit_warn"] = "audit_warn"
+    # v0.1.9.2: kept the ``"block"`` fail-closed default to preserve
+    # R16's "N ≤ 16 always blocks" security guarantee. v0.1.9.1
+    # briefly set this to ``"audit_warn"`` to dodge a false-positive
+    # class on long benign base64 strings, but that broke the security
+    # promise (depth-10-to-16 attacks allowed on slow CI hardware
+    # where the 2 s deadline fired before the cascade unrolled). The
+    # actual fix shipped in the same release was raising the deadline
+    # (``_BFS_WALL_BUDGET_SECONDS``) from 2.0 s to 10.0 s, which
+    # accommodates both legitimate long base64 (npm SRI / git SRI /
+    # CSP hashes complete in <1 s even on small VMs) and the
+    # adversarial pad-attack class (10 s deadline still bounds CPU-DoS
+    # vs. the 12.5 s uncapped R14 baseline). Default policy when the
+    # deadline still fires: ``"block"`` (fail-closed). Operators that
+    # ship genuinely huge legitimate payloads can opt into
+    # ``"audit_warn"`` (allow + structured warning so operators can
+    # spot the deadline burn in audit) or ``"escalate"``.
+    on_decode_budget_exceeded: Literal["block", "escalate", "audit_warn"] = "block"
 
     def __post_init__(self) -> None:
         for sev, action in self.severity_actions.items():
@@ -1887,14 +1880,27 @@ class PromptInjectionCheck(Check):
         #
         # 1. Wall-clock deadline. A 324 KB random-bytes spiral was
         #    observed driving ``_extract_decoded`` for 12.5 seconds
-        #    under R14 — well past every per-request timeout. The
-        #    2.0 s deadline is set generously above the empirical
-        #    ~400 ms needed for ``b64^16`` of an attack phrase to
-        #    surface (the worst legitimate cascade we cover) so
-        #    moderately-loaded CI hardware doesn't false-positive
-        #    the budget. Past it we ABORT decoded scanning and let
-        #    the phrase detector proceed on what we've already
-        #    collected.
+        #    under R14 — well past every per-request timeout.
+        #
+        #    v0.1.9.2: raised from 2.0 s → 10.0 s. The 2.0 s budget
+        #    was tuned against local-dev hardware where ``b64^16(attack)``
+        #    surfaces in ~400 ms; on GitHub Actions runners (and any
+        #    similarly small VM) the same cascade routinely takes
+        #    1.5 – 7 s under coverage instrumentation, which made the
+        #    R16 ``"N ≤ 16 always blocks"`` security promise CI-flaky
+        #    (deadline fired before the inner cascade unrolled, attack
+        #    surfaced as ``allow`` instead of ``block``). 10 s is still
+        #    well under the 12.5 s uncapped R14 baseline so the CPU-DoS
+        #    backstop is preserved; legitimate long benign base64
+        #    payloads (npm ``sha512-...==``, git commit SRI, CSP
+        #    ``sha256-...``) complete in under 1 s even on the smallest
+        #    workers, so the FP class that drove v0.1.9.1 stays closed.
+        #
+        #    Past the deadline we ABORT decoded scanning. The
+        #    ``on_decode_budget_exceeded`` policy (default ``"block"``,
+        #    fail-closed) decides admission when no rule matched the
+        #    partial-decoded corpus.
+        #
         # 2. Total decoded-byte budget (``_MAX_DECODED_BYTES``) plus
         #    per-depth budget (``_PER_DEPTH_BUDGET``) remain the
         #    aggregate cost bounds — every blob admitted to
@@ -1910,7 +1916,7 @@ class PromptInjectionCheck(Check):
         # the right primitive because it scales with hardware.
         # ``time.monotonic`` is checked outside the inner candidate
         # loop to keep the hot path branch-free.
-        _BFS_WALL_BUDGET_SECONDS = 2.0
+        _BFS_WALL_BUDGET_SECONDS = 10.0
         _deadline = time.monotonic() + _BFS_WALL_BUDGET_SECONDS
         bfs_deadline_exceeded = False
 
