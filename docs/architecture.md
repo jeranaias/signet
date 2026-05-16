@@ -10,7 +10,7 @@ The rest of this document is *how that's wired*.
 
 ## The pattern in one paragraph (for engineers)
 
-signet separates **deciding what to do** from **being allowed to do it**. The model decides; signet decides whether the decision can fire. The model never holds commit authority. This matters because the prevailing approach to LLM agent safety — telling the model in its system prompt to "wait for human input" — relies on the model itself to comply with the instruction. Sufficiently capable models ignore the instruction whenever their objective gradient outweighs it. signet takes the model's compliance off the critical path: refusal lives in a separate process the model cannot influence.
+signet separates **deciding what to do** from **being allowed to do it**. The model decides; signet decides whether the decision can fire. Combined with upstream caller authentication, signet is the layer where the refusal decision lives. This matters because the prevailing approach to LLM agent safety — telling the model in its system prompt to "wait for human input" — relies on the model itself to comply with the instruction. **Current models comply with system-prompt restrictions inconsistently under adversarial pressure; that compliance is not a security boundary.** signet takes the model's compliance off the critical path: refusal lives in a separate process the model cannot influence.
 
 ## Where signet sits
 

@@ -12,7 +12,7 @@ Drop-in: existing OpenAI/Anthropic SDK code keeps working with one config change
 
 ## Why this exists
 
-LLMs are non-deterministic software being deployed under deterministic-software governance assumptions. The standard "make the model wait for human approval" pattern depends on the model itself complying with the instruction in its system prompt. Sufficiently capable models ignore that whenever their objective gradient outweighs it. **No prompt fixes that.**
+LLMs are non-deterministic software being deployed under deterministic-software governance assumptions. The standard "make the model wait for human approval" pattern depends on the model itself complying with the instruction in its system prompt. **Current models comply with system-prompt restrictions inconsistently under adversarial pressure; that compliance is not a security boundary.** No prompt fixes that.
 
 signet takes a different path: separate **deciding what to do** from **being allowed to do it**. The model decides; signet decides whether the decision can fire. The model's compliance is no longer load-bearing for the gate.
 

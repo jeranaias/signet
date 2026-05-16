@@ -8,6 +8,79 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.10] -- 2026-05-16
+
+### Polish release: hostile-reviewer triage closures
+
+External-review-driven cleanup. Six items closed; one (prompt-injection
+module split) is deferred to v0.1.11 so it can land alongside its own
+confidence cycle.
+
+### Changed (maturity / framing)
+
+- **PyPI classifier**: `Development Status :: 3 - Alpha` →
+  `Development Status :: 4 - Beta`. The classifier was contradicting
+  the README's "production-grade" framing; v0.1.10 closes that gap.
+  Beta status accurately describes "operationally tested by external
+  reviewers; pre-1.0 minor versions may still break API contracts."
+- **Overhead claim** (`README.md`): `< 5 ms overhead per request` →
+  `< 5 ms p50 overhead per request (p95/p99 in `signet bench --gate`
+  documented below)`. The next code block had always shown p99=9.5ms;
+  the marketing line now states the percentile explicitly so the
+  numbers line up on first read.
+- **Commit-authority framing** (`README.md`): "The model never holds
+  commit authority" was overstating without the upstream-auth context.
+  Reframed to "Combined with upstream caller authentication, signet is
+  the layer where the refusal decision lives." Same value prop, no
+  hidden dependency.
+- **LLM teleology** (`README.md`, `docs/architecture.md`,
+  `docs/index.md`): "Sufficiently capable models ignore that
+  instruction whenever their objective gradient outweighs it" →
+  "Current models comply with system-prompt restrictions
+  inconsistently under adversarial pressure; that compliance is not a
+  security boundary." Behavioral framing replaces teleological framing
+  — same operational claim, doesn't read as alignment hand-waving to
+  the audience signet wants as allies.
+
+### Added (supply-chain hygiene)
+
+- **Trusted Publishing for PyPI** (`.github/workflows/publish.yml`):
+  the publish job now uses PEP 740 OIDC token minting
+  (`id-token: write`) instead of a long-lived `PYPI_API_TOKEN`
+  secret. PEP 740 attestations are published per artifact
+  automatically.
+
+  **Operator action required before next tag push**: on the PyPI
+  project page (`pypi.org/manage/account/publishing/`), add a
+  Trusted Publisher binding with `owner=jeranaias`,
+  `repository=signet`, `workflow=publish.yml`. The previous
+  API-token path can be temporarily restored by re-adding the
+  `password:` parameter to the `pypa/gh-action-pypi-publish` step if
+  the binding setup hasn't happened yet.
+
+### Documented (packaging clarity)
+
+- **`signet-sign` (PyPI) vs. `signet` (import)** (`README.md`):
+  prominent blockquote at the top explaining the divergence.
+  Migration of the import path is deferred to v0.2 with a deprecation
+  cycle — invasive for existing users.
+
+### Deferred to v0.1.11
+
+- **`prompt_injection.py` module split**: 2578 LOC, heavily
+  interconnected. Splitting into
+  `prompt_injection/{normalize,decoders,rules,check}.py` per the
+  hostile-reviewer recommendation needs its own R30 hunt cycle to
+  verify zero behavior change. Bundling it with the bookkeeping
+  release would mix risk profiles. The hostile-reviewer "audit
+  surface per file" concern stays valid until v0.1.11.
+
+### Acknowledged out of repo scope
+
+- Bus factor 1 (recruit outside contributor with commit access
+  before DoD-facing pitch) and launch-narrative diversification
+  beyond the Substack write-up are human-action items, not code.
+
 ## [0.1.9.2] -- 2026-05-14
 
 ### Hotfix: raise BFS wall-clock to 10s + restore fail-closed default

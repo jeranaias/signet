@@ -50,9 +50,11 @@ requests. Zero external calls except the optional anchor backend.
 
 ## The problem in one paragraph
 
-Your AI agents are issuing refunds, calling APIs, running tools, writing to databases. Each of those actions is being authorized by a non-deterministic system that can be talked into anything by a sufficiently clever prompt. **The blast radius of "the model held commit authority" is your next incident report.** signet is a small Apache-2.0 proxy that sits between your callers and the LLM. Every request runs through programmatic checks before the model sees it; every response is re-checked before the caller sees it; every tool call is gated before it executes. Every decision lands in a tamper-evident, HMAC-chained audit log compatible with NIST 800-53 audit-content and integrity requirements. **The model never holds commit authority — same shape as a junior employee who fills out the purchase order but can't sign the check.**
+Your AI agents are issuing refunds, calling APIs, running tools, writing to databases. Each of those actions is being authorized by a non-deterministic system that can be talked into anything by a sufficiently clever prompt. **The blast radius of "the model held commit authority" is your next incident report.** signet is a small Apache-2.0 proxy that sits between your callers and the LLM. Every request runs through programmatic checks before the model sees it; every response is re-checked before the caller sees it; every tool call is gated before it executes. Every decision lands in a tamper-evident, HMAC-chained audit log compatible with NIST 800-53 audit-content and integrity requirements. **Combined with upstream caller authentication, signet is the layer where the refusal decision lives — same shape as a junior employee who fills out the purchase order but can't sign the check.**
 
-Drop-in: existing OpenAI/Anthropic SDK code keeps working with one config change. Runs in your VPC. No data sent to third parties. < 100 MB memory. < 5 ms overhead per request.
+Drop-in: existing OpenAI/Anthropic SDK code keeps working with one config change. Runs in your VPC. No data sent to third parties. < 100 MB memory. < 5 ms p50 overhead per request (p95/p99 in `signet bench --gate` documented below).
+
+> **Package name vs. import:** install with `pip install signet-sign` (the `signet` name on PyPI was taken), then `from signet import …` in code. Same package — the wire-name and the import-name diverge for historical PyPI reasons only.
 
 ```bash
 pip install signet-sign
@@ -66,7 +68,7 @@ Three commands from `pip install` to a working gate.
 
 ## Why this exists
 
-LLMs are non-deterministic software being deployed under deterministic-software governance assumptions. The standard "make the model wait for human approval" pattern depends on the model itself complying with the instruction in its system prompt. Sufficiently capable models ignore that instruction whenever their objective gradient outweighs it. **No prompt fixes that.**
+LLMs are non-deterministic software being deployed under deterministic-software governance assumptions. The standard "make the model wait for human approval" pattern depends on the model itself complying with the instruction in its system prompt. **Current models comply with system-prompt restrictions inconsistently under adversarial pressure; that compliance is not a security boundary.** No prompt fixes that.
 
 signet takes a different path: separate **deciding what to do** from **being allowed to do it**. The model decides; signet decides whether the decision can fire. The model's compliance is no longer load-bearing for the gate — refusal lives in a separate process the model cannot influence.
 

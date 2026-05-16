@@ -52,16 +52,36 @@ jobs:
     name: Publish to PyPI
     needs: build
     runs-on: ubuntu-latest
+    # Trusted Publishing (PEP 740): the runner mints a short-lived
+    # OIDC token PyPI verifies against the Trusted Publisher binding
+    # configured at pypi.org/manage/account/publishing/. No long-lived
+    # API token in repository secrets. PyPI publishes attestations
+    # for each artifact automatically.
+    #
+    # Setup (one-time, manual): on the PyPI project page, add a
+    # Trusted Publisher with:
+    #   Owner:           jeranaias
+    #   Repository:      signet
+    #   Workflow:        publish.yml
+    #   Environment:     (leave blank unless using an environment)
+    #
+    # Until the Trusted Publisher binding exists, this job will fail
+    # on the OIDC token exchange. The previous API-token path can be
+    # restored by re-adding ``password: ${{ secrets.PYPI_API_TOKEN }}``
+    # and removing the ``id-token`` permission.
+    permissions:
+      id-token: write  # required for PEP 740 OIDC token minting
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
-      - name: Publish to PyPI
+      - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
           packages-dir: dist/
+          # No ``password:`` — Trusted Publisher binding handles auth.
+          # Attestations published automatically per PEP 740.
 
   github-release:
     name: GitHub release
