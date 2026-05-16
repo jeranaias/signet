@@ -8,6 +8,29 @@ pre-1.0 minor versions may break the API.
 
 ## [Unreleased]
 
+## [0.1.10.1] -- 2026-05-16
+
+### Hotfix: 324 KB spiral test asserts deadline-fired signal, not wall-clock
+
+The v0.1.10 CI matrix flaked on a single cell — Python 3.12 / ubuntu-
+latest — where the 324 KB random-bytes spiral test took 15.9 s. The
+14 s wall-clock bound (already raised v0.1.9.2) was correct in spirit
+but tied to GitHub Actions runner allocation; every other matrix cell
+(Python 3.11 / 3.12 / 3.13 across all three OSes) finished in under
+14 s on the same commit.
+
+The right fix: assert the side channel directly. The test now
+verifies `check._last_bfs_deadline_exceeded is True` after the
+spiral — which is what we actually care about (the cap engaged)
+rather than how long the runner took to finish.
+
+### Changed
+
+- `tests/unit/test_round16_hunt.py::test_324kb_random_spiral_under_4s`
+  renamed to `test_324kb_random_spiral_deadline_fires`; assertion
+  refactored from wall-clock-bound to side-channel
+  (`_last_bfs_deadline_exceeded`).
+
 ## [0.1.10] -- 2026-05-16
 
 ### Polish release: hostile-reviewer triage closures
